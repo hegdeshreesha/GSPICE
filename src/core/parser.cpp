@@ -78,13 +78,28 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.f_start = Utils::parseValue(tokens[3]);
                 settings.f_stop = Utils::parseValue(tokens[4]);
                 netlist.setSettings(settings);
-            } else if (cmd == ".PSS") {
+            } else if (cmd == ".PSS" || cmd == ".HB") {
                 SimulationSettings settings;
-                settings.type = "PSS";
-                settings.f_fund = Utils::parseValue(tokens[1]);
-                settings.n_harms = std::stoi(tokens[2]);
+                settings.type = cmd.substr(1);
+                size_t i = 1;
+                while (i < tokens.size()) {
+                    bool is_int = !tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit);
+                    if (is_int) {
+                        settings.n_harms = std::stoi(tokens[i]);
+                        break;
+                    } else if (settings.f_fund.size() < 4) {
+                        settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                    } else {
+                        std::cerr << "Warning: GSPICE supports max 4 tones. Ignoring extra: " << tokens[i] << std::endl;
+                    }
+                    i++;
+                }
+                if (settings.f_fund.empty()) {
+                    std::cerr << "Error: " << cmd << " requires at least 1 fundamental frequency." << std::endl;
+                }
                 netlist.setSettings(settings);
-            } else if (cmd == ".SP") {
+            }
+ else if (cmd == ".SP") {
                 SimulationSettings settings;
                 settings.type = "SP";
                 settings.points_per_dec = std::stoi(tokens[2]);
@@ -100,12 +115,6 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.points_per_dec = std::stoi(tokens[3]);
                 settings.f_start = Utils::parseValue(tokens[4]);
                 settings.f_stop = Utils::parseValue(tokens[5]);
-                netlist.setSettings(settings);
-            } else if (cmd == ".HB") {
-                SimulationSettings settings;
-                settings.type = "HB";
-                settings.f_fund = Utils::parseValue(tokens[1]);
-                settings.n_harms = std::stoi(tokens[2]);
                 netlist.setSettings(settings);
             } else if (cmd == ".STB") {
                 SimulationSettings settings;
@@ -133,10 +142,21 @@ Netlist Parser::parse(const std::string& filePath) {
             } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" || 
                        cmd == ".PSSSP" || cmd == ".PSSSTB") {
                 SimulationSettings settings;
-                settings.type = cmd.substr(1); // Remove dot
-                settings.points_per_dec = std::stoi(tokens[1]);
-                settings.f_start = Utils::parseValue(tokens[2]);
-                settings.f_stop = Utils::parseValue(tokens[3]);
+                settings.type = cmd.substr(1);
+                
+                size_t i = 1;
+                while (i < tokens.size()) {
+                    bool is_int = !tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit);
+                    if (is_int) {
+                        settings.points_per_dec = std::stoi(tokens[i]);
+                        if (i + 1 < tokens.size()) settings.f_start = Utils::parseValue(tokens[i+1]);
+                        if (i + 2 < tokens.size()) settings.f_stop = Utils::parseValue(tokens[i+2]);
+                        break;
+                    } else {
+                        settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    i++;
+                }
                 netlist.setSettings(settings);
             }
 

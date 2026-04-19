@@ -120,6 +120,7 @@ void run_simulation(Netlist& netlist) {
         double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
         while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
+            // 1. Voltage Pass
             SparseMatrixComplex Jv(matrix_size); VectorComplex bv(matrix_size);
             for (const auto& dev : devices) {
                 auto* p = dynamic_cast<StabilityProbe*>(dev.get());
@@ -127,6 +128,7 @@ void run_simulation(Netlist& netlist) {
             }
             VectorComplex xv = KluSolverComplex::solve(Jv, bv);
             std::complex<double> Tv = -xv[probes[0]->getNodeNeg()] / xv[probes[0]->getNodePos()];
+            // 2. Current Pass
             SparseMatrixComplex Ji(matrix_size); VectorComplex bi(matrix_size);
             for (const auto& dev : devices) {
                 auto* p = dynamic_cast<StabilityProbe*>(dev.get());
@@ -134,22 +136,30 @@ void run_simulation(Netlist& netlist) {
             }
             VectorComplex xi = KluSolverComplex::solve(Ji, bi);
             std::complex<double> Ti = xi[probes[0]->getBranchIndex()];
+            // 3. Combine
             std::complex<double> T = (Tv * Ti - std::complex<double>(1,0)) / (Tv + Ti + std::complex<double>(2,0));
             std::cout << std::scientific << f << " | Mag: " << std::abs(T) << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
             f *= dec_mult;
         }
     } else if (settings.type == "HB") {
-        std::cout << "Starting Harmonic Balance Analysis..." << std::endl;
-        int N = settings.n_harms; int K = 2 * N + 1; int n_vars = matrix_size * K;
-        VectorReal x_hb(n_vars); for (int i = 0; i < matrix_size; ++i) x_hb[i * K] = x_dc[i];
+        std::cout << "Starting Harmonic Balance Analysis (Multi-Tone)..." << std::endl;
+        int n_tones = static_cast<int>(settings.f_fund.size());
+        int H = settings.n_harms;
+        int K = 1;
+        for (int t = 0; t < n_tones; ++t) K *= (2 * H + 1);
+        int n_vars = matrix_size * K;
+        std::cout << "  Tones: " << n_tones << " | Harmonics/Tone: " << H << " | Total States/Node: " << K << std::endl;
+        VectorReal x_hb(n_vars);
+        for (int i = 0; i < matrix_size; ++i) x_hb[i * K] = x_dc[i];
         bool hb_converged = false;
         for (int hb_iter = 0; hb_iter < 30; ++hb_iter) {
             SparseMatrixReal J_hb(n_vars); VectorReal b_hb(n_vars);
             #pragma omp parallel for
-            for (int i = 0; i < num_devs; ++i) devices[i]->hbStamp(J_hb, b_hb, settings.f_fund, N, x_hb);
+            for (int i = 0; i < num_devs; ++i) devices[i]->hbStamp(J_hb, b_hb, (n_tones > 0 ? settings.f_fund[0] : 0.0), H, x_hb);
             VectorReal dx = KluSolverReal::solve(J_hb, b_hb);
-            for (int i = 0; i < n_vars; ++i) x_hb[i] -= dx[i];
-            hb_converged = true; break;
+            double max_dx = 0.0;
+            for (int i = 0; i < n_vars; ++i) { x_hb[i] -= dx[i]; max_dx = std::max(max_dx, std::abs(dx[i])); }
+            if (max_dx < 1e-6) { hb_converged = true; break; }
         }
         if (hb_converged) std::cout << "HB Converged." << std::endl;
     } else if (settings.type == "PAC") {
@@ -158,7 +168,7 @@ void run_simulation(Netlist& netlist) {
         double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
         while (f <= settings.f_stop * 1.01) {
             SparseMatrixReal J_pac(n_vars); VectorReal b_pac(n_vars);
-            for (const auto& dev : netlist.getDevices()) dev->pacStamp(J_pac, b_pac, f, settings.f_fund, N, x_dc);
+            for (const auto& dev : netlist.getDevices()) dev->pacStamp(J_pac, b_pac, f, (settings.f_fund.size() > 0 ? settings.f_fund[0] : 0.0), N, x_dc);
             VectorReal x_pac = KluSolverReal::solve(J_pac, b_pac);
             std::cout << std::scientific << f << " | PAC Solved. Mag: " << std::abs(x_pac[0]) << std::endl;
             f *= dec_mult;

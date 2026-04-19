@@ -18,10 +18,10 @@ struct SimulationSettings {
     int points_per_dec = 0;
     bool use_uic = false;
 
-    // PSS Parameters
-    double f_fund = 0.0;     // Fundamental frequency
-    int n_harms = 0;         // Number of harmonics
-    int max_pss_iter = 10;   // Max shooting iterations
+    // PSS / HB Parameters
+    std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)
+    int n_harms = 0;             // Number of harmonics per tone
+    int max_pss_iter = 10;       // Max shooting iterations
 
     // Noise Parameters
     int out_node = -1;
