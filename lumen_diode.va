@@ -1,0 +1,15 @@
+`include "disciplines.vams"
+`include "constants.vams"
+
+module lumen_diode(a, c);
+    inout a, c;
+    electrical a, c;
+    
+    parameter real is = 1e-14;
+    parameter real vt = 0.02585;
+    
+    analog begin
+        // The Physics Equation
+        I(a, c) <+ is * (limexp(V(a, c) / vt) - 1.0);
+    end
+endmodule

@@ -1,0 +1,21 @@
+# Build directories
+build/
+dist/
+bin/
+
+# IDE files
+.vs/
+*.sln
+*.vcxproj
+*.filters
+*.user
+
+# Output files
+*.raw
+*.log
+*.out
+*.csv
+
+# OS files
+.DS_Store
+Thumbs.db
