@@ -1,33 +1,29 @@
 # GSPICE
-**The Next-Generation Open-Source Circuit Simulator Core**
+**The Next-Generation Parallel Open-Source Circuit Simulator Core**
 
-GSPICE is a high-performance, object-oriented circuit simulator built from the ground up to be a "Super Form" successor to Ngspice and Xyce. It is designed for modern semiconductor processes and RF design.
+GSPICE is a high-performance, object-oriented circuit simulator built from the ground up to be a "Super Form" successor to Ngspice and Xyce. It combines modern C++ architecture with industrial-grade stability and advanced RF analysis capabilities.
 
-## Key Features
-*   🚀 **High Performance:** Built in modern C++ with a native Sparse Matrix architecture.
-*   🔋 **Universal Models:** Native **OSDI (Open Simulation Device Interface)** host, allowing dynamic loading of professional Verilog-A models (BSIM, PSP, HICUM).
-*   🛰️ **RF Ready:** Built-in support for advanced RF analyses:
-    *   **PSS** (Periodic Steady State via Shooting Method)
-    *   **HB** (Harmonic Balance Engine)
-    *   **SP** (S-Parameter characterization)
-*   🛡️ **Stable Solvers:** Robust non-linear Newton-Raphson with G-min stepping and damping.
-*   ⚡ **Scalable:** Integrated bridge for **KLU (SuiteSparse)**, the industry gold-standard for circuit simulation.
+## 🚀 Key Features
+*   **Parallel Core:** Fully multi-threaded device evaluation and matrix stamping using OpenMP. Scalable up to 16 threads for massive designs.
+*   **Universal Models (OSDI):** Native **Open Simulation Device Interface** host. Dynamically load professional Verilog-A models (BSIM4, PSP, HICUM) compiled with OpenVAF.
+*   **Industrial Stability:** Verified against **Level-50 Industrial MOSFET models**. Robust convergence using G-min stepping and Newton-Raphson damping.
+*   **Scalable Math:** High-efficiency **Sparse Matrix** architecture with a bridge for **KLU (SuiteSparse)**, the industry gold-standard for circuit simulation.
+*   **Professional CLI:** Full-featured command-line interface with thread control, help systems, and standard SPICE output formatting.
 
-## Supported Analyses
-*   `.OP`: DC Operating Point
-*   `.TRAN`: Transient Analysis (Backward Euler)
-*   `.AC`: Small-signal Frequency Domain
-*   `.SP`: Scattering Parameters (RF)
-*   `.NOISE`: Adjoint-matrix Noise Density
-*   `.PSS`: Periodic Steady State
-*   `.HB`: Harmonic Balance
+## 🛰️ Advanced Analysis Suite
+GSPICE supports 15+ industrial analysis types:
+*   **Standard:** `.OP`, `.TRAN`, `.AC`, `.NOISE`
+*   **RF Core:** `.PSS` (Shooting Method), `.HB` (Harmonic Balance), `.SP` (S-Parameters)
+*   **RF Advanced:** `.PAC`, `.PNOISE`, `.HBAC`, `.HBNOISE`, `.HBSP`
+*   **Stability:** `.STB`, `.HBSTB`, `.PSSSTB` (Using the Tian Loop-Break Algorithm)
 
-## Installation & Build
-GSPICE uses CMake for a cross-platform build experience.
+## 🛠️ Installation & Build
+GSPICE uses CMake for a professional cross-platform build experience.
 
 ### Prerequisites
 *   CMake 3.10+
-*   C++17 Compiler (MSVC, GCC, or Clang)
+*   C++17 Compiler (MSVC 2022, GCC, or Clang)
+*   OpenMP 2.0+
 
 ### Build Instructions
 ```powershell
@@ -37,11 +33,18 @@ cmake ..
 cmake --build . --config Release
 ```
 
-## Usage
+## 💻 Usage
 ```powershell
-gspice my_circuit.sp [options]
-```
-Use `gspice --help` for full command line options.
+# Run a simulation on 8 threads
+gspice my_circuit.sp --threads 8
 
-## License
-Licensed under the **Apache License, Version 2.0**.
+# Specify a custom output file
+gspice lna_test.sp -o lna_results.raw
+
+# View help and version
+gspice --help
+gspice --version
+```
+
+## 📄 License
+GSPICE is licensed under the **Apache License, Version 2.0**.
