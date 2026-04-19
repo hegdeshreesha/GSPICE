@@ -25,6 +25,9 @@ struct SimulationSettings {
 
     // Noise Parameters
     int out_node = -1;
+
+    // Hierarchical / Periodic Small-Signal Flags
+    bool is_periodic = false; // Set if PAC, HBAC, etc.
 };
 
 class Netlist {

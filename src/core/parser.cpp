@@ -7,6 +7,7 @@
 #include "devices/inductor.hpp"
 #include "devices/port.hpp"
 #include "devices/mosfet.hpp"
+#include "devices/probe.hpp"
 #include <iostream>
 
 namespace gspice {
@@ -105,6 +106,37 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.f_fund = Utils::parseValue(tokens[1]);
                 settings.n_harms = std::stoi(tokens[2]);
                 netlist.setSettings(settings);
+            } else if (cmd == ".STB") {
+                SimulationSettings settings;
+                settings.type = "STB";
+                settings.points_per_dec = std::stoi(tokens[2]);
+                settings.f_start = Utils::parseValue(tokens[3]);
+                settings.f_stop = Utils::parseValue(tokens[4]);
+                netlist.setSettings(settings);
+            } else if (cmd == ".PAC") {
+                SimulationSettings settings;
+                settings.type = "PAC";
+                settings.points_per_dec = std::stoi(tokens[2]);
+                settings.f_start = Utils::parseValue(tokens[3]);
+                settings.f_stop = Utils::parseValue(tokens[4]);
+                netlist.setSettings(settings);
+            } else if (cmd == ".PNOISE") {
+                SimulationSettings settings;
+                settings.type = "PNOISE";
+                std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
+                settings.out_node = netlist.getOrCreateNode(outNode);
+                settings.points_per_dec = std::stoi(tokens[3]);
+                settings.f_start = Utils::parseValue(tokens[4]);
+                settings.f_stop = Utils::parseValue(tokens[5]);
+                netlist.setSettings(settings);
+            } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" || 
+                       cmd == ".PSSSP" || cmd == ".PSSSTB") {
+                SimulationSettings settings;
+                settings.type = cmd.substr(1); // Remove dot
+                settings.points_per_dec = std::stoi(tokens[1]);
+                settings.f_start = Utils::parseValue(tokens[2]);
+                settings.f_stop = Utils::parseValue(tokens[3]);
+                netlist.setSettings(settings);
             }
 
         } else if (firstChar == 'R') {
@@ -125,6 +157,11 @@ Netlist Parser::parse(const std::string& filePath) {
             int n2 = netlist.getOrCreateNode(tokens[2]);
             double val = Utils::parseValue(tokens[3]);
             netlist.addDevice(std::make_unique<Inductor>(tokens[0], n1, n2, val, -1));
+        } else if (firstChar == 'W') {
+            // Stability Probe: Wname node_in node_out
+            int nIn = netlist.getOrCreateNode(tokens[1]);
+            int nOut = netlist.getOrCreateNode(tokens[2]);
+            netlist.addDevice(std::make_unique<StabilityProbe>(tokens[0], nIn, nOut, -1));
         } else if (firstChar == 'P') {
             // Port: Pname N1 N2 PortNum Z0
             int n1 = netlist.getOrCreateNode(tokens[1]);
