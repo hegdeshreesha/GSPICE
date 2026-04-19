@@ -4,25 +4,23 @@
 #include <vector>
 #include <map>
 #include <complex>
+#include <mutex>
 #include "matrix.hpp"
 
 namespace gspice {
 
 /**
- * A Sparse Matrix representation using a Coordinate Map (Triplet) 
- * for easy assembly, which can then be converted to CCS for KLU/Eigen.
+ * A Sparse Matrix representation using a Coordinate Map (Triplet).
+ * Thread-safe for parallel stamping.
  */
 template <typename T>
 class SparseMatrix {
 public:
     SparseMatrix(int size) : size_(size) {}
 
-    /**
-     * Add a value to the sparse matrix.
-     * Coordinate format is easiest for 'stamping' logic.
-     */
     void add(int row, int col, T value) {
         if (row >= 0 && col >= 0 && row < size_ && col < size_) {
+            std::lock_guard<std::mutex> lock(mutex_);
             triplets_[{row, col}] += value;
         }
     }
@@ -84,6 +82,7 @@ public:
 
 private:
     int size_;
+    mutable std::mutex mutex_;
     // map of {row, col} -> value
     std::map<std::pair<int, int>, T> triplets_;
 };

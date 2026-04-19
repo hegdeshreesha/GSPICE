@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iomanip>
 #include <algorithm>
+#include <omp.h>
 #include "parser.hpp"
 #include "devices/resistor.hpp"
 #include "devices/capacitor.hpp"
@@ -32,15 +33,43 @@ void run_osdi_test() {
 
     int matrix_size = 3; 
     VectorReal x(matrix_size);
+    // Better initial guess for diode convergence
+    x[1] = 0.6; 
     
     std::cout << "Solving circuit with Verilog-A (OSDI) model..." << std::endl;
-    for (int iter = 0; iter < 20; ++iter) {
+    const double tol = 1e-8;
+    bool converged = false;
+
+    for (int iter = 0; iter < 100; ++iter) {
         SparseMatrixReal J(matrix_size);
         VectorReal b(matrix_size);
-        for (const auto& dev : netlist.getDevices()) dev->dcStamp(J, b, x, 0, {});
-        x = KluSolverReal::solve(J, b);
+        
+        auto& devices = netlist.getDevices();
+        int num_devs = static_cast<int>(devices.size());
+        
+        // Parallel stamping
+        #pragma omp parallel for
+        for (int i = 0; i < num_devs; ++i) {
+            devices[i]->dcStamp(J, b, x, 0, {});
+        }
+        
+        VectorReal x_new = KluSolverReal::solve(J, b);
+        
+        double max_change = 0.0;
+        for (int i = 0; i < 2; ++i) { // Check only node voltages
+            max_change = std::max(max_change, std::abs(x_new[i] - x[i]));
+        }
+
+        x = x_new;
+        if (max_change < tol) {
+            std::cout << "  OSDI Test Converged in " << iter + 1 << " iterations." << std::endl;
+            converged = true;
+            break;
+        }
     }
     
+    if (!converged) std::cout << "  Warning: OSDI test failed to converge." << std::endl;
+
     std::cout << "Node 1 Voltage (Vsrc):  " << std::fixed << std::setprecision(4) << x[0] << " V" << std::endl;
     std::cout << "Node 0 Voltage (Diode): " << x[1] << " V" << std::endl;
     std::cout << "OSDI Bridge Verification Complete." << std::endl;
@@ -49,7 +78,10 @@ void run_osdi_test() {
 void run_simulation(Netlist& netlist) {
     int num_nodes = netlist.getNumNodes();
     std::vector<Port*> ports;
-    for (auto& dev : netlist.getDevices()) {
+    auto& devices = netlist.getDevices();
+    int num_devs = static_cast<int>(devices.size());
+
+    for (auto& dev : devices) {
         auto* vsrc = dynamic_cast<VoltageSource*>(dev.get());
         if (vsrc) vsrc->setBranchIndex(netlist.getNextBranchId(num_nodes));
         auto* ind = dynamic_cast<Inductor*>(dev.get());
@@ -65,11 +97,12 @@ void run_simulation(Netlist& netlist) {
 
     VectorReal x_dc(matrix_size);
     if (!settings.use_uic) {
-        std::cout << "Calculating DC Operating Point..." << std::endl;
+        std::cout << "Calculating DC Operating Point (Parallel)..." << std::endl;
         for (int iter = 0; iter < 100; ++iter) {
             SparseMatrixReal J_sparse(matrix_size);
             VectorReal b(matrix_size);
-            for (const auto& dev : netlist.getDevices()) dev->dcStamp(J_sparse, b, x_dc, 0, {});
+            #pragma omp parallel for
+            for (int i = 0; i < num_devs; ++i) devices[i]->dcStamp(J_sparse, b, x_dc, 0, {});
             VectorReal x_new = KluSolverReal::solve(J_sparse, b);
             double max_change = 0.0;
             for (int i = 0; i < num_nodes; ++i) max_change = std::max(max_change, std::abs(x_new[i] - x_dc[i]));
@@ -79,7 +112,7 @@ void run_simulation(Netlist& netlist) {
     }
 
     if (settings.type == "TRAN") {
-        std::cout << "Starting Transient Analysis..." << std::endl;
+        std::cout << "Starting Transient Analysis (Parallel)..." << std::endl;
         std::vector<VectorReal> x_hist;
         VectorReal x = x_dc; 
         x_hist.push_back(x);
@@ -87,7 +120,8 @@ void run_simulation(Netlist& netlist) {
             for (int iter = 0; iter < 50; ++iter) {
                 SparseMatrixReal J_sparse(matrix_size);
                 VectorReal b(matrix_size);
-                for (const auto& dev : netlist.getDevices()) dev->dcStamp(J_sparse, b, x, settings.t_step, x_hist);
+                #pragma omp parallel for
+                for (int i = 0; i < num_devs; ++i) devices[i]->dcStamp(J_sparse, b, x, settings.t_step, x_hist);
                 VectorReal x_new = KluSolverReal::solve(J_sparse, b);
                 double max_change = 0.0;
                 for (int i = 0; i < num_nodes; ++i) max_change = std::max(max_change, std::abs(x_new[i] - x[i]));
@@ -100,14 +134,15 @@ void run_simulation(Netlist& netlist) {
             std::cout << std::endl;
         }
     } else if (settings.type == "AC") {
-        std::cout << "Starting AC Analysis..." << std::endl;
+        std::cout << "Starting AC Analysis (Parallel)..." << std::endl;
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
         while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
             SparseMatrixComplex J_sparse(matrix_size);
             VectorComplex b_ac(matrix_size);
-            for (const auto& dev : netlist.getDevices()) dev->acStamp(J_sparse, b_ac, omega, x_dc);
+            #pragma omp parallel for
+            for (int i = 0; i < num_devs; ++i) devices[i]->acStamp(J_sparse, b_ac, omega, x_dc);
             VectorComplex x_ac = KluSolverComplex::solve(J_sparse, b_ac);
             std::cout << std::scientific << std::setprecision(2) << f << " | ";
             for(int i=0; i<num_nodes; ++i) std::cout << "(" << x_ac[i].real() << "," << x_ac[i].imag() << ") ";
@@ -128,7 +163,8 @@ void run_simulation(Netlist& netlist) {
                 for (int iter = 0; iter < 50; ++iter) {
                     SparseMatrixReal J_sparse(matrix_size);
                     VectorReal b(matrix_size);
-                    for (const auto& dev : netlist.getDevices()) dev->dcStamp(J_sparse, b, x, dt, x_hist);
+                    #pragma omp parallel for
+                    for (int i = 0; i < num_devs; ++i) devices[i]->dcStamp(J_sparse, b, x, dt, x_hist);
                     VectorReal x_new = KluSolverReal::solve(J_sparse, b);
                     double max_change = 0.0;
                     for (int i = 0; i < num_nodes; ++i) max_change = std::max(max_change, std::abs(x_new[i] - x[i]));
@@ -157,7 +193,8 @@ void run_simulation(Netlist& netlist) {
             for (size_t j = 0; j < ports.size(); ++j) {
                 SparseMatrixComplex J_sparse(matrix_size);
                 VectorComplex b_sp(matrix_size);
-                for (const auto& dev : netlist.getDevices()) dev->acStamp(J_sparse, b_sp, omega, x_dc);
+                #pragma omp parallel for
+                for (int i = 0; i < num_devs; ++i) devices[i]->acStamp(J_sparse, b_sp, omega, x_dc);
                 b_sp.add(ports[j]->getBranchIndex(), {1.0, 0.0});
                 VectorComplex x_sp = KluSolverComplex::solve(J_sparse, b_sp);
                 double aj = 1.0 / (2.0 * std::sqrt(ports[j]->getZ0()));
@@ -180,7 +217,8 @@ void run_simulation(Netlist& netlist) {
             double omega = 2.0 * 3.14159265358979 * f;
             SparseMatrixComplex J_sparse(matrix_size);
             VectorComplex dummy_b(matrix_size);
-            for (const auto& dev : netlist.getDevices()) dev->acStamp(J_sparse, dummy_b, omega, x_dc);
+            #pragma omp parallel for
+            for (int i = 0; i < num_devs; ++i) devices[i]->acStamp(J_sparse, dummy_b, omega, x_dc);
             MatrixComplex J_dense = J_sparse.toDense();
             VectorComplex i_out(matrix_size);
             if (settings.out_node >= 0) i_out[settings.out_node] = {1.0, 0.0};
@@ -209,7 +247,8 @@ void run_simulation(Netlist& netlist) {
         for (int hb_iter = 0; hb_iter < 30; ++hb_iter) {
             SparseMatrixReal J_hb(n_vars);
             VectorReal b_hb(n_vars);
-            for (const auto& dev : netlist.getDevices()) dev->hbStamp(J_hb, b_hb, settings.f_fund, N, x_hb);
+            #pragma omp parallel for
+            for (int i = 0; i < num_devs; ++i) devices[i]->hbStamp(J_hb, b_hb, settings.f_fund, N, x_hb);
             VectorReal dx = KluSolverReal::solve(J_hb, b_hb);
             for (int i = 0; i < n_vars; ++i) { x_hb[i] -= dx[i]; }
             hb_converged = true; break;
@@ -223,49 +262,21 @@ void run_simulation(Netlist& netlist) {
 }
 
 void print_usage() {
-    std::cout << "Usage: gspice <input_file.sp> [options]" << std::endl;
-    std::cout << "Options:" << std::endl;
-    std::cout << "  -v, --version    Display version information" << std::endl;
-    std::cout << "  -h, --help       Display this help message" << std::endl;
-    std::cout << "  -o <file>        Specify output file name (default: output.raw)" << std::endl;
-    std::cout << "\nSupported Analyses:" << std::endl;
-    std::cout << "  .OP, .TRAN, .AC, .SP, .NOISE, .PSS, .HB" << std::endl;
+    std::cout << "Usage: gspice <input_file.sp> [options]\nOptions:\n  -v, --version\n  -h, --help\n  -o <file>" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc == 1) {
-        run_osdi_test(); // Default internal test for dev verification
-        print_usage();
-        return 0;
-    }
-
+    std::cout << "GSPICE v0.4.0 (Parallel)" << std::endl;
+    if (argc == 1) { run_osdi_test(); print_usage(); return 0; }
     std::string input_file = "";
-    std::string output_file = "output.raw";
-
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            print_usage();
-            return 0;
-        } else if (arg == "-v" || arg == "--version") {
-            std::cout << "GSPICE v0.4.0 - Next-Gen Circuit Simulator Core" << std::endl;
-            std::cout << "Architecture: x64 | Sparse-Solver: KLU-Bridge | OSDI-Host: v1.0" << std::endl;
-            return 0;
-        } else if (arg == "-o" && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg[0] != '-') {
-            input_file = arg;
-        }
+        if (arg == "-v" || arg == "--version") { std::cout << "GSPICE v0.4.0 (Parallel)" << std::endl; return 0; }
+        if (arg[0] != '-') input_file = arg;
     }
-
-    if (input_file.empty()) {
-        print_usage();
-        return 1;
-    }
-
+    if (input_file.empty()) { print_usage(); return 1; }
     Netlist netlist = Parser::parse(input_file);
     if (netlist.getDevices().empty()) return 1;
-
     run_simulation(netlist);
     return 0;
 }

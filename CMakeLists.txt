@@ -7,8 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Include directories
 include_directories(include)
 
-# Find SuiteSparse/KLU if available (we will add this properly later)
-# find_package(SuiteSparse REQUIRED)
+# Find and enable OpenMP
+find_package(OpenMP REQUIRED)
 
 # Core source files
 set(GSPICE_CORE_SOURCES
@@ -17,5 +17,9 @@ set(GSPICE_CORE_SOURCES
 )
 
 add_executable(gspice ${GSPICE_CORE_SOURCES})
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(gspice PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 target_include_directories(gspice PRIVATE include)

@@ -3,18 +3,20 @@
 
 #include "osdi.h"
 #include <cmath>
+#include <algorithm>
 #include <iostream>
 
 namespace gspice {
 
-/**
- * Emulates a compiled OSDI shared library in memory.
- * Used to verify the OSDI bridge when OpenVAF is not present.
- */
 class OsdiEmulator {
 public:
     static void evaluate_diode(void* instance_data, OsdiEvaluationData* data) {
         double Vd = data->voltages[0] - data->voltages[1];
+        
+        // Stabilizing limit
+        if (Vd > 0.8) Vd = 0.8;
+        if (Vd < -2.0) Vd = -2.0;
+
         double Is = 1e-14;
         double Vt = 0.026;
 
@@ -22,24 +24,26 @@ public:
         double Id = Is * (expV - 1.0);
         double gd = (Is / Vt) * expV;
 
-        // OSDI Terminal 0 (Anode), Terminal 1 (Cathode)
+        // Standard SPICE Convention: Current flowing INTO the terminal is positive.
+        // Terminal 0 (Anode): Current enters => +Id
+        // Terminal 1 (Cathode): Current enters => -Id
         data->currents[0] = Id;
         data->currents[1] = -Id;
 
-        // Jacobian: dI/dV
-        data->jacobian[0*2 + 0] = gd;  // dI0/dV0
-        data->jacobian[0*2 + 1] = -gd; // dI0/dV1
-        data->jacobian[1*2 + 0] = -gd; // dI1/dV0
-        data->jacobian[1*2 + 1] = gd;  // dI1/dV1
+        // Jacobian: dI_in / dV
+        // d(Id)/dV_a = gd,  d(Id)/dV_c = -gd
+        // d(-Id)/dV_a = -gd, d(-Id)/dV_c = gd
+        data->jacobian[0*2 + 0] = gd;
+        data->jacobian[0*2 + 1] = -gd;
+        data->jacobian[1*2 + 0] = -gd;
+        data->jacobian[1*2 + 1] = gd;
     }
 
-    static void* create_instance(void* model_data) {
-        return nullptr; // No instance state needed for this simple diode
-    }
+    static void* create_instance(void* model_data) { return nullptr; }
 
     static OsdiDescriptor getDescriptor() {
         static const char* term_names[] = {"a", "c"};
-        OsdiDescriptor desc;
+        static OsdiDescriptor desc;
         desc.model_name = "lumen_diode_va";
         desc.version_major = 1;
         desc.version_minor = 0;

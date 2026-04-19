@@ -6,17 +6,34 @@
 #include <iomanip>
 #include <cmath>
 #include <complex>
+#include <mutex>
 
 namespace gspice {
 
 /**
  * Templated Vector class.
  * Support for both double (DC/Tran) and std::complex<double> (AC/HB).
+ * Thread-safe for parallel stamping.
  */
 template <typename T>
 class Vector {
 public:
     Vector(int size = 0) : data_(size, T(0)) {}
+
+    // Copy constructor (needed because std::mutex is not copyable)
+    Vector(const Vector& other) {
+        std::lock_guard<std::mutex> lock(other.mutex_);
+        data_ = other.data_;
+    }
+
+    Vector& operator=(const Vector& other) {
+        if (this != &other) {
+            std::lock_guard<std::mutex> lock1(mutex_);
+            std::lock_guard<std::mutex> lock2(other.mutex_);
+            data_ = other.data_;
+        }
+        return *this;
+    }
 
     T& operator[](int index) {
         return data_[index];
@@ -28,6 +45,7 @@ public:
 
     void add(int index, T value) {
         if (index >= 0 && index < (int)data_.size()) {
+            std::lock_guard<std::mutex> lock(mutex_);
             data_[index] += value;
         }
     }
@@ -46,6 +64,7 @@ public:
 
 private:
     std::vector<T> data_;
+    mutable std::mutex mutex_;
 };
 
 /**
@@ -81,9 +100,6 @@ public:
 
     int getSize() const { return size_; }
 
-    /**
-     * Solves Ax = b using Gaussian Elimination with partial pivoting.
-     */
     Vector<T> solve(const Vector<T>& b_in) {
         int n = size_;
         std::vector<T> A = data_;
@@ -91,7 +107,6 @@ public:
         Vector<T> b = b_in;
 
         for (int i = 0; i < n; i++) {
-            // 1. Pivot search
             double maxVal = std::abs(A[i * n + i]);
             int maxRow = i;
             for (int k = i + 1; k < n; k++) {
@@ -100,12 +115,9 @@ public:
                     maxRow = k;
                 }
             }
-
-            // 2. Swap
             for (int k = i; k < n; k++) std::swap(A[maxRow * n + k], A[i * n + k]);
             std::swap(b[maxRow], b[i]);
 
-            // 3. Elimination
             if (std::abs(A[i * n + i]) < 1e-25) continue; 
             for (int k = i + 1; k < n; k++) {
                 T c = A[k * n + i] / A[i * n + i];
@@ -116,7 +128,6 @@ public:
             }
         }
 
-        // 4. Back substitution
         for (int i = n - 1; i >= 0; i--) {
             if (std::abs(A[i * n + i]) < 1e-25) {
                 x[i] = T(0);
@@ -131,14 +142,9 @@ public:
         return x;
     }
 
-    /**
-     * Solves A^T * x = b (The Adjoint System).
-     * Used for Noise and Sensitivity analysis.
-     */
     Vector<T> solveTranspose(const Vector<T>& b_in) {
         int n = size_;
         Matrix<T> At(n);
-        // Transpose the matrix
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
                 At(j, i) = (*this)(i, j);
@@ -152,7 +158,6 @@ private:
     std::vector<T> data_;
 };
 
-// Typedefs for convenience
 using MatrixReal = Matrix<double>;
 using VectorReal = Vector<double>;
 using MatrixComplex = Matrix<std::complex<double>>;

@@ -11,7 +11,6 @@ class OSDIDevice : public Device {
 public:
     OSDIDevice(const std::string& name, const OsdiDescriptor& desc, const std::vector<int>& nodes)
         : Device(name), desc_(desc), nodes_(nodes) {
-        // Create an instance of the model logic
         instance_data_ = desc_.create_instance(nullptr);
     }
 
@@ -36,31 +35,28 @@ public:
         // Call the compiled OSDI model logic
         desc_.evaluate(instance_data_, &eval_data);
 
-        // 1. Stamp Jacobian (conductances)
+        // Standard Newton-Raphson update: J * V_next = J * V_k - I_total
+        // RHS_entry = sum_j(g_ij * V_j) - I_i_total
+        
         for (int i = 0; i < n; ++i) {
             if (nodes_[i] < 0) continue;
+            
+            // 1. Stamp Jacobian (conductances)
             for (int j = 0; j < n; ++j) {
                 if (nodes_[j] < 0) continue;
                 J.add(nodes_[i], nodes_[j], jacobian[i * n + j]);
             }
-        }
 
-        // 2. Stamp RHS (currents)
-        // Ieq_i = I_i - sum_j(g_ij * V_j)
-        for (int i = 0; i < n; ++i) {
-            if (nodes_[i] < 0) continue;
-            double Ieq = currents[i];
+            // 2. Stamp RHS (current equivalents)
+            double rhs_val = -currents[i];
             for (int j = 0; j < n; ++j) {
-                Ieq -= jacobian[i * n + j] * voltages[j];
+                rhs_val += jacobian[i * n + j] * voltages[j];
             }
-            b.add(nodes_[i], -Ieq);
+            b.add(nodes_[i], rhs_val);
         }
     }
 
-    void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        // Linearize at DC OP and stamp small-signal parameters
-        // (Similar to dcStamp but with omega and complex matrix)
-    }
+    void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {}
 
 private:
     OsdiDescriptor desc_;
