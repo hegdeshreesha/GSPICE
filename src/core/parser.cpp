@@ -8,6 +8,7 @@
 #include "devices/port.hpp"
 #include "devices/mosfet.hpp"
 #include "devices/probe.hpp"
+#include "devices/current_source.hpp"
 #include <iostream>
 
 namespace gspice {
@@ -198,6 +199,12 @@ Netlist Parser::parse(const std::string& filePath) {
             // Branch current ID is assigned later during assembly, or we can handle it here
             // For now, let's keep it simple.
             netlist.addDevice(std::make_unique<VoltageSource>(tokens[0], n1, n2, val, -1)); 
+        } else if (firstChar == 'I') {
+            // Current Source: Iname N1 N2 Value
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            double val = Utils::parseValue(tokens[3]);
+            netlist.addDevice(std::make_unique<CurrentSource>(tokens[0], n1, n2, val));
         } else if (firstChar == 'D') {
             // Diode: Dname N1 N2
             int n1 = netlist.getOrCreateNode(tokens[1]);

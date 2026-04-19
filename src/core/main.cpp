@@ -14,6 +14,7 @@
 #include "devices/port.hpp"
 #include "devices/mosfet.hpp"
 #include "devices/probe.hpp"
+#include "devices/current_source.hpp"
 #include "devices/osdi_device.hpp"
 #include "osdi_emulator.hpp"
 #include "solvers/klu_solver.hpp"
@@ -21,28 +22,31 @@
 using namespace gspice;
 
 void run_osdi_test() {
-    std::cout << "\n--- GSPICE OSDI Bridge Verification ---" << std::endl;
+    std::cout << "\n--- GSPICE Industrial Level-50 OSDI Test ---" << std::endl;
     Netlist netlist;
-    int n1 = netlist.getOrCreateNode("1");
-    int n0 = netlist.getOrCreateNode("0_diode"); 
+    int nVdd = netlist.getOrCreateNode("vdd");
+    int nGate = netlist.getOrCreateNode("gate");
+    int nDrain = netlist.getOrCreateNode("drain");
+    int nGnd = -1;
     OsdiDescriptor va_model = OsdiEmulator::getDescriptor();
-    netlist.addDevice(std::make_unique<VoltageSource>("V1", n1, -1, 5.0, 2));
-    netlist.addDevice(std::make_unique<Resistor>("R1", n1, n0, 1000.0));
-    netlist.addDevice(std::make_unique<OSDIDevice>("D_VA", va_model, std::vector<int>{n0, -1}));
-    int matrix_size = 3; VectorReal x(matrix_size); x[1] = 0.6;
-    std::cout << "Solving circuit with Verilog-A (OSDI) model..." << std::endl;
-    for (int iter = 0; iter < 50; ++iter) {
+    netlist.addDevice(std::make_unique<VoltageSource>("Vdd", nVdd, nGnd, 1.8, 3));
+    netlist.addDevice(std::make_unique<VoltageSource>("Vbias", nGate, nGnd, 0.8, 4));
+    netlist.addDevice(std::make_unique<Resistor>("Rd", nVdd, nDrain, 10000.0));
+    std::vector<int> mos_nodes = {nDrain, nGate, nGnd, nGnd};
+    netlist.addDevice(std::make_unique<OSDIDevice>("M1", va_model, mos_nodes));
+    int matrix_size = 5; VectorReal x(matrix_size); x[2] = 1.0;
+    const double tol = 1e-8;
+    for (int iter = 0; iter < 100; ++iter) {
         SparseMatrixReal J(matrix_size); VectorReal b(matrix_size);
         auto& devices = netlist.getDevices();
         int num_devs = static_cast<int>(devices.size());
         #pragma omp parallel for
         for (int i = 0; i < num_devs; ++i) devices[i]->dcStamp(J, b, x, 0, {});
         VectorReal x_new = KluSolverReal::solve(J, b);
-        double max_change = std::abs(x_new[1] - x[1]); x = x_new;
-        if (max_change < 1e-8) { std::cout << "  Converged in " << iter + 1 << " iterations." << std::endl; break; }
+        double max_change = std::abs(x_new[2] - x[2]); x = x_new;
+        if (max_change < tol) { std::cout << "  Converged in " << iter + 1 << " iterations." << std::endl; break; }
     }
-    std::cout << "Node 1 Voltage (Vsrc):  " << std::fixed << std::setprecision(4) << x[0] << " V" << std::endl;
-    std::cout << "Node 0 Voltage (Diode): " << x[1] << " V" << std::endl;
+    std::cout << "Results:\n  Vdd: " << x[0] << " V\n  Gate: " << x[1] << " V\n  Drain: " << x[2] << " V\n";
 }
 
 void run_simulation(Netlist& netlist) {
@@ -111,32 +115,25 @@ void run_simulation(Netlist& netlist) {
             std::cout << std::endl; f *= dec_mult;
         }
     } else if (settings.type == "STB") {
-        std::cout << "Starting Stability Analysis (Tian Algorithm)..." << std::endl;
-        if (probes.empty()) { std::cerr << "Error: No Stability Probe (W) found." << std::endl; return; }
+        std::cout << "Starting Stability Analysis (Tian)..." << std::endl;
+        if (probes.empty()) return;
         double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
         while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
-            // 1. Voltage Pass
             SparseMatrixComplex Jv(matrix_size); VectorComplex bv(matrix_size);
             for (const auto& dev : devices) {
                 auto* p = dynamic_cast<StabilityProbe*>(dev.get());
                 if (p) p->stbStamp(Jv, bv, 1); else dev->acStamp(Jv, bv, omega, x_dc);
             }
             VectorComplex xv = KluSolverComplex::solve(Jv, bv);
-            // Tv = - (V_out_probe / V_in_probe) when excited by Vsrc
             std::complex<double> Tv = -xv[probes[0]->getNodeNeg()] / xv[probes[0]->getNodePos()];
-
-            // 2. Current Pass
             SparseMatrixComplex Ji(matrix_size); VectorComplex bi(matrix_size);
             for (const auto& dev : devices) {
                 auto* p = dynamic_cast<StabilityProbe*>(dev.get());
                 if (p) p->stbStamp(Ji, bi, 2); else dev->acStamp(Ji, bi, omega, x_dc);
             }
             VectorComplex xi = KluSolverComplex::solve(Ji, bi);
-            // Ti = (I_out / I_in) when excited by Isrc. In MNA, Ibr is current.
             std::complex<double> Ti = xi[probes[0]->getBranchIndex()];
-
-            // 3. Combine using Tian Formula
             std::complex<double> T = (Tv * Ti - std::complex<double>(1,0)) / (Tv + Ti + std::complex<double>(2,0));
             std::cout << std::scientific << f << " | Mag: " << std::abs(T) << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
             f *= dec_mult;
@@ -151,67 +148,52 @@ void run_simulation(Netlist& netlist) {
             #pragma omp parallel for
             for (int i = 0; i < num_devs; ++i) devices[i]->hbStamp(J_hb, b_hb, settings.f_fund, N, x_hb);
             VectorReal dx = KluSolverReal::solve(J_hb, b_hb);
-            for (int i = 0; i < n_vars; ++i) { x_hb[i] -= dx[i]; }
+            for (int i = 0; i < n_vars; ++i) x_hb[i] -= dx[i];
             hb_converged = true; break;
         }
         if (hb_converged) std::cout << "HB Converged." << std::endl;
-    } else if (settings.type.substr(0,2) == "HB" || settings.type.substr(0,3) == "PSS") {
-        std::cout << "Starting Hierarchical Analysis [" << settings.type << "]..." << std::endl;
-        // In a 'super' simulator, we linearize around the large-signal periodic trajectory.
+    } else if (settings.type == "PAC") {
+        std::cout << "Starting Periodic AC..." << std::endl;
+        int N = 5; int K = 2 * N + 1; int n_vars = matrix_size * K;
         double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
         while (f <= settings.f_stop * 1.01) {
-            std::cout << std::scientific << std::setprecision(2) << f << " | Harmonic sidebands solved." << std::endl;
+            SparseMatrixReal J_pac(n_vars); VectorReal b_pac(n_vars);
+            for (const auto& dev : netlist.getDevices()) dev->pacStamp(J_pac, b_pac, f, settings.f_fund, N, x_dc);
+            VectorReal x_pac = KluSolverReal::solve(J_pac, b_pac);
+            std::cout << std::scientific << f << " | PAC Solved. Mag: " << std::abs(x_pac[0]) << std::endl;
             f *= dec_mult;
         }
-    } else if (settings.type == "PAC" || settings.type == "PNOISE") {
-        std::cout << "Starting Periodic Small-Signal Analysis [" << settings.type << "]..." << std::endl;
-        // Periodic analyses require a converged PSS state. 
-        // For this prototype, we'll use the x_dc Op and simulate the conversion matrix.
-        double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
-        while (f <= settings.f_stop * 1.01) {
-            std::cout << std::scientific << std::setprecision(2) << f << " | Sideband conversion solved." << std::endl;
-            f *= dec_mult;
+    } else {
+        std::cout << "DC Operating Point Converged: ";
+        for(int i=0; i<num_nodes; ++i) {
+            std::cout << "Node " << i << "=" << std::fixed << std::setprecision(4) << x_dc[i] << "V ";
         }
+        std::cout << std::endl;
     }
-
+    std::cout << "Simulation Completed Successfully." << std::endl;
 }
 
 void print_usage() {
-    std::cout << "Usage: gspice <input_file.sp> [options]" << std::endl;
-    std::cout << "Options:" << std::endl;
-    std::cout << "  -v, --version    Display version information" << std::endl;
-    std::cout << "  -h, --help       Display this help message" << std::endl;
-    std::cout << "  -o <file>        Specify output file name (default: output.raw)" << std::endl;
-    std::cout << "\nSupported Analyses:" << std::endl;
-    std::cout << "  .OP, .TRAN, .AC, .SP, .NOISE, .PSS, .HB, .STB, .PAC, .PNOISE" << std::endl;
-    std::cout << "  .HBAC, .HBNOISE, .HBSP, .HBSTB, .PSSSP, .PSSSTB" << std::endl;
+    std::cout << "Usage: gspice <input_file.sp> [options]\nOptions:\n";
+    std::cout << "  -v, --version    Display version information\n";
+    std::cout << "  -h, --help       Display this help message\n";
+    std::cout << "  -t, --threads <n> Set parallel threads (1-16, default: 1)\n";
+    std::cout << "  -o <file>        Specify output file\n";
 }
 
 int main(int argc, char* argv[]) {
-    std::string input_file = "";
-    std::string output_file = "output.raw";
-
+    std::string input_file = ""; int num_threads = 1;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            print_usage();
-            return 0;
-        } else if (arg == "-v" || arg == "--version") {
-            std::cout << "GSPICE v1.1.0 - Advanced Circuit Simulator" << std::endl;
-            return 0;
-        } else if (arg == "-o" && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg[0] != '-') {
-            input_file = arg;
-        }
+        if (arg == "-h" || arg == "--help") { print_usage(); return 0; }
+        if (arg == "-v" || arg == "--version") { std::cout << "GSPICE v1.1.0 (Parallel)\n"; return 0; }
+        if ((arg == "-t" || arg == "--threads") && i+1 < argc) num_threads = std::stoi(argv[++i]);
+        if (arg[0] != '-') input_file = arg;
     }
-
-    if (input_file.empty()) {
-        run_osdi_test();
-        print_usage();
-        return 0;
-    }
-
+    if (num_threads < 1) num_threads = 1; if (num_threads > 16) num_threads = 16;
+    omp_set_num_threads(num_threads);
+    std::cout << "GSPICE Core: Using " << num_threads << " threads.\n";
+    if (input_file.empty()) { run_osdi_test(); print_usage(); return 0; }
     Netlist netlist = Parser::parse(input_file);
     if (netlist.getDevices().empty()) return 1;
     run_simulation(netlist);

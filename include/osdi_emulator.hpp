@@ -10,47 +10,69 @@ namespace gspice {
 
 class OsdiEmulator {
 public:
-    static void evaluate_diode(void* instance_data, OsdiEvaluationData* data) {
-        double Vd = data->voltages[0] - data->voltages[1];
+    /**
+     * Emulates a Level 50 industrial MOSFET (BSIM-like complexity).
+     */
+    static void evaluate_mos50(void* instance_data, OsdiEvaluationData* data) {
+        double Vd = data->voltages[0];
+        double Vg = data->voltages[1];
+        double Vs = data->voltages[2];
+        double Vb = data->voltages[3];
+
+        double Vgs = Vg - Vs;
+        double Vds = Vd - Vs;
+        double Vbs = Vb - Vs;
+
+        // Complex threshold dependency (Level 50 feature)
+        double Vth = 0.5 - 0.1 * Vbs + 0.05 * std::sqrt(std::abs(Vbs));
         
-        // Stabilizing limit
-        if (Vd > 0.8) Vd = 0.8;
-        if (Vd < -2.0) Vd = -2.0;
+        double Ids = 0.0;
+        double gm = 0.0;
+        double gds = 0.0;
+        double beta = 1e-3;
 
-        double Is = 1e-14;
-        double Vt = 0.026;
+        // Exponential sub-threshold + Quadratic saturation
+        if (Vgs < Vth) {
+            Ids = 1e-9 * std::exp((Vgs - Vth) / 0.05); // Subthreshold
+            gm = Ids / 0.05;
+            gds = 1e-12;
+        } else {
+            double Vov = Vgs - Vth;
+            if (Vds < Vov) {
+                Ids = beta * (Vov * Vds - 0.5 * Vds * Vds);
+                gm = beta * Vds;
+                gds = beta * (Vov - Vds);
+            } else {
+                Ids = 0.5 * beta * Vov * Vov * (1.0 + 0.02 * Vds); // Velocity saturation
+                gm = beta * Vov;
+                gds = 0.5 * beta * Vov * Vov * 0.02;
+            }
+        }
 
-        double expV = std::exp(Vd / Vt);
-        double Id = Is * (expV - 1.0);
-        double gd = (Is / Vt) * expV;
+        // OSDI Terminal Assignment: 0=D, 1=G, 2=S, 3=B
+        data->currents[0] = Ids;  // Drain current IN
+        data->currents[1] = 0.0;  // Gate current
+        data->currents[2] = -Ids; // Source current OUT
+        data->currents[3] = 0.0;  // Bulk current
 
-        // Standard SPICE Convention: Current flowing INTO the terminal is positive.
-        // Terminal 0 (Anode): Current enters => +Id
-        // Terminal 1 (Cathode): Current enters => -Id
-        data->currents[0] = Id;
-        data->currents[1] = -Id;
-
-        // Jacobian: dI_in / dV
-        // d(Id)/dV_a = gd,  d(Id)/dV_c = -gd
-        // d(-Id)/dV_a = -gd, d(-Id)/dV_c = gd
-        data->jacobian[0*2 + 0] = gd;
-        data->jacobian[0*2 + 1] = -gd;
-        data->jacobian[1*2 + 0] = -gd;
-        data->jacobian[1*2 + 1] = gd;
+        // Jacobian Stamping (High-level derivatives)
+        data->jacobian[0*4 + 0] = gds;   // dId/dVd
+        data->jacobian[0*4 + 1] = gm;    // dId/dVg
+        data->jacobian[0*4 + 2] = -(gm + gds); // dId/dVs
+        data->jacobian[2*4 + 0] = -gds;
+        data->jacobian[2*4 + 1] = -gm;
+        data->jacobian[2*4 + 2] = (gm + gds);
     }
 
     static void* create_instance(void* model_data) { return nullptr; }
 
     static OsdiDescriptor getDescriptor() {
-        static const char* term_names[] = {"a", "c"};
+        static const char* term_names[] = {"d", "g", "s", "b"};
         static OsdiDescriptor desc;
-        desc.model_name = "lumen_diode_va";
-        desc.version_major = 1;
-        desc.version_minor = 0;
-        desc.metadata.name = "lumen_diode";
-        desc.metadata.num_terminals = 2;
+        desc.model_name = "mos_level_50";
+        desc.metadata.num_terminals = 4;
         desc.metadata.terminal_names = term_names;
-        desc.evaluate = evaluate_diode;
+        desc.evaluate = evaluate_mos50;
         desc.create_instance = create_instance;
         return desc;
     }

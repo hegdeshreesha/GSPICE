@@ -40,9 +40,7 @@ public:
 
     void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) override {
         double G = getConductance();
-        int K = 2 * n_harms + 1; // Size of harmonic block per node
-
-        // Stamp G for DC and every Cos/Sin harmonic component
+        int K = 2 * n_harms + 1;
         for (int k = 0; k < K; ++k) {
             J.add(nodePos_ * K + k, nodePos_ * K + k, G);
             J.add(nodeNeg_ * K + k, nodeNeg_ * K + k, G);
@@ -50,6 +48,12 @@ public:
             J.add(nodeNeg_ * K + k, nodePos_ * K + k, -G);
         }
     }
+
+    void pacStamp(SparseMatrixReal& J, VectorReal& b, double f_in, double f_fund, int n_harms, const VectorReal& x_periodic) override {
+        hbStamp(J, b, f_fund, n_harms, x_periodic); // Resistor is freq-independent, same as HB
+    }
+
+private:
     int nodePos_;
     int nodeNeg_;
     double value_;

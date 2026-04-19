@@ -39,6 +39,16 @@ public:
      */
     virtual void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) {}
 
+    /**
+     * Stamping for Periodic Small-Signal analysis (PAC/HBAC).
+     * @param J The large Conversion Matrix
+     * @param b The RHS sideband vector
+     * @param f_in Input small-signal frequency
+     * @param f_fund Periodic fundamental frequency
+     * @param x_periodic The converged PSS or HB state
+     */
+    virtual void pacStamp(SparseMatrixReal& J, VectorReal& b, double f_in, double f_fund, int n_harms, const VectorReal& x_periodic) {}
+
 protected:
     std::string name_;
 };
