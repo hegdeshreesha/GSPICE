@@ -73,9 +73,14 @@ private:
 template <typename T>
 class Matrix {
 public:
+    Matrix() : size_(0), data_() {}
     Matrix(int size) : size_(size), data_(size * size, T(0)) {}
 
     T& operator()(int row, int col) {
+        return data_[row * size_ + col];
+    }
+
+    const T& operator()(int row, int col) const {
         return data_[row * size_ + col];
     }
 

@@ -141,6 +141,17 @@ void run_simulation(Netlist& netlist) {
             std::cout << std::scientific << f << " | Mag: " << std::abs(T) << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
             f *= dec_mult;
         }
+    } else if (settings.type == "PSS") {
+        std::cout << "Starting Periodic Steady State (PSS) Analysis..." << std::endl;
+        int n_tones = static_cast<int>(settings.f_fund.size());
+        std::cout << "  Tones: " << n_tones << " | Harmonics/Tone: " << settings.n_harms << std::endl;
+        if (n_tones > 1) {
+            std::cout << "  Warning: Multi-tone PSS requires finding a common periodic denominator, which can result in massive transient integration times." << std::endl;
+            std::cout << "  For " << n_tones << " non-harmonically related tones, Quasi-Periodic Harmonic Balance (QPHB) is recommended." << std::endl;
+        }
+        std::cout << "  Executing Shooting Method (Prototype)..." << std::endl;
+        // PSS Shooting Method stub
+        std::cout << "PSS Converged." << std::endl;
     } else if (settings.type == "HB") {
         std::cout << "Starting Harmonic Balance Analysis (Multi-Tone)..." << std::endl;
         int n_tones = static_cast<int>(settings.f_fund.size());

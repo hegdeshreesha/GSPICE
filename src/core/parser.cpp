@@ -9,6 +9,7 @@
 #include "devices/mosfet.hpp"
 #include "devices/probe.hpp"
 #include "devices/current_source.hpp"
+#include "devices/multi_port.hpp"
 #include <iostream>
 
 namespace gspice {
@@ -191,6 +192,33 @@ Netlist Parser::parse(const std::string& filePath) {
             double z0 = 50.0;
             if (tokens.size() > 4) z0 = Utils::parseValue(tokens[4]);
             netlist.addDevice(std::make_unique<Port>(tokens[0], n1, n2, pNum, z0));
+        } else if (firstChar == 'S') {
+            // S-parameter Multi-port Device: Sname N1 N2 ... Nn file="data.sNp"
+            std::vector<int> nodes;
+            size_t token_idx = 1;
+            while (token_idx < tokens.size()) {
+                bool is_num = !tokens[token_idx].empty() && (std::isdigit(tokens[token_idx][0]) || (tokens[token_idx][0] == '-' && tokens[token_idx].length() > 1 && std::isdigit(tokens[token_idx][1])));
+                if (is_num) {
+                    nodes.push_back(netlist.getOrCreateNode(tokens[token_idx]));
+                } else {
+                    break;
+                }
+                token_idx++;
+            }
+            std::string filename = "";
+            for (; token_idx < tokens.size(); ++token_idx) {
+                std::string tok = tokens[token_idx];
+                std::transform(tok.begin(), tok.end(), tok.begin(), ::toupper);
+                if (tok.substr(0, 5) == "FILE=") {
+                    filename = tokens[token_idx].substr(5);
+                    if (!filename.empty() && filename.front() == '"') filename = filename.substr(1, filename.size()-2);
+                }
+            }
+            if (filename.empty()) {
+                std::cerr << "Error: S-parameter device " << tokens[0] << " requires file=\"path\"" << std::endl;
+                continue;
+            }
+            netlist.addDevice(std::make_unique<MultiPort>(tokens[0], nodes, nodes.size(), filename));
         } else if (firstChar == 'M') {
             // MOSFET: Mname D G S B Model [W=..] [L=..]
             int nD = netlist.getOrCreateNode(tokens[1]);
