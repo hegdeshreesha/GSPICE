@@ -6,6 +6,12 @@ $DistDir = "dist/gspice_v$Version`_win64"
 
 Write-Host "--- Packaging GSPICE v$Version ---" -ForegroundColor Cyan
 
+# Avoid MSBuild PATH/Path collision in some PowerShell environments.
+if (Test-Path Env:PATH) {
+    $env:Path = $env:PATH
+    Remove-Item Env:PATH -ErrorAction SilentlyContinue
+}
+
 # 1. Clean and Build in Release mode
 Remove-Item -Path build -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path build

@@ -5,6 +5,7 @@
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <map>
 #include "device.hpp"
 
 namespace gspice {
@@ -47,10 +48,19 @@ public:
         }
         int new_id = next_node_id_++;
         node_map_[name] = new_id;
+        node_names_[new_id] = name;
         return new_id;
     }
 
     int getNumNodes() const { return next_node_id_; }
+
+    std::string getNodeName(int index) const {
+        auto it = node_names_.find(index);
+        if (it != node_names_.end()) {
+            return it->second;
+        }
+        return "node" + std::to_string(index);
+    }
     
     const std::vector<std::unique_ptr<Device>>& getDevices() const {
         return devices_;
@@ -68,10 +78,29 @@ public:
         model_lib_map_[name] = path;
     }
 
+    void addWarning(const std::string& message) {
+        warnings_.push_back(message);
+    }
+
+    void addError(const std::string& message) {
+        errors_.push_back(message);
+    }
+
+    const std::vector<std::string>& getWarnings() const {
+        return warnings_;
+    }
+
+    const std::vector<std::string>& getErrors() const {
+        return errors_;
+    }
+
 private:
     std::vector<std::unique_ptr<Device>> devices_;
     std::unordered_map<std::string, int> node_map_;
+    std::map<int, std::string> node_names_;
     std::unordered_map<std::string, std::string> model_lib_map_;
+    std::vector<std::string> warnings_;
+    std::vector<std::string> errors_;
     int next_node_id_ = 0;
     int next_branch_id_ = 0; // We'll need this for voltage sources
     SimulationSettings settings_;

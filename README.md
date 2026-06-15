@@ -1,31 +1,39 @@
 # GSPICE
-**The Next-Generation Parallel Open-Source Circuit Simulator Core**
 
-GSPICE is a high-performance, object-oriented circuit simulator built from the ground up to be a "Super Form" successor to Ngspice and Xyce. It combines modern C++ architecture with industrial-grade stability and advanced RF analysis capabilities.
+**Lumen's Experimental Native Circuit Simulator Core**
 
-## 🚀 Key Features
-*   **Parallel Core:** Fully multi-threaded device evaluation and matrix stamping using OpenMP. Scalable up to 16 threads for massive designs.
-*   **Universal Models (OSDI):** Native **Open Simulation Device Interface** host. Dynamically load professional Verilog-A models (BSIM4, PSP, HICUM) compiled with OpenVAF.
-*   **Industrial Stability:** Verified against **Level-50 Industrial MOSFET models**. Robust convergence using G-min stepping and Newton-Raphson damping.
-*   **Scalable Math:** High-efficiency **Sparse Matrix** architecture with a bridge for **KLU (SuiteSparse)**, the industry gold-standard for circuit simulation.
-*   **Professional CLI:** Full-featured command-line interface with thread control, help systems, and standard SPICE output formatting.
+GSPICE is an experimental C++ SPICE-like simulator being developed as the native simulation engine for Lumen Circuit Studio. The current codebase is useful for primitive-device bring-up and Lumen integration work, but it is not yet a replacement for production simulators such as Cadence Spectre, ngspice, or Xyce.
 
-## 🛰️ Advanced Analysis Suite
-GSPICE supports 15+ industrial analysis types:
-*   **Standard:** `.OP`, `.TRAN`, `.AC`, `.NOISE`
-*   **RF Core:** `.PSS` (Shooting Method), `.HB` (Harmonic Balance), `.SP` (S-Parameters)
-*   **RF Advanced:** `.PAC`, `.PNOISE`, `.HBAC`, `.HBNOISE`, `.HBSP`
-*   **Stability:** `.STB`, `.HBSTB`, `.PSSSTB` (Using the Tian Loop-Break Algorithm)
+## Current Features
 
-## 🛠️ Installation & Build
-GSPICE uses CMake for a professional cross-platform build experience.
+- Primitive MNA stamping for R, C, L, V, I, diode, simple MOS, ports, probes, and simple S-parameter devices.
+- `.OP`, `.TRAN`, and `.AC` paths for supported primitive circuits.
+- OpenMP-assisted device stamping.
+- Named-node stdout output for Lumen waveform import.
+- Explicit diagnostics for unsupported subcircuit instances and unsupported model/include directives.
+
+## Major Gaps
+
+- No real `.SUBCKT` expansion yet.
+- No `.LIB` / `.INCLUDE` foundry model parsing yet.
+- No production BSIM/PSP/HICUM-class compact model support yet.
+- The current KLU bridge still falls back to a dense solver.
+- RF/PSS/HB/noise/stability analyses are prototype-level and need validation.
+
+See `docs/GSPICE_AUDIT_ROADMAP.md` for the current audit and roadmap.
+
+## Installation And Build
+
+GSPICE uses CMake.
 
 ### Prerequisites
-*   CMake 3.10+
-*   C++17 Compiler (MSVC 2022, GCC, or Clang)
-*   OpenMP 2.0+
 
-### Build Instructions
+- CMake 3.10+
+- C++17 compiler, such as MSVC, GCC, or Clang
+- OpenMP
+
+### Build
+
 ```powershell
 mkdir build
 cd build
@@ -33,18 +41,16 @@ cmake ..
 cmake --build . --config Release
 ```
 
-## 💻 Usage
+If MSBuild fails on Windows with a duplicate `Path` / `PATH` environment error, run CMake from a clean process environment.
+
+## Usage
+
 ```powershell
-# Run a simulation on 8 threads
-gspice my_circuit.sp --threads 8
-
-# Specify a custom output file
-gspice lna_test.sp -o lna_results.raw
-
-# View help and version
+gspice my_circuit.sp --threads 1
 gspice --help
 gspice --version
 ```
 
-## 📄 License
-GSPICE is licensed under the **Apache License, Version 2.0**.
+## License
+
+GSPICE is licensed under the Apache License, Version 2.0.

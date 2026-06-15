@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iomanip>
 #include <algorithm>
+#include <exception>
 #include <omp.h>
 #include "parser.hpp"
 #include "devices/resistor.hpp"
@@ -86,6 +87,11 @@ void run_simulation(Netlist& netlist) {
     if (settings.type == "TRAN") {
         std::cout << "Starting Transient Analysis..." << std::endl;
         std::vector<VectorReal> x_hist; VectorReal x = x_dc; x_hist.push_back(x);
+        std::cout << "time | ";
+        for (int i = 0; i < num_nodes; ++i) {
+            std::cout << "V(" << netlist.getNodeName(i) << ") ";
+        }
+        std::cout << std::endl;
         for (double t = settings.t_step; t <= settings.t_stop; t += settings.t_step) {
             for (int iter = 0; iter < 50; ++iter) {
                 SparseMatrixReal J_sparse(matrix_size); VectorReal b(matrix_size);
@@ -97,7 +103,7 @@ void run_simulation(Netlist& netlist) {
                 x = x_new; if (max_change < 1e-6) break;
             }
             x_hist.push_back(x);
-            std::cout << std::fixed << std::setprecision(6) << t << " | ";
+            std::cout << std::scientific << std::setprecision(9) << t << " | ";
             for(int i=0; i<num_nodes; ++i) std::cout << x[i] << " ";
             std::cout << std::endl;
         }
@@ -187,7 +193,8 @@ void run_simulation(Netlist& netlist) {
     } else {
         std::cout << "DC Operating Point Converged: ";
         for(int i=0; i<num_nodes; ++i) {
-            std::cout << "Node " << i << "=" << std::fixed << std::setprecision(4) << x_dc[i] << "V ";
+            std::cout << "Node " << i << "=" << std::fixed << std::setprecision(6) << x_dc[i]
+                      << "V [" << netlist.getNodeName(i) << "] ";
         }
         std::cout << std::endl;
     }
@@ -216,7 +223,21 @@ int main(int argc, char* argv[]) {
     std::cout << "GSPICE Core: Using " << num_threads << " threads.\n";
     if (input_file.empty()) { run_osdi_test(); print_usage(); return 0; }
     Netlist netlist = Parser::parse(input_file);
+    for (const auto& warning : netlist.getWarnings()) {
+        std::cerr << "WARNING: " << warning << std::endl;
+    }
+    if (!netlist.getErrors().empty()) {
+        for (const auto& error : netlist.getErrors()) {
+            std::cerr << "ERROR: " << error << std::endl;
+        }
+        return 2;
+    }
     if (netlist.getDevices().empty()) return 1;
-    run_simulation(netlist);
+    try {
+        run_simulation(netlist);
+    } catch (const std::exception& exc) {
+        std::cerr << "ERROR: Simulation failed: " << exc.what() << std::endl;
+        return 3;
+    }
     return 0;
 }

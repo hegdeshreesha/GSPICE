@@ -7,6 +7,7 @@
 #include <cmath>
 #include <complex>
 #include <mutex>
+#include <stdexcept>
 
 namespace gspice {
 
@@ -123,7 +124,9 @@ public:
             for (int k = i; k < n; k++) std::swap(A[maxRow * n + k], A[i * n + k]);
             std::swap(b[maxRow], b[i]);
 
-            if (std::abs(A[i * n + i]) < 1e-25) continue; 
+            if (std::abs(A[i * n + i]) < 1e-25) {
+                throw std::runtime_error("Singular matrix: zero pivot at row " + std::to_string(i));
+            }
             for (int k = i + 1; k < n; k++) {
                 T c = A[k * n + i] / A[i * n + i];
                 for (int j = i; j < n; j++) {
@@ -135,8 +138,7 @@ public:
 
         for (int i = n - 1; i >= 0; i--) {
             if (std::abs(A[i * n + i]) < 1e-25) {
-                x[i] = T(0);
-                continue;
+                throw std::runtime_error("Singular matrix during back substitution at row " + std::to_string(i));
             }
             T sum = b[i];
             for (int k = i + 1; k < n; k++) {
