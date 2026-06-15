@@ -209,9 +209,16 @@ Netlist Parser::parse(const std::string& filePath) {
             if (cmd == ".END") {
                 break;
             } else if (cmd == ".OP") {
-                SimulationSettings settings;
-                settings.type = "OP";
-                netlist.setSettings(settings);
+                if (netlist.getSettings().type == "OP") {
+                    SimulationSettings settings;
+                    settings.type = "OP";
+                    netlist.setSettings(settings);
+                } else {
+                    netlist.addWarning(
+                        "Line " + std::to_string(lineNo) +
+                        ": .OP kept as operating-point initialization; active analysis remains ." +
+                        netlist.getSettings().type);
+                }
             } else if (cmd == ".LIB" || cmd == ".INCLUDE" || cmd == ".INC") {
                 netlist.addWarning("Line " + std::to_string(lineNo) + ": model/include directive is not implemented yet: " + line);
             } else if (cmd == ".TRAN") {

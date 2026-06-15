@@ -22,6 +22,24 @@
 
 using namespace gspice;
 
+namespace {
+
+constexpr double DEFAULT_GMIN = 1e-12;
+
+void stamp_global_gmin(SparseMatrixReal& J, int num_nodes) {
+    for (int i = 0; i < num_nodes; ++i) {
+        J.add(i, i, DEFAULT_GMIN);
+    }
+}
+
+void stamp_global_gmin(SparseMatrixComplex& J, int num_nodes) {
+    for (int i = 0; i < num_nodes; ++i) {
+        J.add(i, i, {DEFAULT_GMIN, 0.0});
+    }
+}
+
+} // namespace
+
 void run_osdi_test() {
     std::cout << "\n--- GSPICE Industrial Level-50 OSDI Test ---" << std::endl;
     Netlist netlist;
@@ -75,6 +93,7 @@ void run_simulation(Netlist& netlist) {
         std::cout << "Calculating DC Operating Point..." << std::endl;
         for (int iter = 0; iter < 100; ++iter) {
             SparseMatrixReal J_sparse(matrix_size); VectorReal b(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes);
             #pragma omp parallel for
             for (int i = 0; i < num_devs; ++i) devices[i]->dcStamp(J_sparse, b, x_dc, 0, {});
             VectorReal x_new = KluSolverReal::solve(J_sparse, b);
@@ -95,6 +114,7 @@ void run_simulation(Netlist& netlist) {
         for (double t = settings.t_step; t <= settings.t_stop; t += settings.t_step) {
             for (int iter = 0; iter < 50; ++iter) {
                 SparseMatrixReal J_sparse(matrix_size); VectorReal b(matrix_size);
+                stamp_global_gmin(J_sparse, num_nodes);
                 #pragma omp parallel for
                 for (int i = 0; i < num_devs; ++i) devices[i]->dcStamp(J_sparse, b, x, settings.t_step, x_hist);
                 VectorReal x_new = KluSolverReal::solve(J_sparse, b);
@@ -113,6 +133,7 @@ void run_simulation(Netlist& netlist) {
         while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
             SparseMatrixComplex J_sparse(matrix_size); VectorComplex b_ac(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes);
             #pragma omp parallel for
             for (int i = 0; i < num_devs; ++i) devices[i]->acStamp(J_sparse, b_ac, omega, x_dc);
             VectorComplex x_ac = KluSolverComplex::solve(J_sparse, b_ac);
