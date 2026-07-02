@@ -1,0 +1,6 @@
+.LIB slow
+Rslow out 0 2k
+.ENDL
+.LIB fast
+Rfast out 0 1k
+.ENDL

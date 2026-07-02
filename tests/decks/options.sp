@@ -1,0 +1,7 @@
+* Solver options smoke deck
+.OPTIONS RELTOL=1e-4 VNTOL=1e-8 ABSTOL=1e-13 GMIN=1e-11 ITL1=25 ITL4=30 METHOD=AUTO
+V1 in 0 PULSE(1 2 0 1n 1n 5n 10n)
+R1 in 0 1k
+.OP
+.TRAN 1n 3n
+.END

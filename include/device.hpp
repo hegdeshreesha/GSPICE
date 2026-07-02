@@ -18,7 +18,32 @@ public:
     /**
      * Stamping for DC and Transient analysis (Real numbers).
      */
-    virtual void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) = 0;
+    virtual void dcStamp(
+        SparseMatrixReal& J,
+        VectorReal& b,
+        const VectorReal& x,
+        double timeStep,
+        double currentTime,
+        const std::vector<VectorReal>& x_hist) = 0;
+
+    /**
+     * Called after a transient timestep has converged and is accepted.
+     * Devices with internal dynamic state can commit next-state buffers here.
+     */
+    virtual void acceptTransientStep(const VectorReal& x, double currentTime) {
+        (void)x;
+        (void)currentTime;
+    }
+
+    /**
+     * Time points where independent source waveforms or device behavior change
+     * abruptly. Transient analysis uses these breakpoints to land on edges
+     * without forcing tiny timesteps everywhere.
+     */
+    virtual void collectBreakpoints(double t_stop, std::vector<double>& points) const {
+        (void)t_stop;
+        (void)points;
+    }
 
     /**
      * Stamping for AC analysis (Complex numbers).

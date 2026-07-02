@@ -60,13 +60,36 @@ public:
         acMagnitude_ = value;
     }
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void collectBreakpoints(double t_stop, std::vector<double>& points) const override {
+        if (t_stop <= 0.0) return;
+        auto add = [&](double t) {
+            if (t >= 0.0 && t <= t_stop) points.push_back(t);
+        };
+        if (waveformType_ == WaveformType::PULSE) {
+            const double tr = (pulse_.tr > 0.0) ? pulse_.tr : 1e-18;
+            const double tf = (pulse_.tf > 0.0) ? pulse_.tf : 1e-18;
+            const double period = pulse_.per > 0.0 ? pulse_.per : t_stop + 1.0;
+            for (double base = pulse_.td; base <= t_stop; base += period) {
+                add(base);
+                add(base + tr);
+                add(base + tr + pulse_.pw);
+                add(base + tr + pulse_.pw + tf);
+                if (pulse_.per <= 0.0) break;
+            }
+        } else if (waveformType_ == WaveformType::PWL) {
+            for (double t : pwlTimes_) add(t);
+        } else if (waveformType_ == WaveformType::SIN && sin_.td > 0.0) {
+            add(sin_.td);
+        }
+    }
+
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (branchIndex_ < 0) return;
         J.add(nodePos_, branchIndex_, 1.0);
         J.add(nodeNeg_, branchIndex_, -1.0);
         J.add(branchIndex_, nodePos_, 1.0);
         J.add(branchIndex_, nodeNeg_, -1.0);
-        b.add(branchIndex_, evaluateSourceValue(timeStep, x_hist));
+        b.add(branchIndex_, evaluateAt(currentTime));
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
@@ -102,18 +125,19 @@ public:
 private:
     static constexpr double PI_ = 3.14159265358979323846;
 
-    double evaluateSourceValue(double timeStep, const std::vector<VectorReal>& x_hist) const {
-        if (timeStep <= 0.0 || x_hist.empty()) {
+public:
+    double evaluateAt(double time) const {
+        if (time <= 0.0) {
             return dcValue_;
         }
-        const double t = timeStep * static_cast<double>(x_hist.size());
 
-        if (waveformType_ == WaveformType::PULSE) return evalPulse(t);
-        if (waveformType_ == WaveformType::SIN) return evalSin(t);
-        if (waveformType_ == WaveformType::PWL) return evalPwl(t);
+        if (waveformType_ == WaveformType::PULSE) return evalPulse(time);
+        if (waveformType_ == WaveformType::SIN) return evalSin(time);
+        if (waveformType_ == WaveformType::PWL) return evalPwl(time);
         return dcValue_;
     }
 
+private:
     double evalPulse(double t) const {
         if (t < pulse_.td) return pulse_.v1;
         double tr = (pulse_.tr > 0.0) ? pulse_.tr : 1e-18;

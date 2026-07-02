@@ -11,7 +11,7 @@ public:
     Inductor(const std::string& name, int nodePos, int nodeNeg, double value, int branchIndex = -1)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), value_(value), branchIndex_(branchIndex) {}
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (branchIndex_ < 0) return;
         if (timeStep <= 0) {
             J.add(nodePos_, branchIndex_, 1.0);

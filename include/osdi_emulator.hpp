@@ -13,11 +13,13 @@ public:
     /**
      * Emulates a Level 50 industrial MOSFET (BSIM-like complexity).
      */
-    static void evaluate_mos50(void* instance_data, OsdiEvaluationData* data) {
-        double Vd = data->voltages[0];
-        double Vg = data->voltages[1];
-        double Vs = data->voltages[2];
-        double Vb = data->voltages[3];
+    static void evaluate_mos50(void* instance_data, const double* voltages, double* currents, double* charges, double* jacobian) {
+        (void)instance_data;
+        (void)charges;
+        double Vd = voltages[0];
+        double Vg = voltages[1];
+        double Vs = voltages[2];
+        double Vb = voltages[3];
 
         double Vgs = Vg - Vs;
         double Vds = Vd - Vs;
@@ -50,30 +52,36 @@ public:
         }
 
         // OSDI Terminal Assignment: 0=D, 1=G, 2=S, 3=B
-        data->currents[0] = Ids;  // Drain current IN
-        data->currents[1] = 0.0;  // Gate current
-        data->currents[2] = -Ids; // Source current OUT
-        data->currents[3] = 0.0;  // Bulk current
+        currents[0] = Ids;  // Drain current IN
+        currents[1] = 0.0;  // Gate current
+        currents[2] = -Ids; // Source current OUT
+        currents[3] = 0.0;  // Bulk current
 
         // Jacobian Stamping (High-level derivatives)
-        data->jacobian[0*4 + 0] = gds;   // dId/dVd
-        data->jacobian[0*4 + 1] = gm;    // dId/dVg
-        data->jacobian[0*4 + 2] = -(gm + gds); // dId/dVs
-        data->jacobian[2*4 + 0] = -gds;
-        data->jacobian[2*4 + 1] = -gm;
-        data->jacobian[2*4 + 2] = (gm + gds);
+        jacobian[0*4 + 0] = gds;   // dId/dVd
+        jacobian[0*4 + 1] = gm;    // dId/dVg
+        jacobian[0*4 + 2] = -(gm + gds); // dId/dVs
+        jacobian[2*4 + 0] = -gds;
+        jacobian[2*4 + 1] = -gm;
+        jacobian[2*4 + 2] = (gm + gds);
     }
 
     static void* create_instance(void* model_data) { return nullptr; }
 
     static OsdiDescriptor getDescriptor() {
         static const char* term_names[] = {"d", "g", "s", "b"};
+        static OsdiNode nodes[4] = {};
         static OsdiDescriptor desc;
+        desc.name = const_cast<char*>("mos_level_50");
         desc.model_name = "mos_level_50";
-        desc.metadata.num_terminals = 4;
-        desc.metadata.terminal_names = term_names;
-        desc.evaluate = evaluate_mos50;
-        desc.create_instance = create_instance;
+        desc.num_nodes = 4;
+        desc.num_terminals = 4;
+        desc.nodes = nodes;
+        for (int i = 0; i < 4; ++i) {
+            nodes[i].name = const_cast<char*>(term_names[i]);
+        }
+        desc.legacy_evaluate = evaluate_mos50;
+        desc.legacy_create_instance = create_instance;
         return desc;
     }
 };

@@ -11,7 +11,7 @@ public:
     Capacitor(const std::string& name, int nodePos, int nodeNeg, double value)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), value_(value) {}
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (timeStep <= 0) return; 
         double Geq = value_ / timeStep;
         if (x_hist.empty()) return;

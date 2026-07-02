@@ -15,7 +15,7 @@ public:
     int getNodePos() const { return nodePos_; }
     int getNodeNeg() const { return nodeNeg_; }
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         double G = getConductance();
         J.add(nodePos_, nodePos_, G);
         J.add(nodeNeg_, nodeNeg_, G);

@@ -13,7 +13,7 @@ public:
     Diode(const std::string& name, int nodePos, int nodeNeg, double Is = 1e-14, double Vt = 0.026)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), Is_(Is), Vt_(Vt) {}
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         double Vd = ((nodePos_ >= 0) ? x[nodePos_] : 0.0) - ((nodeNeg_ >= 0) ? x[nodeNeg_] : 0.0);
         if (Vd > 0.8) Vd = 0.8; if (Vd < -2.0) Vd = -2.0;
         double expV = std::exp(Vd / Vt_);

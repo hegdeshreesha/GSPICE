@@ -1,50 +1,189 @@
 #ifndef GSPICE_OSDI_H
 #define GSPICE_OSDI_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// OSDI Parameter Types
-typedef enum {
-    OSDI_PARA_TY_REAL = 0,
-    OSDI_PARA_TY_INT = 1,
-    OSDI_PARA_TY_STR = 2
-} OsdiParameterType;
+#define PARA_TY_MASK 3u
+#define PARA_TY_REAL 0u
+#define PARA_TY_INT 1u
+#define PARA_TY_STR 2u
+#define PARA_KIND_MASK (3u << 30)
+#define PARA_KIND_MODEL (0u << 30)
+#define PARA_KIND_INST (1u << 30)
+#define PARA_KIND_OPVAR (2u << 30)
 
-// Model Metadata
-typedef struct {
-    const char* name;
+#define ACCESS_FLAG_READ 0u
+#define ACCESS_FLAG_SET 1u
+#define ACCESS_FLAG_INSTANCE 4u
+
+#define JACOBIAN_ENTRY_RESIST_CONST 1u
+#define JACOBIAN_ENTRY_REACT_CONST 2u
+#define JACOBIAN_ENTRY_RESIST 4u
+#define JACOBIAN_ENTRY_REACT 8u
+
+#define CALC_RESIST_RESIDUAL 1u
+#define CALC_REACT_RESIDUAL 2u
+#define CALC_RESIST_JACOBIAN 4u
+#define CALC_REACT_JACOBIAN 8u
+#define CALC_NOISE 16u
+#define CALC_OP 32u
+#define CALC_RESIST_LIM_RHS 64u
+#define CALC_REACT_LIM_RHS 128u
+#define ENABLE_LIM 256u
+#define INIT_LIM 512u
+#define ANALYSIS_NOISE 1024u
+#define ANALYSIS_DC 2048u
+#define ANALYSIS_AC 4096u
+#define ANALYSIS_TRAN 8192u
+#define ANALYSIS_IC 16384u
+#define ANALYSIS_STATIC 32768u
+#define ANALYSIS_NODESET 65536u
+
+#define EVAL_RET_FLAG_LIM 1u
+#define EVAL_RET_FLAG_FATAL 2u
+#define EVAL_RET_FLAG_FINISH 4u
+#define EVAL_RET_FLAG_STOP 8u
+
+#define INIT_ERR_OUT_OF_BOUNDS 1u
+
+typedef struct OsdiSimParas {
+    char** names;
+    double* vals;
+    char** names_str;
+    char** vals_str;
+} OsdiSimParas;
+
+typedef struct OsdiSimInfo {
+    OsdiSimParas paras;
+    double abstime;
+    double* prev_solve;
+    double* prev_state;
+    double* next_state;
+    uint32_t flags;
+} OsdiSimInfo;
+
+typedef union OsdiInitErrorPayload {
+    uint32_t parameter_id;
+} OsdiInitErrorPayload;
+
+typedef struct OsdiInitError {
+    uint32_t code;
+    OsdiInitErrorPayload payload;
+} OsdiInitError;
+
+typedef struct OsdiInitInfo {
+    uint32_t flags;
+    uint32_t num_errors;
+    OsdiInitError* errors;
+} OsdiInitInfo;
+
+typedef struct OsdiNodePair {
+    uint32_t node_1;
+    uint32_t node_2;
+} OsdiNodePair;
+
+typedef struct OsdiJacobianEntry {
+    OsdiNodePair nodes;
+    uint32_t react_ptr_off;
+    uint32_t flags;
+} OsdiJacobianEntry;
+
+typedef struct OsdiNode {
+    char* name;
+    char* units;
+    char* residual_units;
+    uint32_t resist_residual_off;
+    uint32_t react_residual_off;
+    uint32_t resist_limit_rhs_off;
+    uint32_t react_limit_rhs_off;
+    bool is_flow;
+} OsdiNode;
+
+typedef struct OsdiParamOpvar {
+    char** name;
+    uint32_t num_alias;
+    char* description;
+    char* units;
+    uint32_t flags;
+    uint32_t len;
+} OsdiParamOpvar;
+
+typedef struct OsdiNoiseSource {
+    char* name;
+    OsdiNodePair nodes;
+} OsdiNoiseSource;
+
+typedef struct OsdiNatureRef {
+    uint32_t ref_type;
+    uint32_t index;
+} OsdiNatureRef;
+
+typedef struct OsdiDescriptor {
+    char* name;
+    uint32_t num_nodes;
     uint32_t num_terminals;
-    const char** terminal_names;
-} OsdiModelDescriptor;
+    OsdiNode* nodes;
+    uint32_t num_jacobian_entries;
+    OsdiJacobianEntry* jacobian_entries;
+    uint32_t num_collapsible;
+    OsdiNodePair* collapsible;
+    uint32_t collapsed_offset;
+    OsdiNoiseSource* noise_sources;
+    uint32_t num_noise_src;
+    uint32_t num_params;
+    uint32_t num_instance_params;
+    uint32_t num_opvars;
+    OsdiParamOpvar* param_opvar;
+    uint32_t node_mapping_offset;
+    uint32_t jacobian_ptr_resist_offset;
+    uint32_t num_states;
+    uint32_t state_idx_off;
+    uint32_t bound_step_offset;
+    uint32_t instance_size;
+    uint32_t model_size;
+    void* (*access)(void* inst, void* model, uint32_t id, uint32_t flags);
+    void (*setup_model)(void* handle, void* model, OsdiSimParas* sim_params, OsdiInitInfo* res);
+    void (*setup_instance)(void* handle, void* inst, void* model, double temperature, uint32_t num_terminals, OsdiSimParas* sim_params, OsdiInitInfo* res);
+    uint32_t (*eval)(void* handle, void* inst, void* model, OsdiSimInfo* info);
+    void (*load_noise)(void* inst, void* model, double freq, double* noise_dens);
+    void (*load_residual_resist)(void* inst, void* model, double* dst);
+    void (*load_residual_react)(void* inst, void* model, double* dst);
+    void (*load_limit_rhs_resist)(void* inst, void* model, double* dst);
+    void (*load_limit_rhs_react)(void* inst, void* model, double* dst);
+    void (*load_spice_rhs_dc)(void* inst, void* model, double* dst, double* prev_solve);
+    void (*load_spice_rhs_tran)(void* inst, void* model, double* dst, double* prev_solve, double alpha);
+    void (*load_jacobian_resist)(void* inst, void* model);
+    void (*load_jacobian_react)(void* inst, void* model, double alpha);
+    void (*load_jacobian_tran)(void* inst, void* model, double alpha);
+    uint32_t (*given_flag_model)(void* model, uint32_t id);
+    uint32_t (*given_flag_instance)(void* inst, uint32_t id);
+    uint32_t num_resistive_jacobian_entries;
+    uint32_t num_reactive_jacobian_entries;
+    void (*write_jacobian_array_resist)(void* inst, void* model, double* destination);
+    void (*write_jacobian_array_react)(void* inst, void* model, double* destination);
+    uint32_t num_inputs;
+    OsdiNodePair* inputs;
+    void (*load_jacobian_with_offset_resist)(void* inst, void* model, size_t offset);
+    void (*load_jacobian_with_offset_react)(void* inst, void* model, size_t offset);
+    OsdiNatureRef* unknown_nature;
+    OsdiNatureRef* residual_nature;
+    uint32_t* noise_source_type;
+    void (*load_noise_params)(void* inst, void* model, double* power, double* exponent);
+    uint32_t module_flags;
 
-// Evaluation Input/Output
-typedef struct {
-    const double* voltages;     // Input: node voltages
-    double* currents;           // Output: terminal currents
-    double* charges;            // Output: terminal charges
-    double* jacobian;           // Output: dI/dV and dQ/dV (conductances/capacitances)
-} OsdiEvaluationData;
-
-// Function pointers for model logic
-typedef void (*OsdiEvaluateFunc)(void* instance_data, OsdiEvaluationData* data);
-typedef void* (*OsdiCreateInstanceFunc)(void* model_data);
-
-// Descriptor for a compiled model
-typedef struct {
+    // GSPICE legacy demo extension. Real OpenVAF descriptors leave these null.
     const char* model_name;
-    uint32_t version_major;
-    uint32_t version_minor;
-    OsdiModelDescriptor metadata;
-    OsdiEvaluateFunc evaluate;
-    OsdiCreateInstanceFunc create_instance;
+    void (*legacy_evaluate)(void* instance_data, const double* voltages, double* currents, double* charges, double* jacobian);
+    void* (*legacy_create_instance)(void* model_data);
 } OsdiDescriptor;
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // GSPICE_OSDI_H
+#endif

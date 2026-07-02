@@ -17,7 +17,7 @@ public:
     StabilityProbe(const std::string& name, int nodePos, int nodeNeg, int branchIndex = -1)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), branchIndex_(branchIndex) {}
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (branchIndex_ < 0) return;
         // In DC, probe is a short circuit (0V source)
         J.add(nodePos_, branchIndex_, 1.0);

@@ -12,7 +12,7 @@ public:
     Port(const std::string& name, int nodePos, int nodeNeg, int portNum, double z0 = 50.0)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), portNum_(portNum), z0_(z0) {}
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         double G = 1.0 / z0_;
         J.add(nodePos_, nodePos_, G);
         J.add(nodeNeg_, nodeNeg_, G);

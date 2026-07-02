@@ -14,7 +14,7 @@ public:
     MultiPort(const std::string& name, const std::vector<int>& nodes, int num_ports, const std::string& filename)
         : Device(name), nodes_(nodes), num_ports_(num_ports), ts_(filename, num_ports) {}
 
-    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, const std::vector<VectorReal>& x_hist) override {
+    void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         // DC: For simplicity, treat as a direct connection (short) for DC with a small conductance.
         // Alternatively, use the S-parameters at f=0 to compute a DC conductance matrix.
         // For robustness, just add a small G to ground to prevent floating nodes.
