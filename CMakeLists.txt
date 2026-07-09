@@ -10,6 +10,25 @@ include_directories(include)
 # Find and enable OpenMP
 find_package(OpenMP REQUIRED)
 
+# Optional SuiteSparse/KLU backend. GSPICE still builds without it and falls
+# back to the internal sparse engine.
+find_path(SUITESPARSE_KLU_INCLUDE_DIR
+    NAMES klu.h
+    PATH_SUFFIXES suitesparse SuiteSparse include/suitesparse include/SuiteSparse
+)
+find_library(SUITESPARSE_KLU_LIBRARY NAMES klu libklu)
+find_library(SUITESPARSE_AMD_LIBRARY NAMES amd libamd)
+find_library(SUITESPARSE_COLAMD_LIBRARY NAMES colamd libcolamd)
+find_library(SUITESPARSE_BTF_LIBRARY NAMES btf libbtf)
+find_library(SUITESPARSE_CONFIG_LIBRARY NAMES suitesparseconfig SuiteSparseConfig libsuitesparseconfig)
+
+set(GSPICE_HAVE_SUITESPARSE_KLU OFF)
+if(SUITESPARSE_KLU_INCLUDE_DIR AND SUITESPARSE_KLU_LIBRARY AND
+   SUITESPARSE_AMD_LIBRARY AND SUITESPARSE_COLAMD_LIBRARY AND
+   SUITESPARSE_BTF_LIBRARY AND SUITESPARSE_CONFIG_LIBRARY)
+    set(GSPICE_HAVE_SUITESPARSE_KLU ON)
+endif()
+
 # Core source files
 set(GSPICE_CORE_SOURCES
     src/core/main.cpp
@@ -20,6 +39,22 @@ add_executable(gspice ${GSPICE_CORE_SOURCES})
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(gspice PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+if(GSPICE_HAVE_SUITESPARSE_KLU)
+    target_compile_definitions(gspice PRIVATE GSPICE_HAVE_SUITESPARSE_KLU=1)
+    target_include_directories(gspice PRIVATE ${SUITESPARSE_KLU_INCLUDE_DIR})
+    target_link_libraries(gspice PRIVATE
+        ${SUITESPARSE_KLU_LIBRARY}
+        ${SUITESPARSE_BTF_LIBRARY}
+        ${SUITESPARSE_AMD_LIBRARY}
+        ${SUITESPARSE_COLAMD_LIBRARY}
+        ${SUITESPARSE_CONFIG_LIBRARY}
+    )
+    message(STATUS "SuiteSparse/KLU backend enabled: ${SUITESPARSE_KLU_LIBRARY}")
+else()
+    target_compile_definitions(gspice PRIVATE GSPICE_HAVE_SUITESPARSE_KLU=0)
+    message(STATUS "SuiteSparse/KLU backend not found; using internal sparse solver")
 endif()
 
 target_include_directories(gspice PRIVATE include)
@@ -60,7 +95,12 @@ endfunction()
 add_gspice_smoke_test(smoke_rc_pulse_v tests/decks/rc_pulse_v.sp)
 add_gspice_smoke_test(smoke_rc_pulse_i tests/decks/rc_pulse_i.sp)
 add_gspice_smoke_test(smoke_options tests/decks/options.sp)
+add_gspice_regex_test(smoke_solver_singleton tests/decks/solver_singleton.sp "singleton_elim=[1-9]")
+if(GSPICE_HAVE_SUITESPARSE_KLU)
+    add_gspice_regex_test(smoke_solver_klu tests/decks/solver_klu.sp "ext_klu_calls=[1-9]")
+endif()
 add_gspice_regex_test(smoke_tran_maxstep tests/decks/tran_maxstep.sp "max internal step=2\\.000000000e-11")
+add_gspice_regex_test(smoke_tran_method_options tests/decks/tran_method_options.sp "method=Gear2/BDF2")
 add_gspice_smoke_test(smoke_include tests/decks/include.sp)
 add_gspice_smoke_test(smoke_lib_section tests/decks/lib_section.sp)
 add_gspice_smoke_test(smoke_subckt_param tests/decks/subckt_param.sp)

@@ -26,6 +26,65 @@ public:
         b.add(nodeNeg_, -Ieq);
     }
 
+    void tranStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, const TransientContext& ctx) override {
+        (void)x;
+        if (ctx.timeStep <= 0.0 || !ctx.xHistory || ctx.xHistory->empty()) return;
+
+        double a0 = ctx.a0;
+        double a1 = ctx.a1;
+        double a2 = ctx.a2;
+        bool useSecond = ctx.hasSecondHistory && ctx.xHistory->size() >= 2;
+        const bool useTrap = ctx.method == TransientIntegrationMethod::Trapezoidal && prevCurrentValid_;
+        if (ctx.method == TransientIntegrationMethod::Trapezoidal && !useTrap) {
+            a0 = 1.0 / ctx.timeStep;
+            a1 = -a0;
+            a2 = 0.0;
+            useSecond = false;
+        }
+
+        const double vPrev = voltage((*ctx.xHistory)[ctx.xHistory->size() - 1]);
+        const double vPrev2 = useSecond ? voltage((*ctx.xHistory)[ctx.xHistory->size() - 2]) : vPrev;
+        const double Geq = value_ * a0;
+        double Ieq = -value_ * (a1 * vPrev + (useSecond ? a2 * vPrev2 : 0.0));
+        if (useTrap) {
+            Ieq += prevCurrent_;
+        }
+
+        J.add(nodePos_, nodePos_, Geq);
+        J.add(nodeNeg_, nodeNeg_, Geq);
+        J.add(nodePos_, nodeNeg_, -Geq);
+        J.add(nodeNeg_, nodePos_, -Geq);
+        b.add(nodePos_, Ieq);
+        b.add(nodeNeg_, -Ieq);
+    }
+
+    void acceptTransientStep(const VectorReal& x, double currentTime, const TransientContext& ctx) override {
+        (void)currentTime;
+        if (ctx.timeStep <= 0.0 || !ctx.xHistory || ctx.xHistory->empty()) return;
+
+        double a0 = ctx.a0;
+        double a1 = ctx.a1;
+        double a2 = ctx.a2;
+        bool useSecond = ctx.hasSecondHistory && ctx.xHistory->size() >= 2;
+        const bool useTrap = ctx.method == TransientIntegrationMethod::Trapezoidal && prevCurrentValid_;
+        if (ctx.method == TransientIntegrationMethod::Trapezoidal && !useTrap) {
+            a0 = 1.0 / ctx.timeStep;
+            a1 = -a0;
+            a2 = 0.0;
+            useSecond = false;
+        }
+
+        const double vNow = voltage(x);
+        const double vPrev = voltage((*ctx.xHistory)[ctx.xHistory->size() - 1]);
+        const double vPrev2 = useSecond ? voltage((*ctx.xHistory)[ctx.xHistory->size() - 2]) : vPrev;
+        if (useTrap) {
+            prevCurrent_ = value_ * (a0 * vNow + a1 * vPrev) - prevCurrent_;
+        } else {
+            prevCurrent_ = value_ * (a0 * vNow + a1 * vPrev + (useSecond ? a2 * vPrev2 : 0.0));
+        }
+        prevCurrentValid_ = true;
+    }
+
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
         std::complex<double> Y = {0.0, omega * value_};
         J.add(nodePos_, nodePos_, Y);
@@ -72,9 +131,15 @@ public:
     }
 
 private:
+    double voltage(const VectorReal& x) const {
+        return ((nodePos_ >= 0) ? x[nodePos_] : 0.0) - ((nodeNeg_ >= 0) ? x[nodeNeg_] : 0.0);
+    }
+
     int nodePos_;
     int nodeNeg_;
     double value_;
+    double prevCurrent_ = 0.0;
+    bool prevCurrentValid_ = false;
 };
 
 } // namespace gspice

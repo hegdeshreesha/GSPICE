@@ -37,6 +37,9 @@ struct SimulationSettings {
     double gmin = 1e-12;
     int op_max_iter = 100;
     int tran_max_iter = 50;
+    std::string solver_backend = "AUTO";
+    std::string solver_ordering = "AUTO";
+    bool solver_singletons = true;
 
     // PSS / HB Parameters
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)

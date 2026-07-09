@@ -770,8 +770,18 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "ACCURACY" && !value.empty()) applyPreset(value);
     else if ((key == "TRTOL" || key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
     else if ((key == "TRABSTOL" || key == "TRAN_ABSTOL" || key == "LTE_ABSTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_abstol = numeric;
+    else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP") && hasNumeric && numeric > 0.0) settings.t_max_step = numeric;
     else if ((key == "MINSTEP" || key == "TMIN" || key == "TRAN_MINSTEP") && hasNumeric && numeric > 0.0) settings.t_min_step = numeric;
     else if (key == "ADAPTIVE" || key == "TRAN_ADAPTIVE") settings.tran_adaptive = value.empty() ? true : truthy(value);
+    else if ((key == "SOLVER" || key == "LINEAR_SOLVER" || key == "SPARSE_SOLVER") && !value.empty()) {
+        settings.solver_backend = toUpperCopy(value);
+    }
+    else if ((key == "ORDERING" || key == "MATRIX_ORDERING" || key == "SPARSE_ORDERING") && !value.empty()) {
+        settings.solver_ordering = toUpperCopy(value);
+    }
+    else if (key == "SINGLETONS" || key == "SINGLETON_FILTER" || key == "SINGLETON_FILTERING") {
+        settings.solver_singletons = value.empty() ? true : truthy(value);
+    }
     else if ((key == "METHOD" || key == "TRAN_METHOD") && !value.empty()) {
         std::string method = toUpperCopy(value);
         method.erase(std::remove(method.begin(), method.end(), '_'), method.end());

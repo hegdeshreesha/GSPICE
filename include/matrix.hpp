@@ -6,8 +6,10 @@
 #include <iomanip>
 #include <cmath>
 #include <complex>
-#include <mutex>
 #include <stdexcept>
+#include <algorithm>
+#include <atomic>
+#include <omp.h>
 
 namespace gspice {
 
@@ -19,41 +21,58 @@ namespace gspice {
 template <typename T>
 class Vector {
 public:
-    Vector(int size = 0) : data_(size, T(0)) {}
+    Vector(int size = 0) : data_(size, T(0)) {
+        initializeThreadBuffers();
+    }
 
-    // Copy constructor (needed because std::mutex is not copyable)
-    Vector(const Vector& other) {
-        std::lock_guard<std::mutex> lock(other.mutex_);
-        data_ = other.data_;
+    Vector(const Vector& other) : data_(other.snapshotData()) {
+        initializeThreadBuffers();
     }
 
     Vector& operator=(const Vector& other) {
         if (this != &other) {
-            std::lock_guard<std::mutex> lock1(mutex_);
-            std::lock_guard<std::mutex> lock2(other.mutex_);
-            data_ = other.data_;
+            data_ = other.snapshotData();
+            initializeThreadBuffers();
         }
         return *this;
     }
 
     T& operator[](int index) {
+        collapseThreadData();
         return data_[index];
     }
 
     const T& operator[](int index) const {
+        collapseThreadData();
         return data_[index];
     }
 
     void add(int index, T value) {
         if (index >= 0 && index < (int)data_.size()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            data_[index] += value;
+            if (omp_in_parallel()) {
+                thread_data_[omp_get_thread_num()][index] += value;
+                has_thread_data_.store(true, std::memory_order_relaxed);
+            } else {
+                data_[index] += value;
+            }
         }
     }
 
     int getSize() const { return (int)data_.size(); }
 
+    void clear() {
+        collapseThreadData();
+        std::fill(data_.begin(), data_.end(), T(0));
+        clearThreadBuffers();
+    }
+
+    std::vector<T> snapshotData() const {
+        collapseThreadData();
+        return data_;
+    }
+
     void print() const {
+        collapseThreadData();
         for (const T& val : data_) {
             if constexpr (std::is_same_v<T, std::complex<double>>) {
                 std::cout << std::setw(15) << val.real() << " + " << val.imag() << "j" << std::endl;
@@ -64,8 +83,33 @@ public:
     }
 
 private:
-    std::vector<T> data_;
-    mutable std::mutex mutex_;
+    void initializeThreadBuffers() {
+        const int threads = std::max(1, omp_get_max_threads());
+        thread_data_.assign(static_cast<size_t>(threads), std::vector<T>(data_.size(), T(0)));
+        has_thread_data_.store(false, std::memory_order_relaxed);
+    }
+
+    void clearThreadBuffers() {
+        for (auto& buffer : thread_data_) {
+            std::fill(buffer.begin(), buffer.end(), T(0));
+        }
+        has_thread_data_.store(false, std::memory_order_relaxed);
+    }
+
+    void collapseThreadData() const {
+        if (!has_thread_data_.load(std::memory_order_relaxed)) return;
+        for (auto& buffer : thread_data_) {
+            for (size_t i = 0; i < data_.size(); ++i) {
+                data_[i] += buffer[i];
+                buffer[i] = T(0);
+            }
+        }
+        has_thread_data_.store(false, std::memory_order_relaxed);
+    }
+
+    mutable std::vector<T> data_;
+    mutable std::vector<std::vector<T>> thread_data_;
+    mutable std::atomic<bool> has_thread_data_{false};
 };
 
 /**

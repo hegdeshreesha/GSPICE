@@ -8,6 +8,24 @@
 
 namespace gspice {
 
+enum class TransientIntegrationMethod {
+    BackwardEuler,
+    Trapezoidal,
+    Gear2
+};
+
+struct TransientContext {
+    double timeStep = 0.0;
+    double currentTime = 0.0;
+    TransientIntegrationMethod method = TransientIntegrationMethod::BackwardEuler;
+    double a0 = 0.0;
+    double a1 = 0.0;
+    double a2 = 0.0;
+    bool hasSecondHistory = false;
+    const std::vector<VectorReal>* xHistory = nullptr;
+    const std::vector<double>* timeHistory = nullptr;
+};
+
 class Device {
 public:
     Device(const std::string& name) : name_(name) {}
@@ -27,12 +45,34 @@ public:
         const std::vector<VectorReal>& x_hist) = 0;
 
     /**
+     * Transient stamping. Devices that are dynamic can use the integration
+     * coefficients in TransientContext; static devices reuse their DC stamp.
+     */
+    virtual void tranStamp(
+        SparseMatrixReal& J,
+        VectorReal& b,
+        const VectorReal& x,
+        const TransientContext& ctx) {
+        static const std::vector<VectorReal> empty_history;
+        const auto& history = ctx.xHistory ? *ctx.xHistory : empty_history;
+        dcStamp(J, b, x, ctx.timeStep, ctx.currentTime, history);
+    }
+
+    /**
      * Called after a transient timestep has converged and is accepted.
      * Devices with internal dynamic state can commit next-state buffers here.
      */
     virtual void acceptTransientStep(const VectorReal& x, double currentTime) {
         (void)x;
         (void)currentTime;
+    }
+
+    virtual void acceptTransientStep(
+        const VectorReal& x,
+        double currentTime,
+        const TransientContext& ctx) {
+        (void)ctx;
+        acceptTransientStep(x, currentTime);
     }
 
     /**

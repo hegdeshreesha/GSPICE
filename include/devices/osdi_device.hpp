@@ -59,7 +59,14 @@ public:
             (desc_.load_jacobian_react || desc_.write_jacobian_array_react) &&
             !x_hist.empty()
         ) {
-            transientStamp(J, b, x, timeStep, currentTime, x_hist.back());
+            TransientContext ctx;
+            ctx.timeStep = timeStep;
+            ctx.currentTime = currentTime;
+            ctx.method = TransientIntegrationMethod::BackwardEuler;
+            ctx.a0 = 1.0 / timeStep;
+            ctx.a1 = -ctx.a0;
+            ctx.xHistory = &x_hist;
+            transientStamp(J, b, x, ctx);
             return;
         }
 
@@ -133,6 +140,27 @@ public:
         }
     }
 
+    void tranStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, const TransientContext& ctx) override {
+        if (desc_.legacy_evaluate) {
+            legacyDcStamp(J, b, x);
+            return;
+        }
+        if (
+            ctx.timeStep > 0.0 &&
+            ctx.xHistory &&
+            !ctx.xHistory->empty() &&
+            osdiTransientEnabled() &&
+            desc_.load_residual_react &&
+            (desc_.load_jacobian_react || desc_.write_jacobian_array_react)
+        ) {
+            transientStamp(J, b, x, ctx);
+            return;
+        }
+
+        static const std::vector<VectorReal> empty_history;
+        dcStamp(J, b, x, 0.0, ctx.currentTime, empty_history);
+    }
+
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
         (void)J;
         (void)b;
@@ -148,6 +176,45 @@ public:
         }
     }
 
+    void acceptTransientStep(const VectorReal& x, double currentTime, const TransientContext& ctx) override {
+        if (!next_state_.empty()) {
+            prev_state_ = next_state_;
+        }
+        if (!desc_.legacy_evaluate && desc_.load_residual_react && ctx.timeStep > 0.0) {
+            std::vector<double> reactNow(local_node_count_, 0.0);
+            if (loadReactiveResidualAt(x, currentTime, reactNow)) {
+                std::vector<double> deriv(local_node_count_, 0.0);
+                const bool useTrap =
+                    ctx.method == TransientIntegrationMethod::Trapezoidal &&
+                    prev_react_derivative_valid_ &&
+                    prev_react_.size() == reactNow.size();
+                const bool useSecond =
+                    ctx.hasSecondHistory &&
+                    prev_react_.size() == reactNow.size() &&
+                    prev2_react_.size() == reactNow.size();
+                if (useTrap) {
+                    for (size_t i = 0; i < reactNow.size(); ++i) {
+                        deriv[i] = ctx.a0 * reactNow[i] + ctx.a1 * prev_react_[i] - prev_react_derivative_[i];
+                    }
+                } else if (useSecond) {
+                    for (size_t i = 0; i < reactNow.size(); ++i) {
+                        deriv[i] = ctx.a0 * reactNow[i] + ctx.a1 * prev_react_[i] + ctx.a2 * prev2_react_[i];
+                    }
+                } else {
+                    const double alpha = 1.0 / ctx.timeStep;
+                    for (size_t i = 0; i < reactNow.size(); ++i) {
+                        const double prev = prev_react_.size() == reactNow.size() ? prev_react_[i] : reactNow[i];
+                        deriv[i] = alpha * (reactNow[i] - prev);
+                    }
+                }
+                prev2_react_ = prev_react_;
+                prev_react_ = reactNow;
+                prev_react_derivative_ = deriv;
+                prev_react_derivative_valid_ = true;
+            }
+        }
+    }
+
 private:
     OsdiDescriptor desc_{};
     std::vector<int> nodes_;
@@ -160,6 +227,10 @@ private:
     std::vector<std::unique_ptr<char[]>> string_params_;
     std::vector<double> prev_state_;
     std::vector<double> next_state_;
+    std::vector<double> prev_react_;
+    std::vector<double> prev2_react_;
+    std::vector<double> prev_react_derivative_;
+    bool prev_react_derivative_valid_ = false;
 
     static size_t wordsFor(uint32_t bytes) {
         if (bytes == 0) return 0;
@@ -381,37 +452,65 @@ private:
         return solve;
     }
 
-    void transientStamp(
-        SparseMatrixReal& J,
-        VectorReal& b,
-        const VectorReal& x,
-        double timeStep,
-        double currentTime,
-        const VectorReal& x_prev) {
-        std::vector<double> solve = localSolveFromGlobal(x);
-        std::vector<double> solvePrev = localSolveFromGlobal(x_prev);
-
+    bool loadReactiveResidualAt(
+        const VectorReal& state,
+        double time,
+        std::vector<double>& reactive) {
+        if (!desc_.load_residual_react) return false;
+        std::vector<double> solve = localSolveFromGlobal(state);
+        std::vector<double> scratchState(desc_.num_states, 0.0);
         char* nullName = nullptr;
         char* nullStrName = nullptr;
         OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
-
-        std::vector<double> reactPrev(local_node_count_, 0.0);
-        std::vector<double> scratchState(desc_.num_states, 0.0);
-        OsdiSimInfo prevInfo{
+        OsdiSimInfo info{
             paras,
-            currentTime - timeStep,
-            solvePrev.data(),
+            time,
+            solve.data(),
             prev_state_.empty() ? nullptr : prev_state_.data(),
             scratchState.empty() ? nullptr : scratchState.data(),
             CALC_REACT_RESIDUAL | ANALYSIS_TRAN
         };
-        uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &prevInfo);
+        const uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
         if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
         }
-        if (desc_.load_residual_react) {
-            desc_.load_residual_react(instance_data_, model_data_, reactPrev.data());
+        desc_.load_residual_react(instance_data_, model_data_, reactive.data());
+        return true;
+    }
+
+    void transientStamp(
+        SparseMatrixReal& J,
+        VectorReal& b,
+        const VectorReal& x,
+        const TransientContext& ctx) {
+        const double timeStep = ctx.timeStep;
+        const double currentTime = ctx.currentTime;
+        std::vector<double> solve = localSolveFromGlobal(x);
+
+        const auto& history = *ctx.xHistory;
+        const VectorReal& xPrev = history.back();
+        const VectorReal& xPrev2 = (ctx.hasSecondHistory && history.size() >= 2)
+            ? history[history.size() - 2]
+            : history.back();
+        double prevTime = currentTime - timeStep;
+        double prev2Time = prevTime - timeStep;
+        if (ctx.timeHistory && !ctx.timeHistory->empty()) {
+            prevTime = ctx.timeHistory->back();
+            if (ctx.timeHistory->size() >= 2) {
+                prev2Time = (*ctx.timeHistory)[ctx.timeHistory->size() - 2];
+            }
         }
+
+        std::vector<double> reactPrev(local_node_count_, 0.0);
+        std::vector<double> reactPrev2(local_node_count_, 0.0);
+        loadReactiveResidualAt(xPrev, prevTime, reactPrev);
+        if (ctx.hasSecondHistory && history.size() >= 2) {
+            loadReactiveResidualAt(xPrev2, prev2Time, reactPrev2);
+        }
+
+        char* nullName = nullptr;
+        char* nullStrName = nullptr;
+        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
 
         OsdiSimInfo info{
             paras,
@@ -423,12 +522,26 @@ private:
                 CALC_REACT_RESIDUAL | CALC_REACT_JACOBIAN |
                 ANALYSIS_TRAN
         };
-        ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
         if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
         }
 
-        const double alpha = 1.0 / timeStep;
+        double alpha = ctx.a0;
+        double a1 = ctx.a1;
+        double a2 = ctx.a2;
+        bool useSecond = ctx.hasSecondHistory && history.size() >= 2;
+        const bool useTrap =
+            ctx.method == TransientIntegrationMethod::Trapezoidal &&
+            prev_react_derivative_valid_ &&
+            prev_react_derivative_.size() == local_node_count_;
+        if (ctx.method == TransientIntegrationMethod::Trapezoidal && !useTrap) {
+            alpha = 1.0 / timeStep;
+            a1 = -alpha;
+            a2 = 0.0;
+            useSecond = false;
+        }
+
         std::vector<double> residualResist(local_node_count_, 0.0);
         std::vector<double> residualReact(local_node_count_, 0.0);
         if (desc_.load_residual_resist) {
@@ -466,8 +579,14 @@ private:
             const uint32_t localRow = node_mapping_[term];
             if (globalRow < 0 || localRow == UINT32_MAX || localRow >= residualResist.size()) continue;
 
-            const double residual =
-                residualResist[localRow] + alpha * (residualReact[localRow] - reactPrev[localRow]);
+            double reactiveResidual = alpha * residualReact[localRow] + a1 * reactPrev[localRow];
+            if (useSecond && localRow < reactPrev2.size()) {
+                reactiveResidual += a2 * reactPrev2[localRow];
+            }
+            if (useTrap) {
+                reactiveResidual -= prev_react_derivative_[localRow];
+            }
+            const double residual = residualResist[localRow] + reactiveResidual;
             double rhs = -residual;
             size_t resistIndex = 0;
             size_t reactIndex = 0;
