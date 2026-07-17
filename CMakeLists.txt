@@ -92,23 +92,97 @@ function(add_gspice_regex_test test_name deck expected_regex)
     )
 endfunction()
 
+function(add_gspice_env_regex_test test_name deck env_assignment expected_regex)
+    add_test(
+        NAME ${test_name}
+        COMMAND gspice --threads 1 ${CMAKE_CURRENT_SOURCE_DIR}/${deck}
+    )
+    set_tests_properties(${test_name} PROPERTIES
+        ENVIRONMENT "${env_assignment}"
+        PASS_REGULAR_EXPRESSION "${expected_regex}"
+    )
+endfunction()
+
+function(add_gspice_raw_expect_test test_name deck signal expected tolerance)
+    add_test(
+        NAME ${test_name}
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_raw_expect.ps1
+            $<TARGET_FILE:gspice>
+            ${CMAKE_CURRENT_SOURCE_DIR}/${deck}
+            ${signal}
+            ${expected}
+            ${tolerance}
+    )
+endfunction()
+
+function(add_gspice_raw_header_expect_test test_name deck expected_variables expected_signal absent_signal)
+    add_test(
+        NAME ${test_name}
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_raw_header_expect.ps1
+            -Exe $<TARGET_FILE:gspice>
+            -Deck ${CMAKE_CURRENT_SOURCE_DIR}/${deck}
+            -ExpectedVariables ${expected_variables}
+            -ExpectedSignals ${expected_signal}
+            -AbsentSignals ${absent_signal}
+    )
+endfunction()
+
 add_gspice_smoke_test(smoke_rc_pulse_v tests/decks/rc_pulse_v.sp)
 add_gspice_smoke_test(smoke_rc_pulse_i tests/decks/rc_pulse_i.sp)
 add_gspice_smoke_test(smoke_options tests/decks/options.sp)
+add_gspice_regex_test(smoke_options_policy tests/decks/options_policy.sp "Numerical policy:.*source_stepping=on.*gmin_stepping=on.*line_search=on.*residual_check=on")
+add_gspice_regex_test(smoke_ic_temp_global tests/decks/ic_temp_global.sp "Initial conditions: applied 1 node voltage seed")
 add_gspice_regex_test(smoke_solver_singleton tests/decks/solver_singleton.sp "singleton_elim=[1-9]")
 if(GSPICE_HAVE_SUITESPARSE_KLU)
     add_gspice_regex_test(smoke_solver_klu tests/decks/solver_klu.sp "ext_klu_calls=[1-9]")
 endif()
 add_gspice_regex_test(smoke_tran_maxstep tests/decks/tran_maxstep.sp "max internal step=2\\.000000000e-11")
 add_gspice_regex_test(smoke_tran_method_options tests/decks/tran_method_options.sp "method=Gear2/BDF2")
+add_gspice_regex_test(smoke_tran_predictor_options tests/decks/tran_predictor_options.sp "predictor=on")
 add_gspice_smoke_test(smoke_include tests/decks/include.sp)
 add_gspice_smoke_test(smoke_lib_section tests/decks/lib_section.sp)
 add_gspice_smoke_test(smoke_subckt_param tests/decks/subckt_param.sp)
+add_gspice_regex_test(smoke_param_expression tests/decks/param_expression.sp "Node 1=1\\.333333V \\[out\\]")
+add_gspice_regex_test(smoke_subckt_conditional tests/decks/subckt_conditional.sp "Node 1=0\\.500000V \\[out\\]")
 add_gspice_smoke_test(smoke_ihp_lv_mos_wrapper tests/decks/ihp_lv_mos_wrapper.sp)
+set_tests_properties(smoke_ihp_lv_mos_wrapper PROPERTIES
+    ENVIRONMENT "GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1"
+)
 add_gspice_smoke_test(smoke_osdi_builtin tests/decks/osdi_builtin.sp)
+add_gspice_regex_test(smoke_dc_sweep_model tests/decks/dc_sweep_model.sp "Starting DC Sweep Analysis")
+add_gspice_regex_test(smoke_dc_nested tests/decks/dc_nested.sp "sweep\\(V1\\).*sweep\\(V2\\)")
+add_gspice_regex_test(smoke_controlled_sources tests/decks/controlled_sources.sp "Node 1=1\\.000000V \\[out\\].*Node 2=2\\.000000V \\[buf\\]")
+add_gspice_smoke_test(smoke_current_controlled_sources tests/decks/current_controlled_sources.sp)
+add_gspice_regex_test(smoke_tf_divider tests/decks/tf_divider.sp "magnitude=4\\.99999999[0-9]e-01")
+add_gspice_smoke_test(smoke_bjt_npn tests/decks/bjt_npn.sp)
+add_gspice_regex_test(smoke_noise_resistor tests/decks/noise_resistor.sp "Starting Noise Analysis")
+add_gspice_regex_test(smoke_measure_tran tests/decks/measure_tran.sp "MEASURE vfinal = 6\\.[0-9]+e-01")
+add_gspice_regex_test(smoke_step_op tests/decks/step_op.sp "Starting STEP Analysis")
+add_gspice_regex_test(smoke_sens_source tests/decks/sens_source.sp "Sensitivity: dV\\(out\\)/dV1")
+add_gspice_regex_test(smoke_pz_rc tests/decks/pz_rc.sp "Dominant pole estimate")
+add_gspice_regex_test(smoke_mc_source tests/decks/mc_source.sp "MC summary")
+add_gspice_regex_test(smoke_behavioral_current tests/decks/behavioral_current.sp "Node 1=0\\.500000V \\[out\\]")
+add_gspice_regex_test(smoke_behavioral_voltage tests/decks/behavioral_voltage.sp "Node 1=1\\.400000V \\[out\\]")
+add_gspice_regex_test(smoke_corners_spec tests/decks/corners_spec.sp "corner\\(low\\).*SPEC\\(vout\\)=PASS")
+add_gspice_regex_test(smoke_mc_spec tests/decks/mc_spec.sp "Production summary: spec=vout")
+add_gspice_raw_expect_test(regression_rc_step tests/decks/regression_rc_step.sp "V(out)" 0.630 0.03)
+add_gspice_raw_header_expect_test(regression_save_voltage_selection tests/decks/save_voltage_selection.sp 2 "V(out)" "V(in)")
+add_gspice_raw_expect_test(regression_lumen_ihp_inverter tests/decks/lumen_ihp_inverter_short.sp "V(net2)" 0.0 0.2)
+set_tests_properties(regression_lumen_ihp_inverter PROPERTIES
+    ENVIRONMENT "GSPICE_OSDI_DIR=${CMAKE_CURRENT_SOURCE_DIR}/osdi"
+)
 add_gspice_error_test(error_missing_psp_osdi tests/decks/osdi_missing_psp.sp "OSDI model type 'psp103va' is not loaded")
+add_gspice_error_test(error_unsupported_element tests/decks/error_unsupported_element.sp "unsupported element")
+add_gspice_error_test(error_ihp_primitive_fallback tests/decks/error_ihp_primitive_fallback.sp "Refusing primitive MOS fallback")
+add_gspice_error_test(error_compact_mos_fallback tests/decks/error_compact_mos_fallback.sp "Refusing primitive Level-1 fallback")
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/osdi/psp103.osdi")
+    add_gspice_regex_test(smoke_osdi_model_status_loaded tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_LOADED")
+    add_gspice_regex_test(smoke_osdi_model_status_device tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_DEVICE")
+    add_gspice_env_regex_test(smoke_osdi_limiting_rhs_option tests/decks/osdi_psp_inverter.sp "GSPICE_USE_OSDI_LIMITING_RHS=1" "OSDI advanced options: limiting_rhs=requested")
+    add_gspice_regex_test(smoke_osdi_options_deck tests/decks/osdi_psp_options.sp "OSDI advanced options: limiting_rhs=requested.*full_model_params=off.*spice_rhs=requested")
     add_gspice_regex_test(smoke_osdi_psp_pmos_pullup tests/decks/osdi_psp_pmos_pullup.sp "Node 2=1\\.")
     add_gspice_regex_test(smoke_osdi_psp_inverter tests/decks/osdi_psp_inverter.sp "1\\.100000000e-06 \\| 2\\.000000000e\\+00 0\\.000000000e\\+00 1\\.")
     add_gspice_regex_test(smoke_osdi_psp_inverter_loaded tests/decks/osdi_psp_inverter_loaded.sp "e-11 \\| 2\\.000000000e\\+00")

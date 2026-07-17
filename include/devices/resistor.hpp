@@ -38,6 +38,16 @@ public:
         return 4.0 * k * T * G;
     }
 
+    void collectNoiseSources(double omega, const VectorReal& x_dc, std::vector<NoiseSource>& sources) const override {
+        (void)omega;
+        (void)x_dc;
+        double k = 1.380649e-23;
+        double T = 298.15;
+        double G = getConductance();
+        if (G <= 0.0) return;
+        sources.push_back({name_ + ".thermal", nodePos_, nodeNeg_, 4.0 * k * T * G});
+    }
+
     void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) override {
         double G = getConductance();
         int K = 2 * n_harms + 1;

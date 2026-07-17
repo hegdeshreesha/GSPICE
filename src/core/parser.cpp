@@ -11,11 +11,17 @@
 #include "devices/current_source.hpp"
 #include "devices/multi_port.hpp"
 #include "devices/osdi_device.hpp"
+#include "devices/controlled_source.hpp"
+#include "devices/bjt.hpp"
+#include "devices/behavioral_source.hpp"
+#include "expression.hpp"
 #include <iostream>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <cmath>
+#include <iomanip>
 #include <sstream>
 #include <unordered_map>
 #include <set>
@@ -31,6 +37,14 @@ std::string toUpperCopy(std::string s) {
 std::string toLowerCopy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+std::string sanitizeIdentifier(std::string s) {
+    for (char& c : s) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '_' && c != '$') c = '_';
+    }
+    return s.empty() ? "node" : s;
 }
 
 std::string joinTokens(const std::vector<std::string>& tokens, size_t startIdx) {
@@ -56,6 +70,61 @@ std::string stripQuotes(std::string text) {
         return text.substr(1, text.size() - 2);
     }
     return text;
+}
+
+bool tryParseSpiceValue(const std::string& token, double& out);
+bool isGroundName(const std::string& name);
+
+bool parseVoltageProbeToken(const std::string& token, std::string& pos, std::string& neg) {
+    std::string upper = toUpperCopy(token);
+    if (upper.rfind("V(", 0) != 0 || token.back() != ')') return false;
+    std::string payload = token.substr(2, token.size() - 3);
+    size_t comma = payload.find(',');
+    if (comma == std::string::npos) {
+        pos = trimCopy(payload);
+        neg = "0";
+    } else {
+        pos = trimCopy(payload.substr(0, comma));
+        neg = trimCopy(payload.substr(comma + 1));
+    }
+    return !pos.empty() && !neg.empty();
+}
+
+bool parseInitialConditionToken(const std::string& token, std::string& node, double& value) {
+    const auto eq = token.find('=');
+    if (eq == std::string::npos || eq == 0 || eq + 1 >= token.size()) return false;
+    std::string lhs = trimCopy(token.substr(0, eq));
+    std::string rhs = trimCopy(token.substr(eq + 1));
+    std::string neg;
+    if (toUpperCopy(lhs).rfind("V(", 0) == 0 && lhs.back() == ')') {
+        if (!parseVoltageProbeToken(lhs, node, neg)) return false;
+        if (!isGroundName(neg)) return false;
+    } else {
+        node = lhs;
+    }
+    return !node.empty() && tryParseSpiceValue(stripQuotes(rhs), value);
+}
+
+bool parseSaveToken(const std::string& token, gspice::SaveSpec& save) {
+    std::string pos;
+    std::string neg;
+    if (parseVoltageProbeToken(token, pos, neg)) {
+        save.kind = "V";
+        save.node_pos = pos;
+        save.node_neg = neg;
+        return true;
+    }
+    std::string cleaned = stripQuotes(trimCopy(token));
+    if (cleaned.empty()) return false;
+    if (toUpperCopy(cleaned).rfind("I(", 0) == 0) {
+        save.kind = "I";
+        save.node_pos = cleaned;
+        return true;
+    }
+    save.kind = "V";
+    save.node_pos = cleaned;
+    save.node_neg = "0";
+    return true;
 }
 
 std::string stripInlineComment(const std::string& text) {
@@ -121,12 +190,235 @@ struct SubcktDef {
     std::vector<PreLine> body;
 };
 
+bool tryEvaluateParamExpression(
+    const std::string& text,
+    const std::unordered_map<std::string, std::string>& params,
+    double& out,
+    int depth = 0);
+
+bool tryParseSpiceValue(const std::string& token, double& out);
+
+std::pair<std::string, std::string> splitParameterToken(const std::string& token);
+
+std::string remapPrimitiveLine(
+    const PreLine& line,
+    const std::string& instancePrefix,
+    const std::unordered_map<std::string, std::string>& pinMap);
+
+std::vector<PreLine> filterConditionalLines(
+    const std::vector<PreLine>& lines,
+    std::unordered_map<std::string, std::string>& params,
+    std::vector<std::string>& errors,
+    const std::string& context);
+
 void replaceAll(std::string& text, const std::string& needle, const std::string& value) {
     if (needle.empty()) return;
     size_t pos = 0;
     while ((pos = text.find(needle, pos)) != std::string::npos) {
         text.replace(pos, needle.size(), value);
         pos += value.size();
+    }
+}
+
+std::string formatNumericValue(double value) {
+    std::ostringstream oss;
+    oss << std::setprecision(17) << value;
+    return oss.str();
+}
+
+void addParamAlias(std::unordered_map<std::string, std::string>& params, const std::string& key, const std::string& value) {
+    if (key.empty()) return;
+    params[key] = value;
+    params[toUpperCopy(key)] = value;
+    params[toLowerCopy(key)] = value;
+}
+
+std::unordered_map<std::string, std::string> parseParameterAssignments(
+    const std::vector<std::string>& tokens,
+    size_t startIdx) {
+    std::unordered_map<std::string, std::string> params;
+    for (size_t i = startIdx; i < tokens.size(); ++i) {
+        if (i + 2 < tokens.size() && tokens[i + 1] == "=") {
+            addParamAlias(params, tokens[i], stripQuotes(tokens[i + 2]));
+            i += 2;
+            continue;
+        }
+        if (!tokens[i].empty() && tokens[i].back() == '=' && i + 1 < tokens.size()) {
+            addParamAlias(params, tokens[i].substr(0, tokens[i].size() - 1), stripQuotes(tokens[i + 1]));
+            ++i;
+            continue;
+        }
+        size_t eq = tokens[i].find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        addParamAlias(params, tokens[i].substr(0, eq), stripQuotes(tokens[i].substr(eq + 1)));
+    }
+    return params;
+}
+
+bool lookupParamValue(
+    const std::unordered_map<std::string, std::string>& params,
+    const std::string& key,
+    std::string& value) {
+    auto it = params.find(key);
+    if (it == params.end()) it = params.find(toUpperCopy(key));
+    if (it == params.end()) it = params.find(toLowerCopy(key));
+    if (it == params.end()) return false;
+    value = it->second;
+    return true;
+}
+
+std::string stripExpressionDelimiters(std::string text) {
+    text = stripQuotes(trimCopy(text));
+    if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+        text = trimCopy(text.substr(1, text.size() - 2));
+    }
+    text = stripQuotes(trimCopy(text));
+    return text;
+}
+
+bool isExpressionFunctionName(const std::string& idUpper) {
+    static const std::set<std::string> names = {
+        "SIN", "COS", "TAN", "EXP", "LOG", "LN", "LOG10", "SQRT", "ABS",
+        "POW", "MIN", "MAX", "LIMIT", "CLAMP", "IF", "SGN", "SIGN",
+        "U", "STEP", "URAMP", "FLOOR", "CEIL", "CEILING", "ROUND"
+    };
+    return names.count(idUpper) != 0;
+}
+
+bool isNumericSuffixStart(const std::string& text, size_t pos) {
+    if (pos == 0) return false;
+    const char prev = text[pos - 1];
+    return std::isdigit(static_cast<unsigned char>(prev)) || prev == '.';
+}
+
+bool containsCircuitDependentExpression(const std::string& text) {
+    const std::string upper = toUpperCopy(text);
+    return upper.find("V(") != std::string::npos ||
+           upper.find("I(") != std::string::npos ||
+           upper.find("TIME") != std::string::npos;
+}
+
+std::string substituteParamIdentifiers(
+    const std::string& expression,
+    const std::unordered_map<std::string, std::string>& params,
+    int depth) {
+    std::string out;
+    for (size_t i = 0; i < expression.size();) {
+        const char c = expression[i];
+        const bool identStart = std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+        if (!identStart || isNumericSuffixStart(expression, i)) {
+            out += c;
+            ++i;
+            continue;
+        }
+
+        const size_t start = i;
+        while (i < expression.size()) {
+            const char idc = expression[i];
+            if (!(std::isalnum(static_cast<unsigned char>(idc)) || idc == '_' || idc == '$' || idc == ':' || idc == '.')) break;
+            ++i;
+        }
+        const std::string id = expression.substr(start, i - start);
+        size_t next = i;
+        while (next < expression.size() && std::isspace(static_cast<unsigned char>(expression[next]))) ++next;
+        const bool looksLikeFunction = next < expression.size() && expression[next] == '(' && isExpressionFunctionName(toUpperCopy(id));
+        if (looksLikeFunction || toUpperCopy(id) == "PI" || toUpperCopy(id) == "E" || toUpperCopy(id) == "TIME" || toUpperCopy(id) == "T") {
+            out += id;
+            continue;
+        }
+
+        std::string rawValue;
+        if (!lookupParamValue(params, id, rawValue)) {
+            out += id;
+            continue;
+        }
+        double evaluated = 0.0;
+        if (tryEvaluateParamExpression(rawValue, params, evaluated, depth + 1)) {
+            out += formatNumericValue(evaluated);
+        } else {
+            out += "(" + stripExpressionDelimiters(rawValue) + ")";
+        }
+    }
+    return out;
+}
+
+bool tryEvaluateParamExpression(
+    const std::string& text,
+    const std::unordered_map<std::string, std::string>& params,
+    double& out,
+    int depth) {
+    if (depth > 24) return false;
+    const std::string stripped = stripExpressionDelimiters(text);
+    if (stripped.empty()) return false;
+    if (containsCircuitDependentExpression(stripped)) return false;
+    if (tryParseSpiceValue(stripped, out)) return true;
+    const std::string substituted = substituteParamIdentifiers(stripped, params, depth);
+    if (tryParseSpiceValue(substituted, out)) return true;
+    try {
+        gspice::BehavioralExpression expr(substituted, [](const std::string&) { return -1; });
+        gspice::VectorReal empty(0);
+        out = expr.evaluate(empty, 0.0);
+        return std::isfinite(out);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+std::string resolvedParamString(
+    const std::string& text,
+    const std::unordered_map<std::string, std::string>& params) {
+    double value = 0.0;
+    if (tryEvaluateParamExpression(text, params, value)) return formatNumericValue(value);
+    return stripExpressionDelimiters(text);
+}
+
+std::string resolveBracedNumericExpressions(
+    const std::string& line,
+    const std::unordered_map<std::string, std::string>& params) {
+    std::string out;
+    for (size_t i = 0; i < line.size();) {
+        if (line[i] != '{') {
+            out += line[i++];
+            continue;
+        }
+        int depth = 0;
+        size_t j = i;
+        for (; j < line.size(); ++j) {
+            if (line[j] == '{') ++depth;
+            if (line[j] == '}') {
+                --depth;
+                if (depth == 0) break;
+            }
+        }
+        if (j >= line.size()) {
+            out += line.substr(i);
+            break;
+        }
+        const std::string payload = line.substr(i + 1, j - i - 1);
+        double value = 0.0;
+        if (tryEvaluateParamExpression(payload, params, value)) {
+            out += formatNumericValue(value);
+        } else {
+            out += line.substr(i, j - i + 1);
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
+void resolveParameterMapExpressions(std::unordered_map<std::string, std::string>& params) {
+    for (int pass = 0; pass < 8; ++pass) {
+        bool changed = false;
+        for (auto& item : params) {
+            double value = 0.0;
+            if (!tryEvaluateParamExpression(item.second, params, value)) continue;
+            const std::string formatted = formatNumericValue(value);
+            if (item.second != formatted) {
+                item.second = formatted;
+                changed = true;
+            }
+        }
+        if (!changed) break;
     }
 }
 
@@ -139,18 +431,15 @@ std::unordered_map<std::string, std::string> collectGlobalParams(
         if (tokens.empty()) continue;
         std::string cmd = toUpperCopy(tokens[0]);
         if (cmd == ".PARAM" || cmd == ".PARAMS") {
-            for (size_t i = 1; i < tokens.size(); ++i) {
-                size_t eq = tokens[i].find('=');
-                if (eq == std::string::npos || eq == 0) continue;
-                std::string key = tokens[i].substr(0, eq);
-                std::string value = tokens[i].substr(eq + 1);
+            auto parsed = parseParameterAssignments(tokens, 1);
+            for (const auto& [key, value] : parsed) {
                 params[key] = value;
-                params[toUpperCopy(key)] = value;
             }
         } else {
             nonParamLines.push_back(line);
         }
     }
+    resolveParameterMapExpressions(params);
     return params;
 }
 
@@ -158,19 +447,44 @@ std::string applyGlobalParams(
     std::string line,
     const std::unordered_map<std::string, std::string>& params) {
     for (const auto& [key, value] : params) {
-        replaceAll(line, "{" + key + "}", value);
+        const std::string resolved = resolvedParamString(value, params);
+        replaceAll(line, "{" + key + "}", resolved);
+        replaceAll(line, "'" + key + "'", resolved);
     }
+    line = resolveBracedNumericExpressions(line, params);
     auto tokens = tokenizeSimple(line);
     for (auto& token : tokens) {
+        auto [key, value] = splitParameterToken(token);
+        if (!key.empty()) {
+            double evaluated = 0.0;
+            if (tryEvaluateParamExpression(value, params, evaluated)) {
+                token = key + "=" + formatNumericValue(evaluated);
+            }
+            continue;
+        }
         auto it = params.find(token);
-        if (it != params.end()) token = it->second;
+        if (it != params.end()) token = resolvedParamString(it->second, params);
     }
     return joinSimple(tokens);
 }
 
 bool tryParseSpiceValue(const std::string& token, double& out) {
+    const std::string text = stripExpressionDelimiters(token);
+    if (text.empty()) return false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '*' || c == '/' || c == '^' || c == '(' || c == ')' ||
+            c == '{' || c == '}' || c == '<' || c == '>' || c == '=' ||
+            c == '?' || c == ':' || c == ',') {
+            return false;
+        }
+        if ((c == '+' || c == '-') && i != 0) {
+            const char prev = text[i - 1];
+            if (prev != 'e' && prev != 'E') return false;
+        }
+    }
     try {
-        out = gspice::Utils::parseValue(token);
+        out = gspice::Utils::parseValue(text);
         return true;
     } catch (...) {
         return false;
@@ -202,43 +516,90 @@ void addParam(std::unordered_map<std::string, std::string>& params, const std::s
 std::unordered_map<std::string, std::string> parseParameterTokens(
     const std::vector<std::string>& tokens,
     size_t startIdx) {
-    std::unordered_map<std::string, std::string> params;
-    for (size_t i = startIdx; i < tokens.size(); ++i) {
-        if (i + 2 < tokens.size() && tokens[i + 1] == "=") {
-            addParam(params, tokens[i], stripQuotes(tokens[i + 2]));
-            i += 2;
-            continue;
-        }
-        if (!tokens[i].empty() && tokens[i].back() == '=' && i + 1 < tokens.size()) {
-            addParam(params, tokens[i].substr(0, tokens[i].size() - 1), stripQuotes(tokens[i + 1]));
-            ++i;
-            continue;
-        }
-        auto [key, value] = splitParameterToken(tokens[i]);
-        addParam(params, key, value);
+    return parseParameterAssignments(tokens, startIdx);
+}
+
+std::unordered_map<std::string, std::string> parseModelParamsFromText(std::string text) {
+    for (char& c : text) {
+        if (c == '(' || c == ')' || c == ',') c = ' ';
     }
-    return params;
+    auto paramTokens = tokenizeSimple(text);
+    return parseParameterTokens(paramTokens, 0);
+}
+
+double paramValue(
+    const std::unordered_map<std::string, std::string>& params,
+    const std::vector<std::string>& keys,
+    double defaultValue) {
+    for (const auto& key : keys) {
+        auto it = params.find(key);
+        if (it == params.end()) it = params.find(toUpperCopy(key));
+        if (it == params.end()) it = params.find(toLowerCopy(key));
+        if (it == params.end()) continue;
+        double parsed = 0.0;
+        if (tryEvaluateParamExpression(it->second, params, parsed)) return parsed;
+    }
+    return defaultValue;
+}
+
+bool modelTypeMatches(const gspice::ModelCard* model, const std::vector<std::string>& types) {
+    if (!model) return false;
+    const std::string actual = toUpperCopy(model->type);
+    for (const auto& type : types) {
+        if (actual == toUpperCopy(type)) return true;
+    }
+    return false;
+}
+
+bool primitiveModelFallbackEnabled() {
+    const char* raw = std::getenv("GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK");
+    std::string value = raw ? std::string(raw) : "";
+    std::transform(value.begin(), value.end(), value.begin(), ::toupper);
+    return value == "1" || value == "YES" || value == "TRUE" || value == "ON";
+}
+
+bool isLikelyCompactMosModelName(const std::string& modelName) {
+    const std::string name = toUpperCopy(modelName);
+    return name.find("SG13") != std::string::npos ||
+           name.find("PSP") != std::string::npos ||
+           name.find("BSIM") != std::string::npos ||
+           name.find("HICUM") != std::string::npos ||
+           name.find("EKV") != std::string::npos ||
+           name.find("NFET") != std::string::npos ||
+           name.find("PFET") != std::string::npos;
+}
+
+bool isLikelyCompactMosModelType(const std::string& modelType) {
+    const std::string type = toUpperCopy(modelType);
+    return type.find("PSP") != std::string::npos ||
+           type.find("BSIM") != std::string::npos ||
+           type.find("HICUM") != std::string::npos ||
+           type.find("EKV") != std::string::npos ||
+           type.find("OSDI") != std::string::npos;
 }
 
 std::string applyLocalParams(
     std::string line,
     const std::unordered_map<std::string, std::string>& params) {
     for (const auto& [key, value] : params) {
-        replaceAll(line, "{" + key + "}", value);
-        replaceAll(line, "'" + key + "'", value);
+        const std::string resolved = resolvedParamString(value, params);
+        replaceAll(line, "{" + key + "}", resolved);
+        replaceAll(line, "'" + key + "'", resolved);
     }
+    line = resolveBracedNumericExpressions(line, params);
     auto tokens = tokenizeSimple(line);
     for (auto& token : tokens) {
         auto [key, value] = splitParameterToken(token);
         if (!key.empty()) {
-            auto it = params.find(value);
-            if (it == params.end()) it = params.find(toUpperCopy(value));
-            if (it != params.end()) token = key + "=" + it->second;
+            double evaluated = 0.0;
+            if (tryEvaluateParamExpression(value, params, evaluated)) {
+                token = key + "=" + formatNumericValue(evaluated);
+            }
         } else {
             std::string stripped = stripQuotes(token);
             auto it = params.find(stripped);
             if (it == params.end()) it = params.find(toUpperCopy(stripped));
-            if (it != params.end()) token = it->second;
+            if (it != params.end()) token = resolvedParamString(it->second, params);
         }
     }
     return joinSimple(tokens);
@@ -262,6 +623,30 @@ bool hasOsdiDeviceInBody(const SubcktDef& def) {
         if (!tokens.empty() && std::toupper(tokens[0][0]) == 'N') return true;
     }
     return false;
+}
+
+std::vector<PreLine> expandActiveOsdiWrapperBody(
+    const SubcktDef& def,
+    const std::string& subcktName,
+    const std::string& prefix,
+    const std::unordered_map<std::string, std::string>& pinMap,
+    std::unordered_map<std::string, std::string>& localParams,
+    std::vector<std::string>& errors) {
+    std::vector<PreLine> expanded;
+    auto activeBody = filterConditionalLines(def.body, localParams, errors, "subckt " + subcktName);
+    for (const auto& body : activeBody) {
+        auto bodyTokens = tokenizeSimple(body.text);
+        if (bodyTokens.empty()) continue;
+        if (std::toupper(bodyTokens[0][0]) != 'N') continue;
+        PreLine paramBody = body;
+        paramBody.text = applyLocalParams(paramBody.text, localParams);
+        expanded.push_back({remapPrimitiveLine(paramBody, prefix, pinMap), paramBody.source, paramBody.lineNo});
+    }
+    if (expanded.empty()) {
+        errors.push_back("OSDI wrapper subcircuit '" + subcktName +
+                         "' did not select an active compact-model device for instance " + prefix);
+    }
+    return expanded;
 }
 
 void appendUniquePath(std::vector<std::filesystem::path>& roots, const std::filesystem::path& path) {
@@ -297,6 +682,13 @@ void appendEnvSearchRoots(std::vector<std::filesystem::path>& roots, const char*
         item = trimCopy(item);
         if (!item.empty()) appendUniquePath(roots, item);
     }
+}
+
+bool primitiveIhpFallbackEnabled() {
+    std::string value = getEnvVar("GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK");
+    if (value.empty()) return false;
+    value = toUpperCopy(value);
+    return !(value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
 }
 
 std::vector<std::filesystem::path> osdiSearchRoots(const std::string& sourcePath) {
@@ -561,6 +953,113 @@ std::vector<PreLine> expandLines(
     return expanded;
 }
 
+struct ConditionalFrame {
+    bool parentActive = true;
+    bool active = true;
+    bool branchTaken = false;
+    bool elseSeen = false;
+};
+
+bool conditionalStackActive(const std::vector<ConditionalFrame>& stack) {
+    return stack.empty() ? true : stack.back().active;
+}
+
+std::vector<PreLine> filterConditionalLines(
+    const std::vector<PreLine>& lines,
+    std::unordered_map<std::string, std::string>& params,
+    std::vector<std::string>& errors,
+    const std::string& context) {
+    std::vector<PreLine> filtered;
+    std::vector<ConditionalFrame> stack;
+
+    for (const auto& line : lines) {
+        auto tokens = tokenizeSimple(line.text);
+        if (tokens.empty()) continue;
+        const std::string cmd = toUpperCopy(tokens[0]);
+        if (cmd == ".PARAM" || cmd == ".PARAMS") {
+            if (conditionalStackActive(stack)) {
+                auto parsed = parseParameterAssignments(tokens, 1);
+                for (const auto& [key, value] : parsed) params[key] = value;
+                resolveParameterMapExpressions(params);
+            }
+            continue;
+        }
+        if (cmd == ".IF") {
+            const bool parentActive = conditionalStackActive(stack);
+            double condition = 0.0;
+            bool conditionOk = false;
+            if (!parentActive) {
+                conditionOk = true;
+            } else {
+                conditionOk = tryEvaluateParamExpression(joinTokens(tokens, 1), params, condition);
+            }
+            if (!conditionOk) {
+                errors.push_back("Could not evaluate .IF condition in " + context + " at " +
+                                 line.source + ":" + std::to_string(line.lineNo) + ": " + line.text);
+            }
+            const bool branchActive = conditionOk && condition != 0.0;
+            stack.push_back({parentActive, parentActive && branchActive, branchActive, false});
+            continue;
+        }
+        if (cmd == ".ELIF" || cmd == ".ELSEIF") {
+            if (stack.empty()) {
+                errors.push_back("Unexpected " + cmd + " without .IF in " + context + " at " +
+                                 line.source + ":" + std::to_string(line.lineNo));
+                continue;
+            }
+            auto& frame = stack.back();
+            if (frame.elseSeen) {
+                errors.push_back(cmd + " after .ELSE in " + context + " at " +
+                                 line.source + ":" + std::to_string(line.lineNo));
+                frame.active = false;
+                continue;
+            }
+            double condition = 0.0;
+            bool branchActive = false;
+            if (frame.parentActive && !frame.branchTaken) {
+                if (!tryEvaluateParamExpression(joinTokens(tokens, 1), params, condition)) {
+                    errors.push_back("Could not evaluate " + cmd + " condition in " + context + " at " +
+                                     line.source + ":" + std::to_string(line.lineNo) + ": " + line.text);
+                } else {
+                    branchActive = condition != 0.0;
+                }
+            }
+            frame.active = frame.parentActive && !frame.branchTaken && branchActive;
+            frame.branchTaken = frame.branchTaken || branchActive;
+            continue;
+        }
+        if (cmd == ".ELSE") {
+            if (stack.empty()) {
+                errors.push_back("Unexpected .ELSE without .IF in " + context + " at " +
+                                 line.source + ":" + std::to_string(line.lineNo));
+                continue;
+            }
+            auto& frame = stack.back();
+            frame.active = frame.parentActive && !frame.branchTaken;
+            frame.branchTaken = true;
+            frame.elseSeen = true;
+            continue;
+        }
+        if (cmd == ".ENDIF") {
+            if (stack.empty()) {
+                errors.push_back("Unexpected .ENDIF without .IF in " + context + " at " +
+                                 line.source + ":" + std::to_string(line.lineNo));
+                continue;
+            }
+            stack.pop_back();
+            continue;
+        }
+        if (conditionalStackActive(stack)) {
+            filtered.push_back(line);
+        }
+    }
+
+    if (!stack.empty()) {
+        errors.push_back("Unterminated .IF block in " + context);
+    }
+    return filtered;
+}
+
 std::vector<PreLine> expandSubcktInstance(
     const PreLine& line,
     const std::unordered_map<std::string, SubcktDef>& subckts,
@@ -606,63 +1105,47 @@ std::vector<PreLine> expandSubcktInstance(
 
     int ihpMosType = 0;
     if (isIhpLvMosWrapper(toUpperCopy(subcktName), ihpMosType) && def.pins.size() >= 4) {
+        if (hasOsdiDeviceInBody(def)) {
+            return expandActiveOsdiWrapperBody(def, subcktName, prefix, pinMap, localParams, errors);
+        }
+        if (!primitiveIhpFallbackEnabled()) {
+            errors.push_back("IHP wrapper subcircuit '" + subcktName + "' for instance " + prefix +
+                             " does not contain a PSP/OSDI compact-model device. Refusing primitive MOS fallback; " +
+                             "set GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1 only for placeholder smoke decks.");
+            return expanded;
+        }
         const std::string model = ihpMosType < 0 ? "PMOS" : "NMOS";
-        const std::string pspModel = ihpMosType < 0 ? "sg13g2_lv_pmos_psp" : "sg13g2_lv_nmos_psp";
         std::string w = "1u";
         std::string l = "1u";
-        std::string ng = "1";
-        std::string m = "1";
         auto wit = localParams.find("w");
         if (wit == localParams.end()) wit = localParams.find("W");
-        if (wit != localParams.end()) w = wit->second;
+        if (wit != localParams.end()) w = resolvedParamString(wit->second, localParams);
         auto lit = localParams.find("l");
         if (lit == localParams.end()) lit = localParams.find("L");
-        if (lit != localParams.end()) l = lit->second;
-        auto ngit = localParams.find("ng");
-        if (ngit == localParams.end()) ngit = localParams.find("NG");
-        if (ngit != localParams.end()) ng = ngit->second;
-        auto mit = localParams.find("m");
-        if (mit == localParams.end()) mit = localParams.find("M");
-        if (mit != localParams.end()) m = mit->second;
-
-        if (hasOsdiDeviceInBody(def)) {
-            std::vector<std::string> osdiLine = {
-                "NPSP_" + prefix,
-                tokens[1],
-                tokens[2],
-                tokens[3],
-                tokens[4],
-                pspModel,
-                "w=" + stripQuotes(w),
-                "l=" + stripQuotes(l),
-                "nf=" + stripQuotes(ng),
-                "mult=" + stripQuotes(m)
-            };
-            expanded.push_back({joinSimple(osdiLine), line.source, line.lineNo});
-        } else {
-            std::vector<std::string> mosLine = {
-                "MPSP_" + prefix,
-                tokens[1],
-                tokens[2],
-                tokens[3],
-                tokens[4],
-                model,
-                "W=" + stripQuotes(w),
-                "L=" + stripQuotes(l)
-            };
-            expanded.push_back({
-                ".GSPICEWARN IHP PSP wrapper " + subcktName +
-                    " is approximated with GSPICE's simple MOS model; results are not PSP/PDK accurate.",
-                line.source,
-                line.lineNo
-            });
-            expanded.push_back({joinSimple(mosLine), line.source, line.lineNo});
-        }
+        if (lit != localParams.end()) l = resolvedParamString(lit->second, localParams);
+        std::vector<std::string> mosLine = {
+            "MPSP_" + prefix,
+            tokens[1],
+            tokens[2],
+            tokens[3],
+            tokens[4],
+            model,
+            "W=" + stripQuotes(w),
+            "L=" + stripQuotes(l)
+        };
+        expanded.push_back({
+            ".GSPICEWARN IHP wrapper " + subcktName +
+                " did not contain a PSP/OSDI device; using GSPICE's simple MOS fallback for compatibility only.",
+            line.source,
+            line.lineNo
+        });
+        expanded.push_back({joinSimple(mosLine), line.source, line.lineNo});
         return expanded;
     }
 
+    auto activeBody = filterConditionalLines(def.body, localParams, errors, "subckt " + subcktName);
     std::vector<PreLine> bodyLines;
-    for (const auto& body : def.body) {
+    for (const auto& body : activeBody) {
         auto bodyTokens = tokenizeSimple(body.text);
         if (bodyTokens.empty()) continue;
         PreLine paramBody = body;
@@ -763,16 +1246,47 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_max_iter = 120;
         }
     };
+    auto applyNumericalPolicy = [&](std::string policy) {
+        policy = toUpperCopy(policy);
+        policy.erase(std::remove(policy.begin(), policy.end(), '_'), policy.end());
+        policy.erase(std::remove(policy.begin(), policy.end(), '-'), policy.end());
+        if (policy == "ROBUST" || policy == "CONSERVATIVE") {
+            settings.source_stepping = true;
+            settings.gmin_stepping = true;
+            settings.line_search = true;
+            settings.solver_singletons = true;
+            settings.tran_adaptive = true;
+            settings.tran_method = "GEAR2";
+            settings.op_max_iter = std::max(settings.op_max_iter, 200);
+            settings.tran_max_iter = std::max(settings.tran_max_iter, 160);
+            settings.gmin = std::max(settings.gmin, 1e-12);
+            settings.tran_lte_reltol = std::min(settings.tran_lte_reltol, 1e-3);
+        } else if (policy == "FAST") {
+            settings.source_stepping = false;
+            settings.gmin_stepping = false;
+            settings.line_search = false;
+            settings.tran_adaptive = true;
+            settings.tran_lte_reltol = std::max(settings.tran_lte_reltol, 5e-3);
+        } else if (policy == "BALANCED" || policy == "DEFAULT") {
+            settings.source_stepping = true;
+            settings.gmin_stepping = true;
+            settings.line_search = true;
+            settings.solver_singletons = true;
+            settings.tran_adaptive = true;
+        }
+    };
     if (key == "RELTOL" && hasNumeric && numeric > 0.0) settings.reltol = numeric;
     else if (key == "VNTOL" && hasNumeric && numeric > 0.0) settings.vntol = numeric;
     else if (key == "ABSTOL" && hasNumeric && numeric > 0.0) settings.abstol = numeric;
     else if (key == "GMIN" && hasNumeric && numeric >= 0.0) settings.gmin = numeric;
     else if (key == "ACCURACY" && !value.empty()) applyPreset(value);
+    else if ((key == "NUMERICAL" || key == "CONVERGENCE" || key == "POLICY") && !value.empty()) applyNumericalPolicy(value);
     else if ((key == "TRTOL" || key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
     else if ((key == "TRABSTOL" || key == "TRAN_ABSTOL" || key == "LTE_ABSTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_abstol = numeric;
     else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP") && hasNumeric && numeric > 0.0) settings.t_max_step = numeric;
     else if ((key == "MINSTEP" || key == "TMIN" || key == "TRAN_MINSTEP") && hasNumeric && numeric > 0.0) settings.t_min_step = numeric;
     else if (key == "ADAPTIVE" || key == "TRAN_ADAPTIVE") settings.tran_adaptive = value.empty() ? true : truthy(value);
+    else if (key == "TRAN_PREDICTOR" || key == "PREDICTOR") settings.tran_predictor = value.empty() ? true : truthy(value);
     else if ((key == "SOLVER" || key == "LINEAR_SOLVER" || key == "SPARSE_SOLVER") && !value.empty()) {
         settings.solver_backend = toUpperCopy(value);
     }
@@ -781,6 +1295,33 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if (key == "SINGLETONS" || key == "SINGLETON_FILTER" || key == "SINGLETON_FILTERING") {
         settings.solver_singletons = value.empty() ? true : truthy(value);
+    }
+    else if (key == "SOURCESTEPPING" || key == "SRCSTEP" || key == "SOURCE_STEPPING") {
+        settings.source_stepping = value.empty() ? true : truthy(value);
+    }
+    else if (key == "GMINSTEPPING" || key == "GMINSTEP" || key == "GMIN_STEPPING") {
+        settings.gmin_stepping = value.empty() ? true : truthy(value);
+    }
+    else if (key == "LINESEARCH" || key == "DAMPING" || key == "NEWTON_DAMPING") {
+        settings.line_search = value.empty() ? true : truthy(value);
+    }
+    else if (key == "NR_RESIDUALCHECK" || key == "RESIDUALCHECK" || key == "RESIDUAL_CHECK") {
+        settings.nr_residual_check = value.empty() ? true : truthy(value);
+    }
+    else if (key == "OSDI_LIMITING_RHS" || key == "OSDILIMITINGRHS" || key == "OSDI_LIM_RHS" || key == "OSDI_LIMITING") {
+        settings.osdi_limiting_rhs = value.empty() ? true : truthy(value);
+    }
+    else if (key == "OSDI_TRAN_JACOBIAN" || key == "OSDITRANJACOBIAN" || key == "OSDI_TRAN_JAC" || key == "OSDI_STANDARD_TRAN_JACOBIAN") {
+        settings.osdi_tran_jacobian = value.empty() ? true : truthy(value);
+    }
+    else if (key == "OSDI_BIND_FULL_MODEL_PARAMS" || key == "OSDIFULLMODELPARAMS" || key == "OSDI_FULL_MODEL_PARAMS") {
+        settings.osdi_bind_full_model_params = value.empty() ? true : truthy(value);
+    }
+    else if (key == "OSDI_INTERNAL_NODES" || key == "OSDIINTERNALNODES" || key == "OSDI_EXPAND_INTERNAL_NODES") {
+        settings.osdi_internal_nodes = value.empty() ? true : truthy(value);
+    }
+    else if (key == "OSDI_SPICE_RHS" || key == "OSDISPICERHS" || key == "OSDI_NATIVE_RHS") {
+        settings.osdi_spice_rhs = value.empty() ? true : truthy(value);
     }
     else if ((key == "METHOD" || key == "TRAN_METHOD") && !value.empty()) {
         std::string method = toUpperCopy(value);
@@ -891,6 +1432,85 @@ void parseSourceSpec(
     }
 }
 
+bool applyMeasureParam(gspice::MeasureSpec& measure, const std::string& keyIn, const std::string& value) {
+    std::string key = toUpperCopy(keyIn);
+    if (key == "AT") {
+        measure.at = gspice::Utils::parseValue(value);
+        measure.has_at = true;
+        return true;
+    }
+    if (key == "FROM") {
+        measure.from = gspice::Utils::parseValue(value);
+        measure.has_from = true;
+        return true;
+    }
+    if (key == "TO") {
+        measure.to = gspice::Utils::parseValue(value);
+        measure.has_to = true;
+        return true;
+    }
+    return false;
+}
+
+void parseMeasureParams(gspice::MeasureSpec& measure, const std::vector<std::string>& tokens, size_t startIdx) {
+    for (size_t i = startIdx; i < tokens.size(); ++i) {
+        auto [key, value] = splitParameterToken(tokens[i]);
+        if (!key.empty()) {
+            applyMeasureParam(measure, key, value);
+            continue;
+        }
+        std::string upper = toUpperCopy(tokens[i]);
+        if ((upper == "AT" || upper == "FROM" || upper == "TO") && i + 1 < tokens.size()) {
+            if (tokens[i + 1] == "=" && i + 2 < tokens.size()) {
+                applyMeasureParam(measure, upper, tokens[i + 2]);
+                i += 2;
+            } else {
+                applyMeasureParam(measure, upper, tokens[i + 1]);
+                ++i;
+            }
+        }
+    }
+}
+
+std::string stripBehavioralExpressionDelimiters(std::string text) {
+    text = trimCopy(stripQuotes(text));
+    if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+        text = trimCopy(text.substr(1, text.size() - 2));
+    }
+    return text;
+}
+
+bool parseBehavioralSourceSpec(
+    const std::vector<std::string>& tokens,
+    size_t startIdx,
+    gspice::BehavioralSource::Mode& mode,
+    std::string& expression) {
+    if (startIdx >= tokens.size()) return false;
+    std::string spec = joinTokens(tokens, startIdx);
+    spec = trimCopy(spec);
+    if (spec.empty()) return false;
+    auto upperSpec = toUpperCopy(spec);
+    if (upperSpec.rfind("I=", 0) == 0) {
+        mode = gspice::BehavioralSource::Mode::Current;
+        expression = stripBehavioralExpressionDelimiters(spec.substr(2));
+        return !expression.empty();
+    }
+    if (upperSpec.rfind("V=", 0) == 0) {
+        mode = gspice::BehavioralSource::Mode::Voltage;
+        expression = stripBehavioralExpressionDelimiters(spec.substr(2));
+        return !expression.empty();
+    }
+    if (tokens.size() > startIdx + 2) {
+        const std::string key = toUpperCopy(tokens[startIdx]);
+        if ((key == "I" || key == "V") && tokens[startIdx + 1] == "=") {
+            mode = key == "I" ? gspice::BehavioralSource::Mode::Current : gspice::BehavioralSource::Mode::Voltage;
+            expression = stripBehavioralExpressionDelimiters(joinTokens(tokens, startIdx + 2));
+            return !expression.empty();
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 namespace gspice {
@@ -915,6 +1535,7 @@ Netlist Parser::parse(const std::string& filePath) {
     auto expandedLines = expandLines(topLevelLines, subckts, preprocessErrors, 0);
     std::vector<PreLine> paramFreeLines;
     auto globalParams = collectGlobalParams(expandedLines, paramFreeLines);
+    paramFreeLines = filterConditionalLines(paramFreeLines, globalParams, preprocessErrors, "top-level deck");
     for (auto& line : paramFreeLines) {
         line.text = applyGlobalParams(line.text, globalParams);
     }
@@ -930,12 +1551,20 @@ Netlist Parser::parse(const std::string& filePath) {
         if (tokens.empty()) continue;
 
         std::string firstTokenUpper = toUpperCopy(tokens[0]);
-        if (firstTokenUpper == "OSDI" || firstTokenUpper == "PRE_OSDI") {
+        if (firstTokenUpper == "OSDI" || firstTokenUpper == "PRE_OSDI" || firstTokenUpper == "LOAD") {
             if (tokens.size() < 2) {
                 netlist.addError("Line " + std::to_string(lineNo) + ": " + tokens[0] + " requires a library path.");
                 continue;
             }
             std::string osdiPath = stripQuotes(tokens[1]);
+            const std::string osdiPathUpper = toUpperCopy(osdiPath);
+            if (firstTokenUpper == "LOAD" &&
+                osdiPathUpper.size() >= 3 &&
+                osdiPathUpper.substr(osdiPathUpper.size() - 3) == ".VA") {
+                netlist.addError("Line " + std::to_string(lineNo) +
+                    ": LOAD of Verilog-A source requires OpenVAF compilation first. Compile to .osdi, then LOAD the .osdi file.");
+                continue;
+            }
             if (osdiPath.rfind("builtin:", 0) != 0) {
                 osdiPath = resolveRelativePath(std::filesystem::path(preLine.source), osdiPath).string();
             }
@@ -974,8 +1603,206 @@ Netlist Parser::parse(const std::string& filePath) {
                     applyOptionToken(settings, tokens[i]);
                 }
                 netlist.setSettings(settings);
+            } else if (cmd == ".TEMP" || cmd == ".TEMPERATURE") {
+                if (tokens.size() < 2) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .TEMP line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.temperature_c = Utils::parseValue(tokens[1]);
+                netlist.setSettings(settings);
+            } else if (cmd == ".IC") {
+                SimulationSettings settings = netlist.getSettings();
+                for (size_t i = 1; i < tokens.size(); ++i) {
+                    std::string node;
+                    double value = 0.0;
+                    if (!parseInitialConditionToken(tokens[i], node, value)) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .IC token ignored: " + tokens[i]);
+                        continue;
+                    }
+                    settings.initial_conditions.push_back({netlist.getOrCreateNode(node), value});
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".NODESET") {
+                netlist.addWarning(
+                    "Line " + std::to_string(lineNo) +
+                    ": .NODESET is accepted for compatibility but not yet used by the nonlinear solver.");
+            } else if (cmd == ".GLOBAL") {
+                netlist.addWarning(
+                    "Line " + std::to_string(lineNo) +
+                    ": .GLOBAL accepted for compatibility; named nodes are already global in flat GSPICE decks.");
+            } else if (cmd == ".SAVE" || cmd == ".PROBE" || cmd == ".PRINT" || cmd == ".PLOT") {
+                SimulationSettings settings = netlist.getSettings();
+                bool sawSave = false;
+                for (size_t i = 1; i < tokens.size(); ++i) {
+                    const std::string tokenUpper = toUpperCopy(tokens[i]);
+                    if (tokenUpper == "ALL" || tokenUpper == "V(*)" || tokenUpper == "V(ALL)") {
+                        settings.save_all = true;
+                        settings.saves.clear();
+                        sawSave = true;
+                        continue;
+                    }
+                    SaveSpec save;
+                    if (!parseSaveToken(tokens[i], save)) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid " + cmd +
+                                           " token ignored: " + tokens[i]);
+                        continue;
+                    }
+                    if (toUpperCopy(save.kind) == "I") {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": " + cmd +
+                                           " current save '" + tokens[i] +
+                                           "' is not written yet; voltage saves are supported now.");
+                        continue;
+                    }
+                    if (settings.save_all) {
+                        settings.save_all = false;
+                        settings.saves.clear();
+                    }
+                    settings.saves.push_back(save);
+                    sawSave = true;
+                }
+                if (!sawSave) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": empty " + cmd + " ignored.");
+                }
+                netlist.setSettings(settings);
             } else if (cmd == ".LIB" || cmd == ".INCLUDE" || cmd == ".INC") {
-                netlist.addWarning("Line " + std::to_string(lineNo) + ": model/include directive is not implemented yet: " + line);
+                netlist.addError("Line " + std::to_string(lineNo) + ": unresolved include/library directive: " + line);
+            } else if (cmd == ".DC") {
+                if (tokens.size() < 5) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .DC line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "DC";
+                settings.dc_sweeps.clear();
+                for (size_t idx = 1; idx + 3 < tokens.size(); idx += 4) {
+                    SweepSpec sweep;
+                    sweep.source = tokens[idx];
+                    sweep.start = Utils::parseValue(tokens[idx + 1]);
+                    sweep.stop = Utils::parseValue(tokens[idx + 2]);
+                    sweep.step = Utils::parseValue(tokens[idx + 3]);
+                    if (sweep.step == 0.0) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .DC sweep step cannot be zero: " + line);
+                        continue;
+                    }
+                    settings.dc_sweeps.push_back(sweep);
+                }
+                if (settings.dc_sweeps.empty()) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .DC sweep groups ignored: " + line);
+                    continue;
+                }
+                settings.dc_sweep_source = tokens[1];
+                settings.dc_start = Utils::parseValue(tokens[2]);
+                settings.dc_stop = Utils::parseValue(tokens[3]);
+                settings.dc_step = Utils::parseValue(tokens[4]);
+                netlist.setSettings(settings);
+            } else if (cmd == ".STEP") {
+                if (tokens.size() < 5) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .STEP line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "STEP";
+                settings.step_sweeps.clear();
+                for (size_t idx = 1; idx + 3 < tokens.size(); idx += 4) {
+                    SweepSpec sweep;
+                    sweep.source = tokens[idx];
+                    sweep.start = Utils::parseValue(tokens[idx + 1]);
+                    sweep.stop = Utils::parseValue(tokens[idx + 2]);
+                    sweep.step = Utils::parseValue(tokens[idx + 3]);
+                    if (sweep.step == 0.0) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .STEP step cannot be zero: " + line);
+                        continue;
+                    }
+                    settings.step_sweeps.push_back(sweep);
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".MC" || cmd == ".MONTE" || cmd == ".MONTECARLO") {
+                if (tokens.size() < 4) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid Monte Carlo line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "MC";
+                settings.mc_runs = std::max(1, std::stoi(tokens[1]));
+                settings.mc_source = tokens[2];
+                std::string spec = joinTokens(tokens, 3);
+                std::string payload;
+                if (extractParenPayload(spec, "GAUSS", payload) || extractParenPayload(spec, "NORMAL", payload)) {
+                    auto nums = parseParenNumberList(payload);
+                    if (nums.size() >= 2) {
+                        settings.mc_mean = nums[0];
+                        settings.mc_sigma = nums[1];
+                    }
+                } else {
+                    settings.mc_mean = Utils::parseValue(tokens[3]);
+                    settings.mc_sigma = tokens.size() > 4 ? Utils::parseValue(tokens[4]) : 0.0;
+                }
+                for (size_t i = 4; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    if (toUpperCopy(key) == "SEED") {
+                        settings.mc_seed = static_cast<unsigned int>(std::stoul(value));
+                    }
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".CORNER" || cmd == ".CORNERS") {
+                if (tokens.size() < 3) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .CORNER line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                if (settings.type == "OP") settings.type = "CORNER";
+                CornerSpec corner;
+                corner.name = tokens[1];
+                for (size_t i = 2; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    if (key.empty()) {
+                        netlist.addWarning(
+                            "Line " + std::to_string(lineNo) +
+                            ": ignoring malformed corner assignment '" + tokens[i] + "'");
+                        continue;
+                    }
+                    corner.source_values.push_back({key, Utils::parseValue(value)});
+                }
+                if (corner.source_values.empty()) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": .CORNER has no source assignments: " + line);
+                    continue;
+                }
+                settings.corners.push_back(corner);
+                netlist.setSettings(settings);
+            } else if (cmd == ".SPEC" || cmd == ".YIELD") {
+                if (tokens.size() < 4) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SPEC line ignored: " + line);
+                    continue;
+                }
+                std::string outPos;
+                std::string outNeg;
+                if (!parseVoltageProbeToken(tokens[2], outPos, outNeg)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage .SPEC outputs are supported currently: " + line);
+                    continue;
+                }
+                OutputSpec spec;
+                spec.name = tokens[1];
+                spec.node_pos = netlist.getOrCreateNode(outPos);
+                spec.node_neg = netlist.getOrCreateNode(outNeg);
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    key = toUpperCopy(key);
+                    if (key == "MIN" || key == "LOW") {
+                        spec.min_value = Utils::parseValue(value);
+                        spec.has_min = true;
+                    } else if (key == "MAX" || key == "HIGH") {
+                        spec.max_value = Utils::parseValue(value);
+                        spec.has_max = true;
+                    }
+                }
+                if (!spec.has_min && !spec.has_max) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": .SPEC has neither MIN nor MAX: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.output_specs.push_back(spec);
+                netlist.setSettings(settings);
             } else if (cmd == ".TRAN") {
                 if (tokens.size() < 3) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .TRAN line ignored: " + line);
@@ -1023,6 +1850,25 @@ Netlist Parser::parse(const std::string& filePath) {
                 if (!netlist.loadOsdiLibrary(osdiPath, loadError)) {
                     netlist.addError("Line " + std::to_string(lineNo) + ": " + loadError);
                 }
+            } else if (cmd == ".LOAD") {
+                if (tokens.size() < 2) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .LOAD requires a library path.");
+                    continue;
+                }
+                std::string osdiPath = stripQuotes(tokens[1]);
+                const std::string osdiPathUpper = toUpperCopy(osdiPath);
+                if (osdiPathUpper.size() >= 3 && osdiPathUpper.substr(osdiPathUpper.size() - 3) == ".VA") {
+                    netlist.addError("Line " + std::to_string(lineNo) +
+                        ": .LOAD of Verilog-A source requires OpenVAF compilation first. Compile to .osdi, then .LOAD the .osdi file.");
+                    continue;
+                }
+                if (osdiPath.rfind("builtin:", 0) != 0) {
+                    osdiPath = resolveRelativePath(std::filesystem::path(preLine.source), osdiPath).string();
+                }
+                std::string loadError;
+                if (!netlist.loadOsdiLibrary(osdiPath, loadError)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": " + loadError);
+                }
             } else if (cmd == ".MODEL") {
                 if (tokens.size() < 3) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .MODEL line ignored: " + line);
@@ -1030,8 +1876,28 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 ModelCard model;
                 model.name = tokens[1];
-                model.type = tokens[2];
-                model.params = parseParameterTokens(tokens, 3);
+                std::string typeToken = tokens[2];
+                size_t paren = typeToken.find('(');
+                if (paren != std::string::npos) {
+                    model.type = typeToken.substr(0, paren);
+                    std::string paramText = typeToken.substr(paren + 1);
+                    if (tokens.size() > 3) paramText += " " + joinTokens(tokens, 3);
+                    model.params = parseModelParamsFromText(paramText);
+                } else {
+                    model.type = typeToken;
+                    std::string paramText = tokens.size() > 3 ? joinTokens(tokens, 3) : "";
+                    model.params = parseModelParamsFromText(paramText);
+                }
+                auto modelContext = globalParams;
+                for (const auto& [key, value] : model.params) {
+                    modelContext[key] = value;
+                }
+                for (auto& [key, value] : model.params) {
+                    double evaluated = 0.0;
+                    if (tryEvaluateParamExpression(value, modelContext, evaluated)) {
+                        value = formatNumericValue(evaluated);
+                    }
+                }
                 netlist.addModelCard(model);
                 if (toUpperCopy(tokens[2]) == "OSDI" && tokens.size() > 3) {
                     std::string pathPart = tokens[3];
@@ -1096,9 +1962,101 @@ Netlist Parser::parse(const std::string& filePath) {
                 // tokens[1] is V(node)
                 std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
                 settings.out_node = netlist.getOrCreateNode(outNode);
-                settings.points_per_dec = std::stoi(tokens[3]);
-                settings.f_start = Utils::parseValue(tokens[4]);
-                settings.f_stop = Utils::parseValue(tokens[5]);
+                size_t sweepIdx = 3;
+                std::string sweepType = toUpperCopy(tokens[sweepIdx]);
+                if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
+                    if (tokens.size() < 7) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE sweep line ignored: " + line);
+                        continue;
+                    }
+                    settings.points_per_dec = std::stoi(tokens[4]);
+                    settings.f_start = Utils::parseValue(tokens[5]);
+                    settings.f_stop = Utils::parseValue(tokens[6]);
+                } else {
+                    settings.points_per_dec = std::stoi(tokens[3]);
+                    settings.f_start = Utils::parseValue(tokens[4]);
+                    settings.f_stop = Utils::parseValue(tokens[5]);
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".TF") {
+                if (tokens.size() < 3) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .TF line ignored: " + line);
+                    continue;
+                }
+                std::string outPos;
+                std::string outNeg;
+                if (!parseVoltageProbeToken(tokens[1], outPos, outNeg)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage-output .TF is supported currently: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "TF";
+                settings.tf_out_pos = netlist.getOrCreateNode(outPos);
+                settings.tf_out_neg = netlist.getOrCreateNode(outNeg);
+                settings.tf_input_source = tokens[2];
+                netlist.setSettings(settings);
+            } else if (cmd == ".SENS") {
+                if (tokens.size() < 3) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SENS line ignored: " + line);
+                    continue;
+                }
+                std::string outPos;
+                std::string outNeg;
+                if (!parseVoltageProbeToken(tokens[1], outPos, outNeg)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage-output .SENS is supported currently: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "SENS";
+                settings.sens_out_pos = netlist.getOrCreateNode(outPos);
+                settings.sens_out_neg = netlist.getOrCreateNode(outNeg);
+                settings.sens_source = tokens[2];
+                netlist.setSettings(settings);
+            } else if (cmd == ".PZ") {
+                if (tokens.size() < 3) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PZ line ignored: " + line);
+                    continue;
+                }
+                std::string outPos;
+                std::string outNeg;
+                if (!parseVoltageProbeToken(tokens[1], outPos, outNeg)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage-output .PZ is supported currently: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "PZ";
+                settings.tf_out_pos = netlist.getOrCreateNode(outPos);
+                settings.tf_out_neg = netlist.getOrCreateNode(outNeg);
+                settings.tf_input_source = tokens[2];
+                settings.points_per_dec = 20;
+                settings.f_start = 1.0;
+                settings.f_stop = 1e12;
+                if (tokens.size() >= 7) {
+                    settings.points_per_dec = std::stoi(tokens[4]);
+                    settings.f_start = Utils::parseValue(tokens[5]);
+                    settings.f_stop = Utils::parseValue(tokens[6]);
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".MEAS" || cmd == ".MEASURE") {
+                if (tokens.size() < 5) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .MEASURE line ignored: " + line);
+                    continue;
+                }
+                std::string outPos;
+                std::string outNeg;
+                if (!parseVoltageProbeToken(tokens[4], outPos, outNeg)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage .MEASURE expressions are supported currently: " + line);
+                    continue;
+                }
+                MeasureSpec measure;
+                measure.analysis = toUpperCopy(tokens[1]);
+                measure.name = tokens[2];
+                measure.op = toUpperCopy(tokens[3]);
+                measure.node_pos = netlist.getOrCreateNode(outPos);
+                measure.node_neg = netlist.getOrCreateNode(outNeg);
+                parseMeasureParams(measure, tokens, 5);
+                SimulationSettings settings = netlist.getSettings();
+                settings.measures.push_back(measure);
                 netlist.setSettings(settings);
             } else if (cmd == ".STB") {
                 if (tokens.size() < 5) {
@@ -1131,9 +2089,21 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.type = "PNOISE";
                 std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
                 settings.out_node = netlist.getOrCreateNode(outNode);
-                settings.points_per_dec = std::stoi(tokens[3]);
-                settings.f_start = Utils::parseValue(tokens[4]);
-                settings.f_stop = Utils::parseValue(tokens[5]);
+                size_t sweepIdx = 3;
+                std::string sweepType = toUpperCopy(tokens[sweepIdx]);
+                if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
+                    if (tokens.size() < 7) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE sweep line ignored: " + line);
+                        continue;
+                    }
+                    settings.points_per_dec = std::stoi(tokens[4]);
+                    settings.f_start = Utils::parseValue(tokens[5]);
+                    settings.f_stop = Utils::parseValue(tokens[6]);
+                } else {
+                    settings.points_per_dec = std::stoi(tokens[3]);
+                    settings.f_start = Utils::parseValue(tokens[4]);
+                    settings.f_stop = Utils::parseValue(tokens[5]);
+                }
                 netlist.setSettings(settings);
             } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" || 
                        cmd == ".PSSSP" || cmd == ".PSSSTB") {
@@ -1155,39 +2125,126 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 netlist.setSettings(settings);
             } else {
-                netlist.addWarning("Line " + std::to_string(lineNo) + ": unsupported directive ignored: " + line);
+                netlist.addError("Line " + std::to_string(lineNo) + ": unsupported directive; refusing to ignore active simulator syntax: " + line);
             }
 
         } else if (firstChar == 'R') {
             // Resistor: Rname N1 N2 Value
-            if (tokens.size() < 4) continue;
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid resistor line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
             double val = Utils::parseValue(tokens[3]);
             netlist.addDevice(std::make_unique<Resistor>(tokens[0], n1, n2, val));
         } else if (firstChar == 'C') {
             // Capacitor: Cname N1 N2 Value
-            if (tokens.size() < 4) continue;
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid capacitor line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
             double val = Utils::parseValue(tokens[3]);
             netlist.addDevice(std::make_unique<Capacitor>(tokens[0], n1, n2, val));
         } else if (firstChar == 'L') {
             // Inductor: Lname N1 N2 Value
-            if (tokens.size() < 4) continue;
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid inductor line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
             double val = Utils::parseValue(tokens[3]);
             netlist.addDevice(std::make_unique<Inductor>(tokens[0], n1, n2, val, -1));
+        } else if (firstChar == 'B') {
+            // Behavioral source: Bname N+ N- I={expr} or V={expr}.
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid behavioral source line: " + line);
+                continue;
+            }
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            BehavioralSource::Mode mode = BehavioralSource::Mode::Current;
+            std::string expressionText;
+            if (!parseBehavioralSourceSpec(tokens, 3, mode, expressionText)) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": behavioral source requires I={expr} or V={expr}: " + line);
+                continue;
+            }
+            try {
+                BehavioralExpression expression(
+                    expressionText,
+                    [&netlist](const std::string& nodeName) {
+                        return netlist.getOrCreateNode(nodeName);
+                    });
+                netlist.addDevice(std::make_unique<BehavioralSource>(tokens[0], n1, n2, mode, expression, -1));
+            } catch (const std::exception& ex) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": failed to parse behavioral source expression: " + std::string(ex.what()));
+            }
+        } else if (firstChar == 'G') {
+            // VCCS: Gname N+ N- NC+ NC- value
+            if (tokens.size() < 6) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid VCCS line: " + line);
+                continue;
+            }
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            int cp = netlist.getOrCreateNode(tokens[3]);
+            int cn = netlist.getOrCreateNode(tokens[4]);
+            double gm = Utils::parseValue(tokens[5]);
+            netlist.addDevice(std::make_unique<VoltageControlledCurrentSource>(tokens[0], n1, n2, cp, cn, gm));
+        } else if (firstChar == 'E') {
+            // VCVS: Ename N+ N- NC+ NC- gain
+            if (tokens.size() < 6) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid VCVS line: " + line);
+                continue;
+            }
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            int cp = netlist.getOrCreateNode(tokens[3]);
+            int cn = netlist.getOrCreateNode(tokens[4]);
+            double gain = Utils::parseValue(tokens[5]);
+            netlist.addDevice(std::make_unique<VoltageControlledVoltageSource>(tokens[0], n1, n2, cp, cn, gain, -1));
+        } else if (firstChar == 'F') {
+            // CCCS: Fname N+ N- Vcontrol gain
+            if (tokens.size() < 5) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid CCCS line: " + line);
+                continue;
+            }
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            double gain = Utils::parseValue(tokens[4]);
+            netlist.addDevice(std::make_unique<CurrentControlledCurrentSource>(tokens[0], n1, n2, tokens[3], gain));
+        } else if (firstChar == 'H') {
+            // CCVS: Hname N+ N- Vcontrol transresistance
+            if (tokens.size() < 5) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid CCVS line: " + line);
+                continue;
+            }
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            double transresistance = Utils::parseValue(tokens[4]);
+            netlist.addDevice(std::make_unique<CurrentControlledVoltageSource>(tokens[0], n1, n2, tokens[3], transresistance, -1));
         } else if (firstChar == 'W') {
             // Stability Probe: Wname node_in node_out
-            if (tokens.size() < 3) continue;
+            if (tokens.size() < 3) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid stability probe line: " + line);
+                continue;
+            }
             int nIn = netlist.getOrCreateNode(tokens[1]);
             int nOut = netlist.getOrCreateNode(tokens[2]);
             netlist.addDevice(std::make_unique<StabilityProbe>(tokens[0], nIn, nOut, -1));
         } else if (firstChar == 'P') {
             // Port: Pname N1 N2 PortNum Z0
-            if (tokens.size() < 4) continue;
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid port line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
             int pNum = std::stoi(tokens[3]);
@@ -1263,8 +2320,33 @@ Netlist Parser::parse(const std::string& filePath) {
                 continue;
             }
             try {
+                const auto& settings = netlist.getSettings();
+                if (settings.osdi_internal_nodes) {
+                    for (uint32_t nodeIndex = static_cast<uint32_t>(nodes.size()); nodeIndex < desc->num_nodes; ++nodeIndex) {
+                    std::string nodeName = "n_" + tokens[0] + "_osdi_" + std::to_string(nodeIndex);
+                    if (desc->nodes && desc->nodes[nodeIndex].name) {
+                        nodeName += "_" + sanitizeIdentifier(desc->nodes[nodeIndex].name);
+                    }
+                    nodes.push_back(netlist.getOrCreateNode(nodeName));
+                    }
+                }
                 auto instanceParams = parseParameterTokens(tokens, 6);
-                netlist.addDevice(std::make_unique<OSDIDevice>(tokens[0], *desc, nodes, model->params, instanceParams));
+                netlist.addDevice(std::make_unique<OSDIDevice>(
+                    tokens[0], *desc, nodes, model->params, instanceParams,
+                    settings.temperature_c,
+                    settings.osdi_limiting_rhs,
+                    settings.osdi_tran_jacobian,
+                    settings.osdi_bind_full_model_params,
+                    settings.osdi_spice_rhs));
+                const char* descName = desc->name ? desc->name : desc->model_name;
+                netlist.addModelStatus(
+                    "OSDI_DEVICE instance=" + tokens[0] +
+                    " model=" + tokens[5] +
+                    " type=" + model->type +
+                    " descriptor=" + std::string(descName ? descName : "<unnamed>") +
+                    " osdi_nodes=" + std::to_string(desc->num_nodes) +
+                    " internal_unknowns=" + std::to_string(nodes.size() > 4 ? nodes.size() - 4 : 0) +
+                    " internal_mode=" + std::string(settings.osdi_internal_nodes ? "expanded" : "local"));
             } catch (const std::exception& ex) {
                 netlist.addError(
                     "Line " + std::to_string(lineNo) +
@@ -1272,13 +2354,59 @@ Netlist Parser::parse(const std::string& filePath) {
             }
         } else if (firstChar == 'M') {
             // MOSFET: Mname D G S B Model [W=..] [L=..]
-            if (tokens.size() < 6) continue;
+            if (tokens.size() < 6) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid MOSFET line: " + line);
+                continue;
+            }
             int nD = netlist.getOrCreateNode(tokens[1]);
             int nG = netlist.getOrCreateNode(tokens[2]);
             int nS = netlist.getOrCreateNode(tokens[3]);
             int nB = netlist.getOrCreateNode(tokens[4]);
             
             double w = 1e-6, l = 1e-6;
+            const ModelCard* modelCard = netlist.findModelCard(tokens[5]);
+            int type = 1; // Default NMOS
+            std::string modelNameUpper = toUpperCopy(tokens[5]);
+            if (modelCard) {
+                const std::string modelType = toUpperCopy(modelCard->type);
+                if (modelType.find("PMOS") != std::string::npos || modelType == "P") type = -1;
+                if (modelType.find("NMOS") != std::string::npos || modelType == "N") type = 1;
+            } else if (modelNameUpper.find("PMOS") != std::string::npos) {
+                type = -1;
+            }
+
+            double vth = type > 0 ? 0.5 : 0.5;
+            double kp = 100e-6;
+            double lambda = 0.05;
+            double gamma = 0.4;
+            double phi = 0.7;
+            if (modelCard && modelTypeMatches(modelCard, {"NMOS", "PMOS", "N", "P"})) {
+                vth = paramValue(modelCard->params, {"VTO", "VT0", "VTH", "VTH0"}, vth);
+                kp = paramValue(modelCard->params, {"KP", "BETA", "K"}, kp);
+                lambda = paramValue(modelCard->params, {"LAMBDA", "LAMDA"}, lambda);
+                gamma = paramValue(modelCard->params, {"GAMMA"}, gamma);
+                phi = paramValue(modelCard->params, {"PHI"}, phi);
+            } else if (modelCard) {
+                if (isLikelyCompactMosModelType(modelCard->type) && !primitiveModelFallbackEnabled()) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": MOS model '" + tokens[5] + "' has compact/PDK type '" +
+                        modelCard->type + "'. Refusing primitive Level-1 fallback. "
+                        "Load the matching OSDI/OpenVAF model or set GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK=1 only for debug smoke decks.");
+                    continue;
+                }
+                netlist.addWarning(
+                    "Line " + std::to_string(lineNo) +
+                    ": MOS model '" + tokens[5] + "' has unsupported primitive type '" +
+                    modelCard->type + "'; using GSPICE Level-1 fallback parameters.");
+            } else if (isLikelyCompactMosModelName(tokens[5]) && !primitiveModelFallbackEnabled()) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": MOS model '" + tokens[5] + "' looks like a PDK compact model but no supported model card was loaded. "
+                    "Refusing primitive Level-1 fallback; load the real OSDI/OpenVAF model first.");
+                continue;
+            }
+
             // Simple param parsing: look for W= and L=
             for (size_t i = 6; i < tokens.size(); ++i) {
                 std::string upperTok = toUpperCopy(tokens[i]);
@@ -1286,15 +2414,13 @@ Netlist Parser::parse(const std::string& filePath) {
                 if (upperTok.rfind("L=", 0) == 0) l = Utils::parseValue(stripQuotes(tokens[i].substr(2)));
             }
 
-            int type = 1; // Default NMOS
-            std::string model = tokens[5];
-            std::transform(model.begin(), model.end(), model.begin(), ::toupper);
-            if (model.find("PMOS") != std::string::npos) type = -1;
-
-            netlist.addDevice(std::make_unique<Mosfet>(tokens[0], nD, nG, nS, nB, type, w, l));
+            netlist.addDevice(std::make_unique<Mosfet>(tokens[0], nD, nG, nS, nB, type, w, l, vth, kp, lambda, gamma, phi));
         } else if (firstChar == 'V') {
             // Voltage Source: Vname N1 N2 [DC <value>] [AC <mag>] [PULSE(...)/SIN(...)/PWL(...)] or scalar value
-            if (tokens.size() < 4) continue;
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid voltage source line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
             const std::string sourceSpec = joinTokens(tokens, 3);
@@ -1321,7 +2447,10 @@ Netlist Parser::parse(const std::string& filePath) {
             netlist.addDevice(std::move(vsrc));
         } else if (firstChar == 'I') {
             // Current Source: Iname N1 N2 [DC <value>] [waveform...]
-            if (tokens.size() < 4) continue;
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid current source line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
             const std::string sourceSpec = joinTokens(tokens, 3);
@@ -1345,14 +2474,89 @@ Netlist Parser::parse(const std::string& filePath) {
             if (wf == VoltageSource::WaveformType::SIN) isrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) isrc->setPwl(pwlT, pwlV);
             netlist.addDevice(std::move(isrc));
+        } else if (firstChar == 'Q') {
+            // BJT: Qname C B E [S] model [area] [params...]
+            if (tokens.size() < 5) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid BJT line: " + line);
+                continue;
+            }
+            int nC = netlist.getOrCreateNode(tokens[1]);
+            int nB = netlist.getOrCreateNode(tokens[2]);
+            int nE = netlist.getOrCreateNode(tokens[3]);
+            size_t modelIdx = 4;
+            if (tokens.size() >= 6 && !netlist.findModelCard(tokens[4]) && netlist.findModelCard(tokens[5])) {
+                modelIdx = 5; // substrate node is accepted but ignored by this first-pass BJT.
+            }
+            const ModelCard* modelCard = netlist.findModelCard(tokens[modelIdx]);
+            int type = 1;
+            double is = 1e-16;
+            double bf = 100.0;
+            double br = 1.0;
+            double nf = 1.0;
+            double nr = 1.0;
+            if (modelCard) {
+                const std::string modelType = toUpperCopy(modelCard->type);
+                if (modelType == "PNP") type = -1;
+                if (modelType == "NPN") type = 1;
+                if (modelType != "NPN" && modelType != "PNP") {
+                    netlist.addWarning(
+                        "Line " + std::to_string(lineNo) +
+                        ": BJT model '" + tokens[modelIdx] + "' has unsupported type '" +
+                        modelCard->type + "'; using NPN fallback.");
+                }
+                is = paramValue(modelCard->params, {"IS"}, is);
+                bf = paramValue(modelCard->params, {"BF", "BETA", "BETA_F"}, bf);
+                br = paramValue(modelCard->params, {"BR", "BETA_R"}, br);
+                nf = paramValue(modelCard->params, {"NF"}, nf);
+                nr = paramValue(modelCard->params, {"NR"}, nr);
+            } else {
+                netlist.addWarning(
+                    "Line " + std::to_string(lineNo) +
+                    ": BJT model '" + tokens[modelIdx] + "' was not found; using default NPN parameters.");
+            }
+            double area = 1.0;
+            if (modelIdx + 1 < tokens.size() && tokens[modelIdx + 1].find('=') == std::string::npos) {
+                double parsedArea = 1.0;
+                if (tryParseSpiceValue(tokens[modelIdx + 1], parsedArea)) area = parsedArea;
+            }
+            auto instanceParams = parseParameterTokens(tokens, modelIdx + 1);
+            area = paramValue(instanceParams, {"AREA", "M"}, area);
+            netlist.addDevice(std::make_unique<Bjt>(tokens[0], nC, nB, nE, type, is, bf, br, nf, nr, area));
         } else if (firstChar == 'D') {
-            // Diode: Dname N1 N2
-            if (tokens.size() < 3) continue;
+            // Diode: Dname N1 N2 [model] [area]
+            if (tokens.size() < 3) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid diode line: " + line);
+                continue;
+            }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
-            netlist.addDevice(std::make_unique<Diode>(tokens[0], n1, n2));
+            double is = 1e-14;
+            double n = 1.0;
+            double cjo = 0.0;
+            double area = 1.0;
+            if (tokens.size() >= 4) {
+                const ModelCard* modelCard = netlist.findModelCard(tokens[3]);
+                if (modelCard && modelTypeMatches(modelCard, {"D", "DIODE"})) {
+                    is = paramValue(modelCard->params, {"IS", "JS"}, is);
+                    n = paramValue(modelCard->params, {"N", "NF"}, n);
+                    cjo = paramValue(modelCard->params, {"CJO", "CJ0", "CJ"}, cjo);
+                } else if (modelCard) {
+                    netlist.addWarning(
+                        "Line " + std::to_string(lineNo) +
+                        ": diode model '" + tokens[3] + "' has unsupported type '" +
+                        modelCard->type + "'; using default diode parameters.");
+                }
+                if (tokens.size() >= 5 && tokens[4].find('=') == std::string::npos) {
+                    double parsedArea = 1.0;
+                    if (tryParseSpiceValue(tokens[4], parsedArea)) area = parsedArea;
+                }
+                auto instanceParams = parseParameterTokens(tokens, 4);
+                area = paramValue(instanceParams, {"AREA", "M"}, area);
+            }
+            area = std::max(area, 1e-30);
+            netlist.addDevice(std::make_unique<Diode>(tokens[0], n1, n2, is * area, n, cjo * area));
         } else {
-            netlist.addWarning("Line " + std::to_string(lineNo) + ": unsupported element ignored: " + line);
+            netlist.addError("Line " + std::to_string(lineNo) + ": unsupported element; refusing to ignore active device: " + line);
         }
     }
 

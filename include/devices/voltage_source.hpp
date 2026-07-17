@@ -60,6 +60,14 @@ public:
         acMagnitude_ = value;
     }
 
+    void setDcValue(double value) {
+        dcValue_ = value;
+    }
+
+    double getDcValue() const {
+        return dcValue_;
+    }
+
     void collectBreakpoints(double t_stop, std::vector<double>& points) const override {
         if (t_stop <= 0.0) return;
         auto add = [&](double t) {

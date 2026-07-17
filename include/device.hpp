@@ -26,6 +26,13 @@ struct TransientContext {
     const std::vector<double>* timeHistory = nullptr;
 };
 
+struct NoiseSource {
+    std::string name;
+    int nodePos = -1;
+    int nodeNeg = -1;
+    double currentPsd = 0.0;
+};
+
 class Device {
 public:
     Device(const std::string& name) : name_(name) {}
@@ -86,6 +93,14 @@ public:
     }
 
     /**
+     * Optional device-requested maximum next transient step. Compact models can
+     * use this for Verilog-A $bound_step support after evaluating their state.
+     */
+    virtual double transientBoundStep() const {
+        return 0.0;
+    }
+
+    /**
      * Stamping for AC analysis (Complex numbers).
      * @param omega Angular frequency (omega = 2*pi*f)
      */
@@ -95,6 +110,19 @@ public:
      * Returns the noise contribution of this device.
      */
     virtual double getNoisePSD(double omega, const VectorReal& x_dc) { return 0.0; }
+
+    /**
+     * Adds equivalent small-signal noise current sources for output-referred
+     * noise analysis. Each source is solved through the AC matrix.
+     */
+    virtual void collectNoiseSources(
+        double omega,
+        const VectorReal& x_dc,
+        std::vector<NoiseSource>& sources) const {
+        (void)omega;
+        (void)x_dc;
+        (void)sources;
+    }
 
     /**
      * Stamping for Harmonic Balance analysis (Frequency domain non-linear).

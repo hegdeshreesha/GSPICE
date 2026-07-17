@@ -104,11 +104,37 @@ public:
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        // Reuse DC logic for small-signal gm/gds
-        // (Implementation omitted for brevity, similar to dcStamp with complex types)
+        (void)b;
+        (void)omega;
+        const auto ss = evaluateSmallSignal(x_dc);
+        const std::complex<double> gds = {ss.gds, 0.0};
+        const std::complex<double> gm = {ss.gm, 0.0};
+        J.add(nodeD_, nodeD_, gds);
+        J.add(nodeD_, nodeG_, gm);
+        J.add(nodeD_, nodeS_, -(gm + gds));
+        J.add(nodeS_, nodeD_, -gds);
+        J.add(nodeS_, nodeG_, -gm);
+        J.add(nodeS_, nodeS_, gm + gds);
+    }
+
+    void collectNoiseSources(double omega, const VectorReal& x_dc, std::vector<NoiseSource>& sources) const override {
+        (void)omega;
+        const auto ss = evaluateSmallSignal(x_dc);
+        const double k = 1.380649e-23;
+        const double T = 298.15;
+        const double channelConductance = std::max(ss.gds + (2.0 / 3.0) * std::abs(ss.gm), 0.0);
+        const double psd = 4.0 * k * T * channelConductance;
+        if (psd > 0.0) {
+            sources.push_back({name_ + ".channel", nodeD_, nodeS_, psd});
+        }
     }
 
 private:
+    struct SmallSignal {
+        double gm = 0.0;
+        double gds = 0.0;
+    };
+
     int nodeD_, nodeG_, nodeS_, nodeB_;
     int type_;
     double W_, L_, Vth_, Kp_;
@@ -126,6 +152,44 @@ private:
 
     static double nodeVoltage(const VectorReal& x, int node) {
         return node >= 0 ? x[node] : 0.0;
+    }
+
+    SmallSignal evaluateSmallSignal(const VectorReal& x) const {
+        const double Vd = nodeVoltage(x, nodeD_);
+        const double Vg = nodeVoltage(x, nodeG_);
+        const double Vs = nodeVoltage(x, nodeS_);
+        const double Vb = nodeVoltage(x, nodeB_);
+        const double Vgs = type_ * (Vg - Vs);
+        const double Vds = type_ * (Vd - Vs);
+        const double Vsb = std::max(0.0, type_ * (Vs - Vb));
+        const double sqrtPhi = std::sqrt(std::max(phi_, 1e-12));
+        const double VthEff = Vth_ + gamma_ * (std::sqrt(std::max(phi_ + Vsb, 1e-12)) - sqrtPhi);
+        const double beta = Kp_ * (W_ / std::max(L_, 1e-12));
+        const double Vov = Vgs - VthEff;
+
+        SmallSignal ss;
+        if (Vds <= 0.0) {
+            ss.gds = 1e-12;
+        } else if (Vov <= 0.0) {
+            const double thermal = 0.02585;
+            const double n = 1.5;
+            const double Id0 = 1e-12 * (W_ / std::max(L_, 1e-12));
+            const double expArg = std::clamp(Vov / (n * thermal), -80.0, 40.0);
+            const double expTerm = std::exp(expArg);
+            const double vdsTerm = 1.0 - std::exp(-Vds / thermal);
+            const double ids = Id0 * expTerm * vdsTerm;
+            ss.gm = ids / (n * thermal);
+            ss.gds = Id0 * expTerm * std::exp(-Vds / thermal) / thermal;
+            ss.gds = std::max(ss.gds, 1e-12);
+        } else if (Vds < Vov) {
+            ss.gm = beta * Vds;
+            ss.gds = beta * (Vov - Vds);
+        } else {
+            const double Idsat = 0.5 * beta * Vov * Vov;
+            ss.gm = beta * Vov * (1.0 + lambda_ * Vds);
+            ss.gds = std::max(Idsat * lambda_, 1e-12);
+        }
+        return ss;
     }
 
     static void stampCap(

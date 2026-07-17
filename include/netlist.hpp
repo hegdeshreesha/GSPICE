@@ -9,10 +9,58 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <utility>
 #include "device.hpp"
 #include "osdi_loader.hpp"
 
 namespace gspice {
+
+struct SweepSpec {
+    std::string source;
+    double start = 0.0;
+    double stop = 0.0;
+    double step = 0.0;
+};
+
+struct MeasureSpec {
+    std::string analysis = "TRAN";
+    std::string name;
+    std::string op;
+    int node_pos = -1;
+    int node_neg = -1;
+    bool has_at = false;
+    bool has_from = false;
+    bool has_to = false;
+    double at = 0.0;
+    double from = 0.0;
+    double to = 0.0;
+};
+
+struct CornerSpec {
+    std::string name;
+    std::vector<std::pair<std::string, double>> source_values;
+};
+
+struct OutputSpec {
+    std::string name;
+    int node_pos = -1;
+    int node_neg = -1;
+    bool has_min = false;
+    bool has_max = false;
+    double min_value = 0.0;
+    double max_value = 0.0;
+};
+
+struct SaveSpec {
+    std::string kind = "V";
+    std::string node_pos;
+    std::string node_neg = "0";
+};
+
+struct InitialConditionSpec {
+    int node = -1;
+    double value = 0.0;
+};
 
 struct SimulationSettings {
     std::string type = "OP"; // Default to DC Operating Point
@@ -22,6 +70,7 @@ struct SimulationSettings {
     double t_max_step = 0.0;
     double t_min_step = 0.0;
     bool tran_adaptive = true;
+    bool tran_predictor = false;
     std::string tran_method = "AUTO";
     double tran_lte_reltol = 5e-3;
     double tran_lte_abstol = 1e-6;
@@ -29,6 +78,34 @@ struct SimulationSettings {
     double f_stop = 0.0;
     int points_per_dec = 0;
     bool use_uic = false;
+    double temperature_c = 27.0;
+
+    // DC sweep parameters
+    std::string dc_sweep_source;
+    double dc_start = 0.0;
+    double dc_stop = 0.0;
+    double dc_step = 0.0;
+    std::vector<SweepSpec> dc_sweeps;
+    std::vector<SweepSpec> step_sweeps;
+
+    // Monte Carlo source-variation parameters
+    int mc_runs = 0;
+    unsigned int mc_seed = 1;
+    std::string mc_source;
+    double mc_mean = 0.0;
+    double mc_sigma = 0.0;
+    std::vector<CornerSpec> corners;
+    std::vector<OutputSpec> output_specs;
+
+    // Transfer function parameters
+    std::string tf_input_source;
+    int tf_out_pos = -1;
+    int tf_out_neg = -1;
+
+    // Sensitivity parameters
+    std::string sens_source;
+    int sens_out_pos = -1;
+    int sens_out_neg = -1;
 
     // Solver / numerical controls, SPICE-like defaults
     double reltol = 1e-3;
@@ -40,6 +117,15 @@ struct SimulationSettings {
     std::string solver_backend = "AUTO";
     std::string solver_ordering = "AUTO";
     bool solver_singletons = true;
+    bool source_stepping = true;
+    bool gmin_stepping = true;
+    bool line_search = true;
+    bool nr_residual_check = true;
+    bool osdi_limiting_rhs = false;
+    bool osdi_tran_jacobian = false;
+    bool osdi_bind_full_model_params = false;
+    bool osdi_internal_nodes = false;
+    bool osdi_spice_rhs = false;
 
     // PSS / HB Parameters
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)
@@ -48,6 +134,12 @@ struct SimulationSettings {
 
     // Noise Parameters
     int out_node = -1;
+
+    // Measurements
+    std::vector<MeasureSpec> measures;
+    std::vector<InitialConditionSpec> initial_conditions;
+    bool save_all = true;
+    std::vector<SaveSpec> saves;
 
     // Hierarchical / Periodic Small-Signal Flags
     bool is_periodic = false; // Set if PAC, HBAC, etc.
@@ -89,6 +181,16 @@ public:
         }
         return "node" + std::to_string(index);
     }
+
+    int findNode(const std::string& name) const {
+        auto it = node_map_.find(name);
+        if (it != node_map_.end()) return it->second;
+        std::string lower = normalizeKey(name);
+        for (const auto& [key, value] : node_map_) {
+            if (normalizeKey(key) == lower) return value;
+        }
+        return -2;
+    }
     
     const std::vector<std::unique_ptr<Device>>& getDevices() const {
         return devices_;
@@ -112,23 +214,51 @@ public:
             errorOut = loader->getError();
             return false;
         }
-        for (const auto& desc : loader->getAvailableModels()) {
+        std::string models;
+        std::string capabilities;
+        const auto& metadata = loader->getAvailableMetadata();
+        const auto& descriptors = loader->getAvailableModels();
+        for (size_t i = 0; i < descriptors.size(); ++i) {
+            const auto& desc = descriptors[i];
             const char* modelName = desc.name ? desc.name : desc.model_name;
             if (modelName) {
                 osdi_descriptors_[modelName] = desc;
                 osdi_descriptors_[normalizeKey(modelName)] = desc;
+                if (!models.empty()) models += ",";
+                models += modelName;
+            }
+            if (i < metadata.size()) {
+                if (!capabilities.empty()) capabilities += ";";
+                capabilities += metadata[i].summary();
             }
         }
+        model_status_.push_back(
+            "OSDI_LOADED path=\"" + path + "\" models=" + (models.empty() ? "<none>" : models) +
+            " capabilities=" + (capabilities.empty() ? "<unknown>" : capabilities));
         osdi_loaders_.push_back(std::move(loader));
         return true;
     }
 
     void addModelCard(const ModelCard& model) {
         model_cards_[model.name] = model;
+        model_cards_[normalizeKey(model.name)] = model;
+        std::string upper = model.name;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+            return static_cast<char>(std::toupper(c));
+        });
+        model_cards_[upper] = model;
     }
 
     const ModelCard* findModelCard(const std::string& name) const {
         auto it = model_cards_.find(name);
+        if (it != model_cards_.end()) return &it->second;
+        it = model_cards_.find(normalizeKey(name));
+        if (it != model_cards_.end()) return &it->second;
+        std::string upper = name;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+            return static_cast<char>(std::toupper(c));
+        });
+        it = model_cards_.find(upper);
         if (it != model_cards_.end()) return &it->second;
         return nullptr;
     }
@@ -181,12 +311,20 @@ public:
         errors_.push_back(message);
     }
 
+    void addModelStatus(const std::string& message) {
+        model_status_.push_back(message);
+    }
+
     const std::vector<std::string>& getWarnings() const {
         return warnings_;
     }
 
     const std::vector<std::string>& getErrors() const {
         return errors_;
+    }
+
+    const std::vector<std::string>& getModelStatus() const {
+        return model_status_;
     }
 
 private:
@@ -197,6 +335,7 @@ private:
     std::unordered_map<std::string, std::string> legacy_osdi_model_paths_;
     std::unordered_map<std::string, ModelCard> model_cards_;
     std::unordered_map<std::string, OsdiDescriptor> osdi_descriptors_;
+    std::vector<std::string> model_status_;
     std::vector<std::string> warnings_;
     std::vector<std::string> errors_;
     int next_node_id_ = 0;

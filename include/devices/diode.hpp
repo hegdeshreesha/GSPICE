@@ -3,6 +3,7 @@
 
 #include "device.hpp"
 #include "fourier.hpp"
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -10,15 +11,25 @@ namespace gspice {
 
 class Diode : public Device {
 public:
-    Diode(const std::string& name, int nodePos, int nodeNeg, double Is = 1e-14, double Vt = 0.026)
-        : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), Is_(Is), Vt_(Vt) {}
+    Diode(
+        const std::string& name,
+        int nodePos,
+        int nodeNeg,
+        double Is = 1e-14,
+        double emissionCoeff = 1.0,
+        double cjo = 0.0)
+        : Device(name),
+          nodePos_(nodePos),
+          nodeNeg_(nodeNeg),
+          Is_(Is),
+          emissionCoeff_(std::max(emissionCoeff, 1e-6)),
+          Vt_(emissionCoeff_ * thermalVoltage_),
+          cjo_(std::max(cjo, 0.0)) {}
 
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
-        double Vd = ((nodePos_ >= 0) ? x[nodePos_] : 0.0) - ((nodeNeg_ >= 0) ? x[nodeNeg_] : 0.0);
-        if (Vd > 0.8) Vd = 0.8; if (Vd < -2.0) Vd = -2.0;
-        double expV = std::exp(Vd / Vt_);
-        double Id = Is_ * (expV - 1.0);
-        double gd = (Is_ / Vt_) * expV;
+        double Vd = limitedVoltage(x);
+        double Id = diodeCurrentFromLimitedVoltage(Vd);
+        double gd = diodeConductanceFromLimitedVoltage(Vd);
         double gmin = 1e-12; gd += gmin; Id += gmin * Vd;
         double Ieq = Id - gd * Vd;
         J.add(nodePos_, nodePos_, gd);
@@ -27,15 +38,35 @@ public:
         J.add(nodeNeg_, nodePos_, -gd);
         b.add(nodePos_, -Ieq);
         b.add(nodeNeg_, Ieq);
+        if (timeStep > 0.0 && !x_hist.empty() && cjo_ > 0.0) {
+            stampBackwardEulerCap(J, b, timeStep, x_hist.back());
+        }
+    }
+
+    void tranStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, const TransientContext& ctx) override {
+        static const std::vector<VectorReal> empty_history;
+        const auto& history = ctx.xHistory ? *ctx.xHistory : empty_history;
+        dcStamp(J, b, x, ctx.timeStep, ctx.currentTime, history);
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        double Vd = ((nodePos_ >= 0) ? x_dc[nodePos_] : 0.0) - ((nodeNeg_ >= 0) ? x_dc[nodeNeg_] : 0.0);
-        double gd = (Is_ / Vt_) * std::exp(Vd / Vt_);
-        J.add(nodePos_, nodePos_, {gd, 0.0});
-        J.add(nodeNeg_, nodeNeg_, {gd, 0.0});
-        J.add(nodePos_, nodeNeg_, {-gd, 0.0});
-        J.add(nodeNeg_, nodePos_, {-gd, 0.0});
+        double Vd = limitedVoltage(x_dc);
+        double gd = diodeConductanceFromLimitedVoltage(Vd);
+        std::complex<double> y = {gd, omega * cjo_};
+        J.add(nodePos_, nodePos_, y);
+        J.add(nodeNeg_, nodeNeg_, y);
+        J.add(nodePos_, nodeNeg_, -y);
+        J.add(nodeNeg_, nodePos_, -y);
+    }
+
+    void collectNoiseSources(double omega, const VectorReal& x_dc, std::vector<NoiseSource>& sources) const override {
+        (void)omega;
+        const double q = 1.602176634e-19;
+        const double current = std::abs(diodeCurrentFromLimitedVoltage(limitedVoltage(x_dc)));
+        const double psd = 2.0 * q * current;
+        if (psd > 0.0) {
+            sources.push_back({name_ + ".shot", nodePos_, nodeNeg_, psd});
+        }
     }
 
     void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) override {
@@ -82,10 +113,48 @@ public:
     }
 
 private:
+    double nodeVoltage(const VectorReal& x, int node) const {
+        return node >= 0 ? x[node] : 0.0;
+    }
+
+    double limitedVoltage(const VectorReal& x) const {
+        double Vd = nodeVoltage(x, nodePos_) - nodeVoltage(x, nodeNeg_);
+        if (Vd > 0.8) Vd = 0.8;
+        if (Vd < -2.0) Vd = -2.0;
+        return Vd;
+    }
+
+    double diodeCurrentFromLimitedVoltage(double Vd) const {
+        return Is_ * (std::exp(Vd / Vt_) - 1.0);
+    }
+
+    double diodeConductanceFromLimitedVoltage(double Vd) const {
+        return (Is_ / Vt_) * std::exp(Vd / Vt_);
+    }
+
+    void stampBackwardEulerCap(
+        SparseMatrixReal& J,
+        VectorReal& b,
+        double timeStep,
+        const VectorReal& x_prev) const {
+        const double Geq = cjo_ / std::max(timeStep, 1e-30);
+        const double Vprev = nodeVoltage(x_prev, nodePos_) - nodeVoltage(x_prev, nodeNeg_);
+        const double Ieq = Geq * Vprev;
+        J.add(nodePos_, nodePos_, Geq);
+        J.add(nodeNeg_, nodeNeg_, Geq);
+        J.add(nodePos_, nodeNeg_, -Geq);
+        J.add(nodeNeg_, nodePos_, -Geq);
+        b.add(nodePos_, Ieq);
+        b.add(nodeNeg_, -Ieq);
+    }
+
+    static constexpr double thermalVoltage_ = 0.025852;
     int nodePos_;
     int nodeNeg_;
     double Is_;
+    double emissionCoeff_;
     double Vt_;
+    double cjo_;
 };
 
 } // namespace gspice

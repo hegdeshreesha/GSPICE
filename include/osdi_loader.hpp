@@ -12,6 +12,7 @@
 #include <iostream>
 #include "osdi.h"
 #include "osdi_emulator.hpp"
+#include "osdi_metadata.hpp"
 
 namespace gspice {
 
@@ -21,6 +22,7 @@ public:
         library_path_ = libraryPath;
         if (libraryPath == "builtin:mos_level_50") {
             available_models_.push_back(OsdiEmulator::getDescriptor());
+            metadata_.emplace_back(available_models_.back());
             loaded_ = true;
             return;
         }
@@ -51,6 +53,7 @@ public:
                 OsdiDescriptor desc{};
                 std::memcpy(&desc, descriptors_base + static_cast<size_t>(i) * descriptor_size, descriptor_size);
                 available_models_.push_back(desc);
+                metadata_.emplace_back(available_models_.back());
             }
             loaded_ = true;
         } else {
@@ -67,6 +70,10 @@ public:
         return available_models_;
     }
 
+    const std::vector<OsdiDescriptorMetadata>& getAvailableMetadata() const {
+        return metadata_;
+    }
+
     bool isLoaded() const { return loaded_; }
     const std::string& getError() const { return error_; }
     const std::string& getPath() const { return library_path_; }
@@ -77,6 +84,7 @@ private:
     std::string library_path_;
     std::string error_;
     std::vector<OsdiDescriptor> available_models_;
+    std::vector<OsdiDescriptorMetadata> metadata_;
 };
 
 } // namespace gspice

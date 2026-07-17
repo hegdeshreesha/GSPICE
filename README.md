@@ -22,6 +22,8 @@ GSPICE is an experimental C++ SPICE-like simulator being developed as the native
 
 See `docs/GSPICE_AUDIT_ROADMAP.md` for the current audit and roadmap.
 
+For dogfood and beta validation, see `BETA_TESTING.md`.
+
 ## Installation And Build
 
 GSPICE uses CMake.

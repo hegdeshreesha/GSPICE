@@ -3,12 +3,15 @@
 
 #include "device.hpp"
 #include "osdi.h"
+#include "osdi_metadata.hpp"
 #include "utils.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -26,13 +29,27 @@ public:
         const OsdiDescriptor& desc,
         const std::vector<int>& nodes,
         const ParamMap& modelParams = {},
-        const ParamMap& instanceParams = {})
-        : Device(name), desc_(desc), nodes_(nodes) {
+        const ParamMap& instanceParams = {},
+        double temperatureC = 27.0,
+        bool useLimitingRhs = false,
+        bool useTranJacobian = false,
+        bool bindFullModelParams = false,
+        bool useSpiceRhs = false)
+        : Device(name),
+          desc_(desc),
+          metadata_(desc),
+          nodes_(nodes),
+          use_limiting_rhs_(useLimitingRhs),
+          use_tran_jacobian_(useTranJacobian),
+          bind_full_model_params_override_(bindFullModelParams),
+          use_spice_rhs_(useSpiceRhs),
+          temperature_k_(temperatureC + 273.15) {
         if (desc_.legacy_evaluate) {
             instance_data_ = desc_.legacy_create_instance ? desc_.legacy_create_instance(nullptr) : nullptr;
             return;
         }
         validateRealOsdiDescriptor();
+        bind_full_model_params_ = shouldBindFullModelParams(modelParams);
         model_storage_.resize(wordsFor(desc_.model_size));
         instance_storage_.resize(wordsFor(desc_.instance_size));
         model_data_ = model_storage_.empty() ? nullptr : model_storage_.data();
@@ -42,6 +59,7 @@ public:
         setupModel();
         applyParams(instance_data_, instanceParams, true);
         setupInstance();
+        initializeStateIndexTable();
         buildNodeMapping();
         prev_state_.assign(desc_.num_states, 0.0);
         next_state_.assign(desc_.num_states, 0.0);
@@ -86,9 +104,13 @@ public:
             solve.data(),
             nullptr,
             nullptr,
-            CALC_RESIST_RESIDUAL | CALC_RESIST_JACOBIAN | CALC_OP | ANALYSIS_DC | ANALYSIS_STATIC
+            limitingEvalFlags(CALC_RESIST_RESIDUAL | CALC_RESIST_JACOBIAN |
+                (osdiLimitingRhsEnabled() ? CALC_RESIST_LIM_RHS : 0u) |
+                CALC_OP | ANALYSIS_DC | ANALYSIS_STATIC)
         };
+        resetBoundStepRequest();
         uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        noteLimitingEval();
         if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
         }
@@ -96,6 +118,18 @@ public:
         std::vector<double> residual(local_node_count_, 0.0);
         if (desc_.load_residual_resist) {
             desc_.load_residual_resist(instance_data_, model_data_, residual.data());
+        }
+        if (limitingApplied(ret) && desc_.load_limit_rhs_resist) {
+            std::vector<double> limited(local_node_count_, 0.0);
+            desc_.load_limit_rhs_resist(instance_data_, model_data_, limited.data());
+            for (size_t i = 0; i < residual.size() && i < limited.size(); ++i) {
+                residual[i] -= limited[i];
+            }
+        }
+        std::vector<double> spiceRhs(local_node_count_, 0.0);
+        const bool useSpiceRhs = use_spice_rhs_ && desc_.load_spice_rhs_dc;
+        if (useSpiceRhs) {
+            desc_.load_spice_rhs_dc(instance_data_, model_data_, spiceRhs.data(), solve.data());
         }
 
         std::vector<double> jacobian(std::max<uint32_t>(desc_.num_resistive_jacobian_entries, desc_.num_jacobian_entries), 0.0);
@@ -110,12 +144,11 @@ public:
             wroteArray = true;
         }
 
-        for (size_t term = 0; term < nodes_.size() && term < node_mapping_.size(); ++term) {
-            const int globalRow = nodes_[term];
-            const uint32_t localRow = node_mapping_[term];
-            if (globalRow < 0 || localRow == UINT32_MAX || localRow >= residual.size()) continue;
+        for (uint32_t localRow = 1; localRow < local_node_count_; ++localRow) {
+            const int globalRow = globalNodeForLocal(localRow);
+            if (globalRow < 0 || localRow >= residual.size()) continue;
 
-            double rhs = -residual[localRow];
+            double rhs = useSpiceRhs ? spiceRhs[localRow] : -residual[localRow];
             size_t jacIndex = 0;
             for (uint32_t e = 0; wroteArray && e < desc_.num_jacobian_entries; ++e) {
                 const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
@@ -129,11 +162,13 @@ public:
                 const uint32_t colLocal = node_mapping_[entry.nodes.node_1];
                 if (rowLocal != localRow || colLocal == UINT32_MAX) continue;
 
-                const int colTerm = terminalForLocal(colLocal);
+                const int colGlobal = globalNodeForLocal(colLocal);
                 const double vcol = colLocal < solve.size() ? solve[colLocal] : 0.0;
-                rhs -= g * vcol;
-                if (colTerm >= 0 && nodes_[static_cast<size_t>(colTerm)] >= 0) {
-                    J.add(globalRow, nodes_[static_cast<size_t>(colTerm)], -g);
+                if (!useSpiceRhs) {
+                    rhs -= g * vcol;
+                }
+                if (colGlobal >= 0) {
+                    J.add(globalRow, colGlobal, -g);
                 }
             }
             b.add(globalRow, rhs);
@@ -162,10 +197,123 @@ public:
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        (void)J;
         (void)b;
-        (void)omega;
-        (void)x_dc;
+        if (desc_.legacy_evaluate) {
+            const int n = static_cast<int>(nodes_.size());
+            std::vector<double> voltages(n, 0.0);
+            std::vector<double> currents(n, 0.0);
+            std::vector<double> charges(n, 0.0);
+            std::vector<double> jacobian(static_cast<size_t>(n) * static_cast<size_t>(n), 0.0);
+            for (int i = 0; i < n; ++i) {
+                voltages[i] = nodes_[i] >= 0 ? x_dc[nodes_[i]] : 0.0;
+            }
+            desc_.legacy_evaluate(instance_data_, voltages.data(), currents.data(), charges.data(), jacobian.data());
+            for (int row = 0; row < n; ++row) {
+                if (nodes_[row] < 0) continue;
+                for (int col = 0; col < n; ++col) {
+                    if (nodes_[col] < 0) continue;
+                    J.add(nodes_[row], nodes_[col], {jacobian[static_cast<size_t>(row) * n + col], 0.0});
+                }
+            }
+            return;
+        }
+        if (!desc_.eval) return;
+
+        std::vector<double> solve = localSolveFromGlobal(x_dc);
+        char* nullName = nullptr;
+        char* nullStrName = nullptr;
+        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimInfo info{
+            paras,
+            0.0,
+            solve.data(),
+            prev_state_.empty() ? nullptr : prev_state_.data(),
+            next_state_.empty() ? nullptr : next_state_.data(),
+            CALC_RESIST_JACOBIAN | CALC_REACT_JACOBIAN | ANALYSIS_AC | ANALYSIS_STATIC
+        };
+        const uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
+            throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
+        }
+
+        std::vector<double> jacResist(std::max<uint32_t>(desc_.num_resistive_jacobian_entries, 1), 0.0);
+        bool wroteResistArray = false;
+        if (desc_.write_jacobian_array_resist) {
+            desc_.write_jacobian_array_resist(instance_data_, model_data_, jacResist.data());
+            wroteResistArray = true;
+        } else if (desc_.load_jacobian_resist && desc_.jacobian_ptr_resist_offset != UINT32_MAX) {
+            populateJacobianPointers(jacResist);
+            desc_.load_jacobian_resist(instance_data_, model_data_);
+            wroteResistArray = true;
+        }
+
+        std::vector<double> jacReact(std::max<uint32_t>(desc_.num_reactive_jacobian_entries, 1), 0.0);
+        bool wroteReactArray = false;
+        if (desc_.write_jacobian_array_react) {
+            desc_.write_jacobian_array_react(instance_data_, model_data_, jacReact.data());
+            wroteReactArray = true;
+        } else if (desc_.load_jacobian_react) {
+            populateReactiveJacobianPointers(jacReact);
+            desc_.load_jacobian_react(instance_data_, model_data_, 1.0);
+            wroteReactArray = true;
+        }
+
+        size_t resistIndex = 0;
+        size_t reactIndex = 0;
+        for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
+            const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
+            double g = 0.0;
+            double c = 0.0;
+            if ((entry.flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0) {
+                if (wroteResistArray && resistIndex < jacResist.size()) g = jacResist[resistIndex];
+                ++resistIndex;
+            }
+            if ((entry.flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0) {
+                if (wroteReactArray && reactIndex < jacReact.size()) c = jacReact[reactIndex];
+                ++reactIndex;
+            }
+            if (g == 0.0 && c == 0.0) continue;
+            if (entry.nodes.node_2 >= node_mapping_.size() || entry.nodes.node_1 >= node_mapping_.size()) continue;
+            const uint32_t rowLocal = node_mapping_[entry.nodes.node_2];
+            const uint32_t colLocal = node_mapping_[entry.nodes.node_1];
+            const int row = globalNodeForLocal(rowLocal);
+            const int col = globalNodeForLocal(colLocal);
+            if (row < 0 || col < 0) continue;
+            J.add(row, col, {-g, -omega * c});
+        }
+    }
+
+    void collectNoiseSources(double omega, const VectorReal& x_dc, std::vector<NoiseSource>& sources) const override {
+        if (desc_.legacy_evaluate || !desc_.load_noise || desc_.num_noise_src == 0 || !desc_.noise_sources) return;
+        std::vector<double> solve = localSolveFromGlobal(x_dc);
+        char* nullName = nullptr;
+        char* nullStrName = nullptr;
+        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        std::vector<double> prevState = prev_state_;
+        std::vector<double> scratchState(desc_.num_states, 0.0);
+        OsdiSimInfo info{
+            paras,
+            0.0,
+            solve.data(),
+            prevState.empty() ? nullptr : prevState.data(),
+            scratchState.empty() ? nullptr : scratchState.data(),
+            CALC_NOISE | ANALYSIS_NOISE
+        };
+        const uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
+            throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
+        }
+        std::vector<double> densities(desc_.num_noise_src, 0.0);
+        const double freq = std::max(omega / (2.0 * 3.14159265358979323846), 0.0);
+        desc_.load_noise(instance_data_, model_data_, freq, densities.data());
+        for (uint32_t i = 0; i < desc_.num_noise_src; ++i) {
+            if (densities[i] <= 0.0) continue;
+            const int nodePos = globalNodeForDescriptorNode(desc_.noise_sources[i].nodes.node_1);
+            const int nodeNeg = globalNodeForDescriptorNode(desc_.noise_sources[i].nodes.node_2);
+            if (nodePos < 0 && nodeNeg < 0) continue;
+            const char* noiseName = desc_.noise_sources[i].name ? desc_.noise_sources[i].name : "noise";
+            sources.push_back({name_ + "." + noiseName, nodePos, nodeNeg, densities[i]});
+        }
     }
 
     void acceptTransientStep(const VectorReal& x, double currentTime) override {
@@ -215,8 +363,56 @@ public:
         }
     }
 
+    const OsdiDescriptorMetadata& metadata() const {
+        return metadata_;
+    }
+
+    std::vector<std::string> getOpvarNames() const {
+        std::vector<std::string> names;
+        names.reserve(metadata_.opvar_ids.size());
+        for (uint32_t id : metadata_.opvar_ids) {
+            if (id < metadata_.parameters.size()) {
+                names.push_back(metadata_.parameters[id].canonical_name);
+            }
+        }
+        return names;
+    }
+
+    bool readOpvar(const std::string& name, double& value) const {
+        if (desc_.legacy_evaluate || !desc_.access || !instance_data_) return false;
+        const OsdiParameterInfo* info = metadata_.findParameter(name);
+        if (!info || info->kind != OsdiParameterKind::Opvar) return false;
+        const uint32_t flags = info->kind == OsdiParameterKind::Instance
+            ? (ACCESS_FLAG_READ | ACCESS_FLAG_INSTANCE)
+            : (ACCESS_FLAG_READ | ACCESS_FLAG_INSTANCE);
+        void* raw = desc_.access(instance_data_, model_data_, info->id, flags);
+        if (!raw) return false;
+        if (info->type == OsdiValueType::Real) {
+            value = *reinterpret_cast<double*>(raw);
+            return true;
+        }
+        if (info->type == OsdiValueType::Integer) {
+            value = static_cast<double>(*reinterpret_cast<int32_t*>(raw));
+            return true;
+        }
+        return false;
+    }
+
+    double boundStep() const {
+        if (!instance_data_ || desc_.bound_step_offset == UINT32_MAX) return 0.0;
+        const auto* raw = reinterpret_cast<const double*>(
+            reinterpret_cast<const unsigned char*>(instance_data_) + desc_.bound_step_offset);
+        if (!raw || !std::isfinite(*raw) || *raw <= 0.0) return 0.0;
+        return *raw;
+    }
+
+    double transientBoundStep() const override {
+        return boundStep();
+    }
+
 private:
     OsdiDescriptor desc_{};
+    OsdiDescriptorMetadata metadata_;
     std::vector<int> nodes_;
     std::vector<std::max_align_t> model_storage_;
     std::vector<std::max_align_t> instance_storage_;
@@ -231,6 +427,13 @@ private:
     std::vector<double> prev2_react_;
     std::vector<double> prev_react_derivative_;
     bool prev_react_derivative_valid_ = false;
+    bool bind_full_model_params_ = false;
+    bool use_limiting_rhs_ = false;
+    bool use_tran_jacobian_ = false;
+    bool bind_full_model_params_override_ = false;
+    bool use_spice_rhs_ = false;
+    bool limiting_initialized_ = false;
+    double temperature_k_ = 300.15;
 
     static size_t wordsFor(uint32_t bytes) {
         if (bytes == 0) return 0;
@@ -250,6 +453,39 @@ private:
             return static_cast<char>(std::tolower(c));
         });
         return !(text == "0" || text == "false" || text == "no" || text == "off");
+    }
+
+    bool fullOsdiModelParamBindingEnabled() const {
+        if (bind_full_model_params_override_) return true;
+        const char* value = std::getenv("GSPICE_BIND_FULL_OSDI_MODEL_PARAMS");
+        if (!value) return false;
+        std::string text(value);
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return text == "1" || text == "true" || text == "yes" || text == "on";
+    }
+
+    bool standardOsdiTranJacobianEnabled() const {
+        if (use_tran_jacobian_) return true;
+        const char* value = std::getenv("GSPICE_USE_OSDI_TRAN_JACOBIAN");
+        if (!value) return false;
+        std::string text(value);
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return text == "1" || text == "true" || text == "yes" || text == "on";
+    }
+
+    bool osdiLimitingRhsEnabled() const {
+        if (use_limiting_rhs_) return true;
+        const char* value = std::getenv("GSPICE_USE_OSDI_LIMITING_RHS");
+        if (!value) return false;
+        std::string text(value);
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return text == "1" || text == "true" || text == "yes" || text == "on";
     }
 
     static std::string lower(std::string value) {
@@ -283,8 +519,39 @@ private:
         char* nullStrName = nullptr;
         OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
         OsdiInitInfo res{0, 0, nullptr};
-        desc_.setup_instance(osdiHandle(), instance_data_, model_data_, 300.15, desc_.num_terminals, &paras, &res);
+        desc_.setup_instance(osdiHandle(), instance_data_, model_data_, temperature_k_, desc_.num_terminals, &paras, &res);
         checkInitResult(res, "instance");
+    }
+
+    void initializeStateIndexTable() {
+        if (!instance_data_ || desc_.state_idx_off == UINT32_MAX || desc_.num_states == 0) return;
+        auto* stateIndices = reinterpret_cast<uint32_t*>(
+            reinterpret_cast<unsigned char*>(instance_data_) + desc_.state_idx_off);
+        for (uint32_t i = 0; i < desc_.num_states; ++i) {
+            stateIndices[i] = i;
+        }
+    }
+
+    void resetBoundStepRequest() {
+        if (!instance_data_ || desc_.bound_step_offset == UINT32_MAX) return;
+        auto* raw = reinterpret_cast<double*>(
+            reinterpret_cast<unsigned char*>(instance_data_) + desc_.bound_step_offset);
+        *raw = std::numeric_limits<double>::infinity();
+    }
+
+    bool limitingApplied(uint32_t evalResult) const {
+        return osdiLimitingRhsEnabled() && (evalResult & EVAL_RET_FLAG_LIM) != 0;
+    }
+
+    uint32_t limitingEvalFlags(uint32_t baseFlags) const {
+        if (!osdiLimitingRhsEnabled()) return baseFlags;
+        uint32_t flags = baseFlags | ENABLE_LIM;
+        if (!limiting_initialized_) flags |= INIT_LIM;
+        return flags;
+    }
+
+    void noteLimitingEval() {
+        if (osdiLimitingRhsEnabled()) limiting_initialized_ = true;
     }
 
     void checkInitResult(const OsdiInitInfo& res, const std::string& stage) const {
@@ -309,10 +576,9 @@ private:
             if (found == params.end()) {
                 continue;
             }
-            if (!instanceParams && !isTypeParam(param)) {
+            if (!instanceParams && !bind_full_model_params_ && !isTypeParam(param)) {
                 continue;
             }
-
             const uint32_t flags = instanceParams ? (ACCESS_FLAG_SET | ACCESS_FLAG_INSTANCE) : ACCESS_FLAG_SET;
             void* raw = instanceParams
                 ? desc_.access(data, nullptr, id, flags)
@@ -355,6 +621,15 @@ private:
             if (param.name[i] && lower(param.name[i]) == "type") return true;
         }
         return false;
+    }
+
+    bool shouldBindFullModelParams(const ParamMap& params) const {
+        if (fullOsdiModelParamBindingEnabled()) return true;
+        // Large foundry model cards contain many .param-backed expressions.
+        // Partially binding only the numeric subset can create inconsistent
+        // compact-model state. Keep those cards on OpenVAF defaults until
+        // GSPICE has complete model expression evaluation.
+        return params.size() <= 32;
     }
 
     void buildNodeMapping() {
@@ -403,6 +678,20 @@ private:
             if (node_mapping_[term] == local) return static_cast<int>(term);
         }
         return -1;
+    }
+
+    int globalNodeForLocal(uint32_t local) const {
+        if (local == UINT32_MAX || local == 0) return -1;
+        for (uint32_t i = 0; i < node_mapping_.size() && i < nodes_.size(); ++i) {
+            if (node_mapping_[i] == local) return nodes_[static_cast<size_t>(i)];
+        }
+        return -1;
+    }
+
+    int globalNodeForDescriptorNode(uint32_t descriptorNode) const {
+        if (descriptorNode >= node_mapping_.size()) return -1;
+        const uint32_t local = node_mapping_[descriptorNode];
+        return globalNodeForLocal(local);
     }
 
     void populateJacobianPointers(std::vector<double>& jacobian) {
@@ -470,6 +759,7 @@ private:
             scratchState.empty() ? nullptr : scratchState.data(),
             CALC_REACT_RESIDUAL | ANALYSIS_TRAN
         };
+        resetBoundStepRequest();
         const uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
         if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
@@ -518,11 +808,14 @@ private:
             solve.data(),
             prev_state_.empty() ? nullptr : prev_state_.data(),
             next_state_.empty() ? nullptr : next_state_.data(),
-            CALC_RESIST_RESIDUAL | CALC_RESIST_JACOBIAN |
+            limitingEvalFlags(CALC_RESIST_RESIDUAL | CALC_RESIST_JACOBIAN |
                 CALC_REACT_RESIDUAL | CALC_REACT_JACOBIAN |
-                ANALYSIS_TRAN
+                (osdiLimitingRhsEnabled() ? (CALC_RESIST_LIM_RHS | CALC_REACT_LIM_RHS) : 0u) |
+                ANALYSIS_TRAN)
         };
+        resetBoundStepRequest();
         uint32_t ret = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        noteLimitingEval();
         if ((ret & EVAL_RET_FLAG_FATAL) != 0) {
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
         }
@@ -550,13 +843,40 @@ private:
         if (desc_.load_residual_react) {
             desc_.load_residual_react(instance_data_, model_data_, residualReact.data());
         }
+        std::vector<double> limitResist(local_node_count_, 0.0);
+        std::vector<double> limitReact(local_node_count_, 0.0);
+        if (limitingApplied(ret)) {
+            if (desc_.load_limit_rhs_resist) {
+                desc_.load_limit_rhs_resist(instance_data_, model_data_, limitResist.data());
+            }
+            if (desc_.load_limit_rhs_react) {
+                desc_.load_limit_rhs_react(instance_data_, model_data_, limitReact.data());
+            }
+        }
+        std::vector<double> spiceRhs(local_node_count_, 0.0);
+        const bool useSpiceRhs = use_spice_rhs_ && desc_.load_spice_rhs_tran;
+        if (useSpiceRhs) {
+            desc_.load_spice_rhs_tran(instance_data_, model_data_, spiceRhs.data(), solve.data(), alpha);
+        }
+
+        std::vector<double> jacTran(std::max<uint32_t>(desc_.num_jacobian_entries, 1), 0.0);
+        bool wroteTranArray = false;
+        if (
+            standardOsdiTranJacobianEnabled() &&
+            desc_.load_jacobian_tran &&
+            desc_.jacobian_ptr_resist_offset != UINT32_MAX
+        ) {
+            populateTranJacobianPointers(jacTran);
+            desc_.load_jacobian_tran(instance_data_, model_data_, alpha);
+            wroteTranArray = true;
+        }
 
         std::vector<double> jacResist(std::max<uint32_t>(desc_.num_resistive_jacobian_entries, 1), 0.0);
         bool wroteResistArray = false;
-        if (desc_.write_jacobian_array_resist) {
+        if (!wroteTranArray && desc_.write_jacobian_array_resist) {
             desc_.write_jacobian_array_resist(instance_data_, model_data_, jacResist.data());
             wroteResistArray = true;
-        } else if (desc_.load_jacobian_resist && desc_.jacobian_ptr_resist_offset != UINT32_MAX) {
+        } else if (!wroteTranArray && desc_.load_jacobian_resist && desc_.jacobian_ptr_resist_offset != UINT32_MAX) {
             populateJacobianPointers(jacResist);
             desc_.load_jacobian_resist(instance_data_, model_data_);
             wroteResistArray = true;
@@ -564,20 +884,19 @@ private:
 
         std::vector<double> jacReact(std::max<uint32_t>(desc_.num_reactive_jacobian_entries, 1), 0.0);
         bool wroteReactArray = false;
-        if (desc_.write_jacobian_array_react) {
+        if (!wroteTranArray && desc_.write_jacobian_array_react) {
             desc_.write_jacobian_array_react(instance_data_, model_data_, jacReact.data());
             for (double& value : jacReact) value *= alpha;
             wroteReactArray = true;
-        } else if (desc_.load_jacobian_react) {
+        } else if (!wroteTranArray && desc_.load_jacobian_react) {
             populateReactiveJacobianPointers(jacReact);
             desc_.load_jacobian_react(instance_data_, model_data_, alpha);
             wroteReactArray = true;
         }
 
-        for (size_t term = 0; term < nodes_.size() && term < node_mapping_.size(); ++term) {
-            const int globalRow = nodes_[term];
-            const uint32_t localRow = node_mapping_[term];
-            if (globalRow < 0 || localRow == UINT32_MAX || localRow >= residualResist.size()) continue;
+        for (uint32_t localRow = 1; localRow < local_node_count_; ++localRow) {
+            const int globalRow = globalNodeForLocal(localRow);
+            if (globalRow < 0 || localRow >= residualResist.size()) continue;
 
             double reactiveResidual = alpha * residualReact[localRow] + a1 * reactPrev[localRow];
             if (useSecond && localRow < reactPrev2.size()) {
@@ -586,20 +905,29 @@ private:
             if (useTrap) {
                 reactiveResidual -= prev_react_derivative_[localRow];
             }
-            const double residual = residualResist[localRow] + reactiveResidual;
-            double rhs = -residual;
+            const double limitingCorrection = limitResist[localRow] + alpha * limitReact[localRow];
+            const double residual = residualResist[localRow] + reactiveResidual - limitingCorrection;
+            double rhs = useSpiceRhs ? spiceRhs[localRow] : -residual;
             size_t resistIndex = 0;
             size_t reactIndex = 0;
             for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
                 const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
                 double g = 0.0;
-                if ((entry.flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0) {
+                const bool hasResistive =
+                    (entry.flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0;
+                const bool hasReactive =
+                    (entry.flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0;
+                if (wroteTranArray) {
+                    if ((hasResistive || hasReactive) && e < jacTran.size()) {
+                        g = jacTran[e];
+                    }
+                } else if (hasResistive) {
                     if (wroteResistArray && resistIndex < jacResist.size()) {
                         g += jacResist[resistIndex];
                     }
                     ++resistIndex;
                 }
-                if ((entry.flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0) {
+                if (!wroteTranArray && hasReactive) {
                     if (wroteReactArray && reactIndex < jacReact.size()) {
                         g += jacReact[reactIndex];
                     }
@@ -609,11 +937,13 @@ private:
                 const uint32_t rowLocal = node_mapping_[entry.nodes.node_2];
                 const uint32_t colLocal = node_mapping_[entry.nodes.node_1];
                 if (rowLocal != localRow) continue;
-                const int colTerm = terminalForLocal(colLocal);
+                const int colGlobal = globalNodeForLocal(colLocal);
                 const double vcol = colLocal < solve.size() ? solve[colLocal] : 0.0;
-                rhs -= g * vcol;
-                if (colTerm >= 0 && nodes_[static_cast<size_t>(colTerm)] >= 0) {
-                    J.add(globalRow, nodes_[static_cast<size_t>(colTerm)], -g);
+                if (!useSpiceRhs) {
+                    rhs -= g * vcol;
+                }
+                if (colGlobal >= 0) {
+                    J.add(globalRow, colGlobal, -g);
                 }
             }
             b.add(globalRow, rhs);
