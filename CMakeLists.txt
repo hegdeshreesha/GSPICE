@@ -10,23 +10,52 @@ include_directories(include)
 # Find and enable OpenMP
 find_package(OpenMP REQUIRED)
 
-# Optional SuiteSparse/KLU backend. GSPICE still builds without it and falls
-# back to the internal sparse engine.
-find_path(SUITESPARSE_KLU_INCLUDE_DIR
-    NAMES klu.h
-    PATH_SUFFIXES suitesparse SuiteSparse include/suitesparse include/SuiteSparse
-)
-find_library(SUITESPARSE_KLU_LIBRARY NAMES klu libklu)
-find_library(SUITESPARSE_AMD_LIBRARY NAMES amd libamd)
-find_library(SUITESPARSE_COLAMD_LIBRARY NAMES colamd libcolamd)
-find_library(SUITESPARSE_BTF_LIBRARY NAMES btf libbtf)
-find_library(SUITESPARSE_CONFIG_LIBRARY NAMES suitesparseconfig SuiteSparseConfig libsuitesparseconfig)
+# SuiteSparse/KLU backend. Development builds may use the internal sparse
+# fallback, while release presets can set GSPICE_REQUIRE_KLU=ON to prevent a
+# missing or incomplete KLU installation from being silently accepted.
+option(GSPICE_ENABLE_KLU "Enable the SuiteSparse/KLU sparse backend when available" ON)
+option(GSPICE_REQUIRE_KLU "Fail configuration unless SuiteSparse/KLU is available" OFF)
+
+if(GSPICE_REQUIRE_KLU)
+    set(GSPICE_ENABLE_KLU ON)
+endif()
 
 set(GSPICE_HAVE_SUITESPARSE_KLU OFF)
-if(SUITESPARSE_KLU_INCLUDE_DIR AND SUITESPARSE_KLU_LIBRARY AND
-   SUITESPARSE_AMD_LIBRARY AND SUITESPARSE_COLAMD_LIBRARY AND
-   SUITESPARSE_BTF_LIBRARY AND SUITESPARSE_CONFIG_LIBRARY)
-    set(GSPICE_HAVE_SUITESPARSE_KLU ON)
+set(GSPICE_KLU_LINK_TARGET "")
+
+if(GSPICE_ENABLE_KLU)
+    # SuiteSparse and vcpkg publish a transitive imported target containing
+    # KLU plus AMD, COLAMD, BTF, and SuiteSparseConfig. Prefer it over
+    # reconstructing the dependency graph by hand.
+    find_package(KLU CONFIG QUIET)
+    if(TARGET SuiteSparse::KLU)
+        set(GSPICE_HAVE_SUITESPARSE_KLU ON)
+        set(GSPICE_KLU_LINK_TARGET SuiteSparse::KLU)
+    else()
+        # Portable fallback for distributions that install only headers and
+        # libraries without a KLUConfig.cmake package.
+        find_path(SUITESPARSE_KLU_INCLUDE_DIR
+            NAMES klu.h
+            PATH_SUFFIXES suitesparse SuiteSparse include/suitesparse include/SuiteSparse
+        )
+        find_library(SUITESPARSE_KLU_LIBRARY NAMES klu libklu)
+        find_library(SUITESPARSE_AMD_LIBRARY NAMES amd libamd)
+        find_library(SUITESPARSE_COLAMD_LIBRARY NAMES colamd libcolamd)
+        find_library(SUITESPARSE_BTF_LIBRARY NAMES btf libbtf)
+        find_library(SUITESPARSE_CONFIG_LIBRARY NAMES suitesparseconfig SuiteSparseConfig libsuitesparseconfig)
+
+        if(SUITESPARSE_KLU_INCLUDE_DIR AND SUITESPARSE_KLU_LIBRARY AND
+           SUITESPARSE_AMD_LIBRARY AND SUITESPARSE_COLAMD_LIBRARY AND
+           SUITESPARSE_BTF_LIBRARY AND SUITESPARSE_CONFIG_LIBRARY)
+            set(GSPICE_HAVE_SUITESPARSE_KLU ON)
+        endif()
+    endif()
+endif()
+
+if(GSPICE_REQUIRE_KLU AND NOT GSPICE_HAVE_SUITESPARSE_KLU)
+    message(FATAL_ERROR
+        "GSPICE_REQUIRE_KLU=ON, but SuiteSparse/KLU was not found. "
+        "Configure with the vcpkg toolchain and install the suitesparse-klu manifest dependency.")
 endif()
 
 # Core source files
@@ -44,18 +73,27 @@ endif()
 
 if(GSPICE_HAVE_SUITESPARSE_KLU)
     target_compile_definitions(gspice PRIVATE GSPICE_HAVE_SUITESPARSE_KLU=1)
-    target_include_directories(gspice PRIVATE ${SUITESPARSE_KLU_INCLUDE_DIR})
-    target_link_libraries(gspice PRIVATE
-        ${SUITESPARSE_KLU_LIBRARY}
-        ${SUITESPARSE_BTF_LIBRARY}
-        ${SUITESPARSE_AMD_LIBRARY}
-        ${SUITESPARSE_COLAMD_LIBRARY}
-        ${SUITESPARSE_CONFIG_LIBRARY}
-    )
-    message(STATUS "SuiteSparse/KLU backend enabled: ${SUITESPARSE_KLU_LIBRARY}")
+    if(GSPICE_KLU_LINK_TARGET)
+        target_link_libraries(gspice PRIVATE ${GSPICE_KLU_LINK_TARGET})
+        message(STATUS "SuiteSparse/KLU backend enabled through ${GSPICE_KLU_LINK_TARGET}")
+    else()
+        target_include_directories(gspice PRIVATE ${SUITESPARSE_KLU_INCLUDE_DIR})
+        target_link_libraries(gspice PRIVATE
+            ${SUITESPARSE_KLU_LIBRARY}
+            ${SUITESPARSE_BTF_LIBRARY}
+            ${SUITESPARSE_AMD_LIBRARY}
+            ${SUITESPARSE_COLAMD_LIBRARY}
+            ${SUITESPARSE_CONFIG_LIBRARY}
+        )
+        message(STATUS "SuiteSparse/KLU backend enabled: ${SUITESPARSE_KLU_LIBRARY}")
+    endif()
 else()
     target_compile_definitions(gspice PRIVATE GSPICE_HAVE_SUITESPARSE_KLU=0)
-    message(STATUS "SuiteSparse/KLU backend not found; using internal sparse solver")
+    if(GSPICE_ENABLE_KLU)
+        message(STATUS "SuiteSparse/KLU backend not found; using internal sparse solver")
+    else()
+        message(STATUS "SuiteSparse/KLU backend disabled; using internal sparse solver")
+    endif()
 endif()
 
 target_include_directories(gspice PRIVATE include)
@@ -258,6 +296,12 @@ add_test(NAME cli_version COMMAND gspice --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "GSPICE 1\\.3\\.0-academic-beta")
 add_test(NAME cli_capabilities COMMAND gspice --capabilities)
 set_tests_properties(cli_capabilities PROPERTIES PASS_REGULAR_EXPRESSION "\"pss\": \"unsupported\"")
+if(GSPICE_HAVE_SUITESPARSE_KLU)
+    add_test(NAME cli_capabilities_klu COMMAND gspice --capabilities)
+    set_tests_properties(cli_capabilities_klu PROPERTIES
+        PASS_REGULAR_EXPRESSION "\"sparse_backend\": \"SuiteSparse-KLU\""
+    )
+endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/osdi/psp103.osdi")
     add_gspice_regex_test(smoke_osdi_model_status_loaded tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_LOADED")

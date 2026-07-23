@@ -33,13 +33,28 @@ substitute operating-point result.
 ## Build
 
 Prerequisites are CMake 3.10+, a C++17 compiler, and OpenMP. SuiteSparse/KLU is
-optional.
+optional for development builds and required by the Windows vcpkg release
+preset.
 
 ```powershell
 cmake -S . -B build
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+For a release build with SuiteSparse/KLU, set `VCPKG_ROOT` to a bootstrapped
+vcpkg checkout and use the checked-in manifest preset:
+
+```powershell
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+cmake --preset windows-vcpkg-release
+cmake --build --preset windows-vcpkg-release
+ctest --preset windows-vcpkg-release
+```
+
+The preset enables `GSPICE_REQUIRE_KLU`, so configuration fails instead of
+silently producing an internal-solver release. Verify the resulting executable
+with `gspice --capabilities`; `sparse_backend` must be `SuiteSparse-KLU`.
 
 ## Use
 

@@ -99,8 +99,9 @@ path and its numerical solve completed. It is not a signoff guarantee.
 
 ## Numerics, scale, and performance
 
-- Optional SuiteSparse/KLU discovery is build-environment dependent; builds
-  without it use an internal sparse solver with less external validation.
+- Development builds may omit SuiteSparse/KLU and use the less externally
+  validated internal sparse solver. The vcpkg release preset requires KLU and
+  fails configuration if the dependency cannot be found or linked.
 - Row scaling and one-pass iterative refinement are enabled by default. There
   is still no condition-number estimate, column equilibration, iterative/
   preconditioned solver family, distributed matrix, or MPI support.

@@ -1,6 +1,7 @@
 {
   "name": "gspice",
-  "version-string": "0.5.0",
+  "version-string": "1.3.0",
+  "builtin-baseline": "40a9bd4ccdf5dc14ff76d4ed47d46a226ce84a83",
   "dependencies": [
     "suitesparse-klu"
   ]

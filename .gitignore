@@ -1,6 +1,8 @@
 # Build directories
 build/
 build-vcpkg/
+build-*/
+vcpkg_installed/
 dist/
 bin/
 

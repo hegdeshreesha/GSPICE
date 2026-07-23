@@ -7,6 +7,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Some desktop launchers provide both Path and PATH. MSBuild treats those as
+# duplicate keys and fails before invoking cl.exe, so normalize the process
+# environment before launching the toolchain.
+$cleanPath = $env:PATH
+Remove-Item Env:PATH -ErrorAction SilentlyContinue
+$env:Path = $cleanPath
+
 function Find-CMake {
     $cmd = Get-Command cmake.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -57,10 +64,6 @@ if (!(Test-Path -LiteralPath $vcpkg)) {
     throw "vcpkg.exe was not found at $vcpkg. Clone and bootstrap vcpkg first, or set VCPKG_ROOT."
 }
 
-if (!$SkipInstall) {
-    & $vcpkg install "suitesparse-klu:$Triplet"
-}
-
 $cmake = Find-CMake
 $vcvars = Find-VcVars64
 $ninja = Find-Ninja $VcpkgRoot
@@ -68,7 +71,8 @@ $toolchain = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
 $buildPath = Join-Path $repo $BuildDir
 $deployPath = Join-Path $repo "build\Release"
 
-$configure = "call `"$vcvars`" && `"$cmake`" -S `"$repo`" -B `"$buildPath`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$toolchain`" -DVCPKG_TARGET_TRIPLET=$Triplet"
+$manifestInstall = if ($SkipInstall) { "OFF" } else { "ON" }
+$configure = "call `"$vcvars`" && `"$cmake`" -S `"$repo`" -B `"$buildPath`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$toolchain`" -DVCPKG_TARGET_TRIPLET=$Triplet -DVCPKG_MANIFEST_MODE=ON -DVCPKG_MANIFEST_INSTALL=$manifestInstall -DGSPICE_ENABLE_KLU=ON -DGSPICE_REQUIRE_KLU=ON"
 $build = "call `"$vcvars`" && `"$cmake`" --build `"$buildPath`" --config Release"
 
 & cmd.exe /c $configure
