@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -63,7 +64,312 @@ public:
         buildNodeMapping();
         prev_state_.assign(desc_.num_states, 0.0);
         next_state_.assign(desc_.num_states, 0.0);
+        prev_react_.assign(local_node_count_, 0.0);
+        prev2_react_.assign(local_node_count_, 0.0);
+        prev_react_derivative_.assign(local_node_count_, 0.0);
+        read_only_snapshot_.resize(transientStateBytes());
     }
+
+    // Allocate only the uncollapsed internal OSDI unknowns after ordinary
+    // circuit nodes are known. This is the same MNA namespace used by branch
+    // currents, so hidden compact-model unknowns do not leak into waveform
+    // output and collapsed nodes never leave unused global rows behind.
+    int bindInternalUnknowns(const std::function<int()>& allocateUnknown) {
+        if (desc_.legacy_evaluate || internal_unknowns_bound_) return 0;
+        if (nodes_.size() < desc_.num_terminals) {
+            throw std::logic_error("OSDI terminals are not bound");
+        }
+        nodes_.resize(desc_.num_nodes, -2);
+        std::vector<uint32_t> alias(desc_.num_nodes, UINT32_MAX);
+        for (uint32_t i = 0; i < desc_.num_nodes; ++i) alias[i] = i;
+        if (desc_.num_collapsible && desc_.collapsible && desc_.collapsed_offset != UINT32_MAX) {
+            const bool* collapsed = reinterpret_cast<const bool*>(
+                reinterpret_cast<const unsigned char*>(instance_data_) + desc_.collapsed_offset);
+            for (uint32_t i = 0; i < desc_.num_collapsible; ++i) {
+                if (!collapsed[i]) continue;
+                const uint32_t from = desc_.collapsible[i].node_1;
+                const uint32_t to = desc_.collapsible[i].node_2;
+                if (from < alias.size()) alias[from] = to;
+            }
+        }
+        const auto resolve = [&](uint32_t start) {
+            uint32_t current = start;
+            for (uint32_t guard = 0; guard <= desc_.num_nodes; ++guard) {
+                if (current == UINT32_MAX || current >= alias.size()) return UINT32_MAX;
+                const uint32_t next = alias[current];
+                if (next == current) return current;
+                current = next;
+            }
+            throw std::runtime_error("OSDI collapsible-node cycle detected");
+        };
+
+        std::unordered_map<uint32_t, int> rootUnknown;
+        for (uint32_t terminal = 0; terminal < desc_.num_terminals; ++terminal) {
+            const uint32_t root = resolve(terminal);
+            if (root == UINT32_MAX) continue;
+            if (nodes_[terminal] < 0) {
+                rootUnknown[root] = -1;
+            } else if (rootUnknown.find(root) == rootUnknown.end()) {
+                rootUnknown[root] = nodes_[terminal];
+            }
+        }
+        int allocated = 0;
+        for (uint32_t node = 0; node < desc_.num_nodes; ++node) {
+            const uint32_t root = resolve(node);
+            if (root == UINT32_MAX) {
+                nodes_[node] = -1;
+                continue;
+            }
+            auto found = rootUnknown.find(root);
+            if (found == rootUnknown.end()) {
+                const int unknown = allocateUnknown();
+                rootUnknown[root] = unknown;
+                nodes_[node] = unknown;
+                ++allocated;
+            } else {
+                nodes_[node] = found->second;
+            }
+        }
+        internal_unknowns_bound_ = true;
+        buildNodeMapping();
+        prev_react_.assign(local_node_count_, 0.0);
+        prev2_react_.assign(local_node_count_, 0.0);
+        prev_react_derivative_.assign(local_node_count_, 0.0);
+        read_only_snapshot_.resize(transientStateBytes());
+        invalidateDaeCache();
+        return allocated;
+    }
+
+    bool evaluateDae(
+        const VectorReal& x,
+        const DaeRequest& request,
+        DaeEvaluation& evaluation) override {
+        evaluation.clear();
+        if (desc_.legacy_evaluate || !desc_.eval || use_spice_rhs_) return false;
+
+        if (canBypassDae(x, request)) {
+            evaluation = cached_dae_evaluation_;
+            evaluation.bypassed = true;
+            return true;
+        }
+
+        struct ReadOnlyStateRestore {
+            OSDIDevice& device;
+            bool enabled = false;
+
+            ReadOnlyStateRestore(OSDIDevice& target, bool shouldRestore)
+                : device(target), enabled(shouldRestore) {
+                if (enabled && !device.read_only_snapshot_.empty()) {
+                    device.saveTransientStateBytes(
+                        device.read_only_snapshot_.data(), device.read_only_snapshot_.size());
+                }
+            }
+
+            ~ReadOnlyStateRestore() noexcept {
+                if (!enabled || device.read_only_snapshot_.empty()) return;
+                try {
+                    device.restoreTransientStateBytes(
+                        device.read_only_snapshot_.data(), device.read_only_snapshot_.size());
+                } catch (...) {
+                }
+            }
+        } readOnlyState(*this, request.readOnlyState);
+
+        uint32_t flags = 0;
+        if (request.staticResidual) flags |= CALC_RESIST_RESIDUAL;
+        if (request.dynamicResidual) flags |= CALC_REACT_RESIDUAL;
+        if (request.staticJacobian) flags |= CALC_RESIST_JACOBIAN;
+        if (request.dynamicJacobian) flags |= CALC_REACT_JACOBIAN;
+        const bool requestLimiting = request.enableLimiting && osdiLimitingRhsEnabled() &&
+            request.analysis != DaeAnalysis::SmallSignal;
+        if (requestLimiting && request.staticResidual && desc_.load_limit_rhs_resist) {
+            flags |= CALC_RESIST_LIM_RHS;
+        }
+        if (requestLimiting && request.dynamicResidual && desc_.load_limit_rhs_react) {
+            flags |= CALC_REACT_LIM_RHS;
+        }
+        switch (request.analysis) {
+        case DaeAnalysis::OperatingPoint:
+            flags |= CALC_OP | ANALYSIS_DC | ANALYSIS_STATIC;
+            break;
+        case DaeAnalysis::SmallSignal:
+            flags |= ANALYSIS_AC | ANALYSIS_STATIC;
+            break;
+        case DaeAnalysis::Transient:
+            flags |= ANALYSIS_TRAN;
+            break;
+        case DaeAnalysis::HarmonicBalance:
+            return false;
+        }
+        if (request.nodeset) flags |= ANALYSIS_NODESET;
+        if (requestLimiting) flags = limitingEvalFlags(flags);
+
+        std::vector<double> solve = localSolveFromGlobal(x);
+        std::vector<double> scratchState;
+        double* nextState = next_state_.empty() ? nullptr : next_state_.data();
+        if (request.readOnlyState && desc_.num_states != 0) {
+            scratchState.assign(desc_.num_states, 0.0);
+            nextState = scratchState.data();
+        }
+        char* nullName = nullptr;
+        char* nullStrName = nullptr;
+        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimInfo info{
+            paras,
+            request.time,
+            solve.data(),
+            prev_state_.empty() ? nullptr : prev_state_.data(),
+            nextState,
+            flags
+        };
+        resetBoundStepRequest();
+        const uint32_t result = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        if (!request.readOnlyState) noteLimitingEval();
+        if ((result & EVAL_RET_FLAG_FATAL) != 0) {
+            throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
+        }
+        evaluation.limitingApplied = requestLimiting && (result & EVAL_RET_FLAG_LIM) != 0;
+        evaluation.maximumTimeStep = transientBoundStep();
+
+        std::vector<double> staticResidual(local_node_count_, 0.0);
+        std::vector<double> dynamicResidual(local_node_count_, 0.0);
+        if (request.staticResidual && desc_.load_residual_resist) {
+            desc_.load_residual_resist(instance_data_, model_data_, staticResidual.data());
+        }
+        if (request.dynamicResidual && desc_.load_residual_react) {
+            desc_.load_residual_react(instance_data_, model_data_, dynamicResidual.data());
+        }
+        if (evaluation.limitingApplied && request.staticResidual && desc_.load_limit_rhs_resist) {
+            std::vector<double> correction(local_node_count_, 0.0);
+            desc_.load_limit_rhs_resist(instance_data_, model_data_, correction.data());
+            for (size_t i = 0; i < staticResidual.size(); ++i) staticResidual[i] -= correction[i];
+        }
+        if (evaluation.limitingApplied && request.dynamicResidual && desc_.load_limit_rhs_react) {
+            std::vector<double> correction(local_node_count_, 0.0);
+            desc_.load_limit_rhs_react(instance_data_, model_data_, correction.data());
+            for (size_t i = 0; i < dynamicResidual.size(); ++i) dynamicResidual[i] -= correction[i];
+        }
+        double staticGroundResidual = 0.0;
+        double dynamicGroundResidual = 0.0;
+        bool hasGroundTerminal = false;
+        for (uint32_t terminal = 0;
+             terminal < desc_.num_terminals && terminal < node_mapping_.size();
+             ++terminal) {
+            hasGroundTerminal = hasGroundTerminal || node_mapping_[terminal] == 0;
+        }
+        for (uint32_t local = 1; local < local_node_count_; ++local) {
+            const int equation = globalNodeForLocal(local);
+            if (equation < 0) continue;
+            if (request.staticResidual) {
+                evaluation.staticResidual.push_back({equation, staticResidual[local]});
+                staticGroundResidual -= staticResidual[local];
+            }
+            if (request.dynamicResidual) {
+                evaluation.dynamicResidual.push_back({equation, dynamicResidual[local], 0});
+                dynamicGroundResidual -= dynamicResidual[local];
+            }
+        }
+        // OSDI reserves local node zero for ground, but residual loaders do not
+        // need to materialize its discarded MNA row. Reconstruct that row for
+        // conservation/derivative audits; normal stamping ignores equation -1.
+        if (request.staticResidual && hasGroundTerminal) {
+            evaluation.staticResidual.push_back({-1, staticGroundResidual});
+        }
+        if (request.dynamicResidual && hasGroundTerminal) {
+            evaluation.dynamicResidual.push_back({-1, dynamicGroundResidual, 0});
+        }
+
+        std::vector<double> staticJacobian(
+            std::max<uint32_t>(desc_.num_resistive_jacobian_entries, 1), 0.0);
+        std::vector<double> dynamicJacobian(
+            std::max<uint32_t>(desc_.num_reactive_jacobian_entries, 1), 0.0);
+        bool haveStaticJacobian = false;
+        bool haveDynamicJacobian = false;
+        if (request.staticJacobian && desc_.write_jacobian_array_resist) {
+            desc_.write_jacobian_array_resist(instance_data_, model_data_, staticJacobian.data());
+            haveStaticJacobian = true;
+        } else if (request.staticJacobian && desc_.load_jacobian_resist &&
+                   desc_.jacobian_ptr_resist_offset != UINT32_MAX) {
+            populateJacobianPointers(staticJacobian);
+            desc_.load_jacobian_resist(instance_data_, model_data_);
+            haveStaticJacobian = true;
+        }
+        if (request.dynamicJacobian && desc_.write_jacobian_array_react) {
+            desc_.write_jacobian_array_react(instance_data_, model_data_, dynamicJacobian.data());
+            haveDynamicJacobian = true;
+        } else if (request.dynamicJacobian && desc_.load_jacobian_react) {
+            populateReactiveJacobianPointers(dynamicJacobian);
+            desc_.load_jacobian_react(instance_data_, model_data_, 1.0);
+            haveDynamicJacobian = true;
+        }
+
+        size_t staticIndex = 0;
+        size_t dynamicIndex = 0;
+        std::unordered_map<int, double> staticGroundJacobian;
+        std::unordered_map<int, double> dynamicGroundJacobian;
+        for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
+            const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
+            const bool hasStatic = (entry.flags & JACOBIAN_ENTRY_RESIST) != 0;
+            const bool hasDynamic = (entry.flags & JACOBIAN_ENTRY_REACT) != 0;
+            double staticValue = 0.0;
+            double dynamicValue = 0.0;
+            if (hasStatic) {
+                if (haveStaticJacobian && staticIndex < staticJacobian.size()) {
+                    staticValue = staticJacobian[staticIndex];
+                }
+                ++staticIndex;
+            }
+            if (hasDynamic) {
+                if (haveDynamicJacobian && dynamicIndex < dynamicJacobian.size()) {
+                    dynamicValue = dynamicJacobian[dynamicIndex];
+                }
+                ++dynamicIndex;
+            }
+            if (entry.nodes.node_2 >= node_mapping_.size() ||
+                entry.nodes.node_1 >= node_mapping_.size()) continue;
+            const uint32_t rowLocal = node_mapping_[entry.nodes.node_1];
+            const uint32_t columnLocal = node_mapping_[entry.nodes.node_2];
+            const int equation = globalNodeForLocal(rowLocal);
+            const int unknown = globalNodeForLocal(columnLocal);
+            if (rowLocal == 0 || equation < 0 || unknown < 0) continue;
+            if (request.staticJacobian && hasStatic && staticValue != 0.0) {
+                evaluation.staticJacobian.push_back({equation, unknown, staticValue});
+                staticGroundJacobian[unknown] -= staticValue;
+            }
+            if (request.dynamicJacobian && hasDynamic && dynamicValue != 0.0) {
+                evaluation.dynamicJacobian.push_back({equation, unknown, dynamicValue, 0});
+                dynamicGroundJacobian[unknown] -= dynamicValue;
+            }
+        }
+        if (request.staticJacobian && hasGroundTerminal) {
+            for (const auto& entry : staticGroundJacobian) {
+                evaluation.staticJacobian.push_back({-1, entry.first, entry.second});
+            }
+        }
+        if (request.dynamicJacobian && hasGroundTerminal) {
+            for (const auto& entry : dynamicGroundJacobian) {
+                evaluation.dynamicJacobian.push_back({-1, entry.first, entry.second, 0});
+            }
+        }
+        // Collapsed descriptor nodes may already have been allocated as hidden
+        // global unknowns while the instance topology was being elaborated.
+        // They no longer participate in the compact model. Anchor those unused
+        // hidden unknowns independently so exact node collapse cannot leave a
+        // singular global matrix or perturb the active terminal equations.
+        for (int orphan : inactive_global_nodes_) {
+            if (orphan < 0 || orphan >= x.getSize()) continue;
+            if (request.staticResidual) evaluation.staticResidual.push_back({orphan, x[orphan]});
+            if (request.staticJacobian) evaluation.staticJacobian.push_back({orphan, orphan, 1.0});
+        }
+        storeDaeCache(x, request, evaluation);
+        return true;
+    }
+
+    bool daeAuditSafe() const override {
+        return !desc_.legacy_evaluate && desc_.eval && !use_spice_rhs_;
+    }
+
+    bool prefersDampedAutoTransient() const override { return true; }
 
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (desc_.legacy_evaluate) {
@@ -152,23 +458,23 @@ public:
             size_t jacIndex = 0;
             for (uint32_t e = 0; wroteArray && e < desc_.num_jacobian_entries; ++e) {
                 const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
-                const bool isResistive = (entry.flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0;
+                const bool isResistive = (entry.flags & JACOBIAN_ENTRY_RESIST) != 0;
                 if (!isResistive) continue;
                 const double g = jacIndex < jacobian.size() ? jacobian[jacIndex] : 0.0;
                 ++jacIndex;
 
                 if (entry.nodes.node_2 >= node_mapping_.size() || entry.nodes.node_1 >= node_mapping_.size()) continue;
-                const uint32_t rowLocal = node_mapping_[entry.nodes.node_2];
-                const uint32_t colLocal = node_mapping_[entry.nodes.node_1];
+                const uint32_t rowLocal = node_mapping_[entry.nodes.node_1];
+                const uint32_t colLocal = node_mapping_[entry.nodes.node_2];
                 if (rowLocal != localRow || colLocal == UINT32_MAX) continue;
 
                 const int colGlobal = globalNodeForLocal(colLocal);
                 const double vcol = colLocal < solve.size() ? solve[colLocal] : 0.0;
                 if (!useSpiceRhs) {
-                    rhs -= g * vcol;
+                    rhs += g * vcol;
                 }
                 if (colGlobal >= 0) {
-                    J.add(globalRow, colGlobal, -g);
+                    J.add(globalRow, colGlobal, g);
                 }
             }
             b.add(globalRow, rhs);
@@ -264,22 +570,22 @@ public:
             const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
             double g = 0.0;
             double c = 0.0;
-            if ((entry.flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0) {
+            if ((entry.flags & JACOBIAN_ENTRY_RESIST) != 0) {
                 if (wroteResistArray && resistIndex < jacResist.size()) g = jacResist[resistIndex];
                 ++resistIndex;
             }
-            if ((entry.flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0) {
+            if ((entry.flags & JACOBIAN_ENTRY_REACT) != 0) {
                 if (wroteReactArray && reactIndex < jacReact.size()) c = jacReact[reactIndex];
                 ++reactIndex;
             }
             if (g == 0.0 && c == 0.0) continue;
             if (entry.nodes.node_2 >= node_mapping_.size() || entry.nodes.node_1 >= node_mapping_.size()) continue;
-            const uint32_t rowLocal = node_mapping_[entry.nodes.node_2];
-            const uint32_t colLocal = node_mapping_[entry.nodes.node_1];
+            const uint32_t rowLocal = node_mapping_[entry.nodes.node_1];
+            const uint32_t colLocal = node_mapping_[entry.nodes.node_2];
             const int row = globalNodeForLocal(rowLocal);
             const int col = globalNodeForLocal(colLocal);
             if (row < 0 || col < 0) continue;
-            J.add(row, col, {-g, -omega * c});
+            J.add(row, col, {g, omega * c});
         }
     }
 
@@ -322,6 +628,7 @@ public:
         if (!next_state_.empty()) {
             prev_state_ = next_state_;
         }
+        invalidateDaeCache();
     }
 
     void acceptTransientStep(const VectorReal& x, double currentTime, const TransientContext& ctx) override {
@@ -361,6 +668,97 @@ public:
                 prev_react_derivative_valid_ = true;
             }
         }
+        invalidateDaeCache();
+    }
+
+    void limitTransientNewton(const VectorReal& previous, VectorReal& candidate) const override {
+        if (nodes_.empty() || candidate.getSize() <= 0) return;
+        const int n = static_cast<int>(nodes_.size());
+        for (int i = 0; i < n; ++i) {
+            const int node = nodes_[i];
+            if (node < 0 || node >= candidate.getSize() || node >= previous.getSize()) continue;
+            const double v_prev = previous[node];
+            const double v_cand = candidate[node];
+            const double delta = v_cand - v_prev;
+            if (std::abs(delta) > 0.5) {
+                const double sign = (delta > 0.0) ? 1.0 : -1.0;
+                candidate[node] = v_prev + sign * (0.5 + 0.1 * std::log(1.0 + (std::abs(delta) - 0.5)));
+            }
+        }
+    }
+
+    double transientChargeError(
+        const VectorReal& coarse,
+        const VectorReal& fine,
+        double reltol,
+        double chgtol) override {
+        if (!desc_.load_residual_react || local_node_count_ <= 1) return 0.0;
+        std::vector<double> q_coarse(local_node_count_, 0.0);
+        std::vector<double> q_fine(local_node_count_, 0.0);
+        if (!const_cast<OSDIDevice*>(this)->loadReactiveResidualAt(coarse, 0.0, q_coarse) ||
+            !const_cast<OSDIDevice*>(this)->loadReactiveResidualAt(fine, 0.0, q_fine)) {
+            return 0.0;
+        }
+        double max_err = 0.0;
+        for (std::size_t i = 1; i < local_node_count_; ++i) {
+            const double dq = std::abs(q_fine[i] - q_coarse[i]);
+            const double tol = reltol * std::abs(q_fine[i]) + chgtol;
+            if (tol > 0.0) {
+                max_err = std::max(max_err, dq / tol);
+            }
+        }
+        return max_err;
+    }
+
+    std::size_t transientStateBytes() const override {
+        return model_storage_.size() * sizeof(std::max_align_t) +
+            instance_storage_.size() * sizeof(std::max_align_t) +
+            (prev_state_.size() + next_state_.size() + prev_react_.size() +
+             prev2_react_.size() + prev_react_derivative_.size()) * sizeof(double) +
+            2 * sizeof(std::uint8_t);
+    }
+
+    void saveTransientStateBytes(std::byte* destination, std::size_t size) const override {
+        if (size != transientStateBytes()) throw std::invalid_argument("OSDI transient state size");
+        std::size_t offset = 0;
+        const auto write = [&](const void* source, std::size_t bytes) {
+            if (bytes != 0) std::memcpy(destination + offset, source, bytes);
+            offset += bytes;
+        };
+        write(model_storage_.data(), model_storage_.size() * sizeof(std::max_align_t));
+        write(instance_storage_.data(), instance_storage_.size() * sizeof(std::max_align_t));
+        write(prev_state_.data(), prev_state_.size() * sizeof(double));
+        write(next_state_.data(), next_state_.size() * sizeof(double));
+        write(prev_react_.data(), prev_react_.size() * sizeof(double));
+        write(prev2_react_.data(), prev2_react_.size() * sizeof(double));
+        write(prev_react_derivative_.data(), prev_react_derivative_.size() * sizeof(double));
+        const std::uint8_t derivativeValid = prev_react_derivative_valid_ ? 1u : 0u;
+        const std::uint8_t limitingInitialized = limiting_initialized_ ? 1u : 0u;
+        write(&derivativeValid, sizeof(derivativeValid));
+        write(&limitingInitialized, sizeof(limitingInitialized));
+    }
+
+    void restoreTransientStateBytes(const std::byte* source, std::size_t size) override {
+        if (size != transientStateBytes()) throw std::invalid_argument("OSDI transient state size");
+        std::size_t offset = 0;
+        const auto read = [&](void* destination, std::size_t bytes) {
+            if (bytes != 0) std::memcpy(destination, source + offset, bytes);
+            offset += bytes;
+        };
+        read(model_storage_.data(), model_storage_.size() * sizeof(std::max_align_t));
+        read(instance_storage_.data(), instance_storage_.size() * sizeof(std::max_align_t));
+        read(prev_state_.data(), prev_state_.size() * sizeof(double));
+        read(next_state_.data(), next_state_.size() * sizeof(double));
+        read(prev_react_.data(), prev_react_.size() * sizeof(double));
+        read(prev2_react_.data(), prev2_react_.size() * sizeof(double));
+        read(prev_react_derivative_.data(), prev_react_derivative_.size() * sizeof(double));
+        std::uint8_t derivativeValid = 0;
+        std::uint8_t limitingInitialized = 0;
+        read(&derivativeValid, sizeof(derivativeValid));
+        read(&limitingInitialized, sizeof(limitingInitialized));
+        prev_react_derivative_valid_ = derivativeValid != 0;
+        limiting_initialized_ = limitingInitialized != 0;
+        invalidateDaeCache();
     }
 
     const OsdiDescriptorMetadata& metadata() const {
@@ -419,6 +817,7 @@ private:
     void* model_data_ = nullptr;
     void* instance_data_ = nullptr;
     std::vector<uint32_t> node_mapping_;
+    std::vector<int> inactive_global_nodes_;
     size_t local_node_count_ = 0;
     std::vector<std::unique_ptr<char[]>> string_params_;
     std::vector<double> prev_state_;
@@ -426,6 +825,7 @@ private:
     std::vector<double> prev_react_;
     std::vector<double> prev2_react_;
     std::vector<double> prev_react_derivative_;
+    std::vector<std::byte> read_only_snapshot_;
     bool prev_react_derivative_valid_ = false;
     bool bind_full_model_params_ = false;
     bool use_limiting_rhs_ = false;
@@ -433,7 +833,12 @@ private:
     bool bind_full_model_params_override_ = false;
     bool use_spice_rhs_ = false;
     bool limiting_initialized_ = false;
+    bool internal_unknowns_bound_ = false;
     double temperature_k_ = 300.15;
+    bool dae_cache_valid_ = false;
+    DaeRequest cached_dae_request_{};
+    DaeEvaluation cached_dae_evaluation_{};
+    std::vector<double> cached_dae_inputs_;
 
     static size_t wordsFor(uint32_t bytes) {
         if (bytes == 0) return 0;
@@ -586,19 +991,29 @@ private:
             if (!raw) continue;
             const uint32_t ty = param.flags & PARA_TY_MASK;
             try {
+                std::string normalizedValue = found->second;
+                normalizedValue.erase(
+                    std::remove_if(normalizedValue.begin(), normalizedValue.end(), [](char c) {
+                        return c == '\'' || c == '"' || c == '{' || c == '}';
+                    }),
+                    normalizedValue.end());
                 if (ty == PARA_TY_REAL) {
-                    *reinterpret_cast<double*>(raw) = Utils::parseValue(found->second);
+                    *reinterpret_cast<double*>(raw) = Utils::parseValue(normalizedValue);
                 } else if (ty == PARA_TY_INT) {
-                    *reinterpret_cast<int32_t*>(raw) = static_cast<int32_t>(Utils::parseValue(found->second));
+                    *reinterpret_cast<int32_t*>(raw) = static_cast<int32_t>(Utils::parseValue(normalizedValue));
                 } else if (ty == PARA_TY_STR) {
                     auto text = std::make_unique<char[]>(found->second.size() + 1);
                     std::memcpy(text.get(), found->second.c_str(), found->second.size() + 1);
                     *reinterpret_cast<char**>(raw) = text.get();
                     string_params_.push_back(std::move(text));
                 }
-            } catch (const std::exception&) {
-                // PDK cards often contain expressions or unresolved .param symbols.
-                // Leave those at the OpenVAF model default until GSPICE has a full expression evaluator.
+            } catch (const std::exception& ex) {
+                const char* parameterName =
+                    param.name && param.name[0] ? param.name[0] : "<unnamed>";
+                throw std::runtime_error(
+                    "OSDI parameter '" + std::string(parameterName) +
+                    "' has an unresolved or invalid value '" + found->second +
+                    "': " + ex.what());
             }
         }
     }
@@ -624,16 +1039,16 @@ private:
     }
 
     bool shouldBindFullModelParams(const ParamMap& params) const {
-        if (fullOsdiModelParamBindingEnabled()) return true;
-        // Large foundry model cards contain many .param-backed expressions.
-        // Partially binding only the numeric subset can create inconsistent
-        // compact-model state. Keep those cards on OpenVAF defaults until
-        // GSPICE has complete model expression evaluation.
-        return params.size() <= 32;
+        (void)params;
+        // Binding is an explicit all-or-selector policy. With full binding
+        // enabled every recognized value must parse or construction fails;
+        // disabling it binds only topology selectors such as `type`.
+        return fullOsdiModelParamBindingEnabled();
     }
 
     void buildNodeMapping() {
         node_mapping_.assign(desc_.num_nodes, UINT32_MAX);
+        inactive_global_nodes_.clear();
         uint32_t nextLocal = 1; // OSDI convention reserves node 0 for ground.
         for (uint32_t i = 0; i < desc_.num_nodes; ++i) {
             if (i < nodes_.size() && nodes_[i] < 0) {
@@ -671,6 +1086,80 @@ private:
                 osdiNodeMap[i] = node_mapping_[i];
             }
         }
+
+        for (uint32_t i = desc_.num_terminals; i < node_mapping_.size() && i < nodes_.size(); ++i) {
+            if (nodes_[i] < 0) continue;
+            if (globalNodeForLocal(node_mapping_[i]) != nodes_[i]) {
+                inactive_global_nodes_.push_back(nodes_[i]);
+            }
+        }
+    }
+
+    std::vector<double> daeBypassInputs(const VectorReal& x) const {
+        std::vector<double> inputs;
+        if (desc_.inputs && desc_.num_inputs != 0) {
+            inputs.reserve(desc_.num_inputs);
+            for (uint32_t i = 0; i < desc_.num_inputs; ++i) {
+                const int first = globalNodeForDescriptorNode(desc_.inputs[i].node_1);
+                const int second = globalNodeForDescriptorNode(desc_.inputs[i].node_2);
+                const double firstValue = first >= 0 && first < x.getSize() ? x[first] : 0.0;
+                const double secondValue = second >= 0 && second < x.getSize() ? x[second] : 0.0;
+                inputs.push_back(firstValue - secondValue);
+            }
+            return inputs;
+        }
+        inputs.reserve(node_mapping_.size());
+        for (uint32_t descriptorNode = 0; descriptorNode < node_mapping_.size(); ++descriptorNode) {
+            const int global = globalNodeForDescriptorNode(descriptorNode);
+            inputs.push_back(global >= 0 && global < x.getSize() ? x[global] : 0.0);
+        }
+        return inputs;
+    }
+
+    static bool sameDaeRequest(const DaeRequest& lhs, const DaeRequest& rhs) {
+        return lhs.analysis == rhs.analysis && lhs.time == rhs.time &&
+            lhs.staticResidual == rhs.staticResidual && lhs.dynamicResidual == rhs.dynamicResidual &&
+            lhs.staticJacobian == rhs.staticJacobian && lhs.dynamicJacobian == rhs.dynamicJacobian &&
+            lhs.enableLimiting == rhs.enableLimiting && lhs.nodeset == rhs.nodeset &&
+            lhs.evaluationEpoch == rhs.evaluationEpoch;
+    }
+
+    bool canBypassDae(const VectorReal& x, const DaeRequest& request) const {
+        if (!request.allowBypass || request.highPrecision || request.readOnlyState ||
+            !dae_cache_valid_ || cached_dae_evaluation_.limitingApplied ||
+            !sameDaeRequest(request, cached_dae_request_)) {
+            return false;
+        }
+        const auto inputs = daeBypassInputs(x);
+        if (inputs.size() != cached_dae_inputs_.size()) return false;
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const double scale = std::max(std::abs(inputs[i]), std::abs(cached_dae_inputs_[i]));
+            const double tolerance = request.bypassAbsoluteTolerance +
+                request.bypassRelativeTolerance * scale;
+            if (std::abs(inputs[i] - cached_dae_inputs_[i]) > tolerance) return false;
+        }
+        return true;
+    }
+
+    void storeDaeCache(
+        const VectorReal& x,
+        const DaeRequest& request,
+        const DaeEvaluation& evaluation) {
+        if (!request.allowBypass || request.highPrecision || request.readOnlyState ||
+            evaluation.limitingApplied) {
+            return;
+        }
+        cached_dae_request_ = request;
+        cached_dae_evaluation_ = evaluation;
+        cached_dae_evaluation_.bypassed = false;
+        cached_dae_inputs_ = daeBypassInputs(x);
+        dae_cache_valid_ = true;
+    }
+
+    void invalidateDaeCache() {
+        dae_cache_valid_ = false;
+        cached_dae_inputs_.clear();
+        cached_dae_evaluation_.clear();
     }
 
     int terminalForLocal(uint32_t local) const {
@@ -698,7 +1187,7 @@ private:
         auto** ptrs = reinterpret_cast<double**>(reinterpret_cast<unsigned char*>(instance_data_) + desc_.jacobian_ptr_resist_offset);
         size_t jacIndex = 0;
         for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
-            const bool isResistive = (desc_.jacobian_entries[e].flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0;
+            const bool isResistive = (desc_.jacobian_entries[e].flags & JACOBIAN_ENTRY_RESIST) != 0;
             ptrs[e] = isResistive && jacIndex < jacobian.size() ? &jacobian[jacIndex++] : nullptr;
         }
     }
@@ -720,7 +1209,7 @@ private:
         size_t jacIndex = 0;
         for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
             const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
-            const bool isReactive = (entry.flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0;
+            const bool isReactive = (entry.flags & JACOBIAN_ENTRY_REACT) != 0;
             if (!isReactive) continue;
             if (entry.react_ptr_off != UINT32_MAX) {
                 auto** reactPtr = reinterpret_cast<double**>(
@@ -913,10 +1402,8 @@ private:
             for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
                 const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
                 double g = 0.0;
-                const bool hasResistive =
-                    (entry.flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0;
-                const bool hasReactive =
-                    (entry.flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0;
+                const bool hasResistive = (entry.flags & JACOBIAN_ENTRY_RESIST) != 0;
+                const bool hasReactive = (entry.flags & JACOBIAN_ENTRY_REACT) != 0;
                 if (wroteTranArray) {
                     if ((hasResistive || hasReactive) && e < jacTran.size()) {
                         g = jacTran[e];
@@ -934,16 +1421,16 @@ private:
                     ++reactIndex;
                 }
                 if (entry.nodes.node_2 >= node_mapping_.size() || entry.nodes.node_1 >= node_mapping_.size()) continue;
-                const uint32_t rowLocal = node_mapping_[entry.nodes.node_2];
-                const uint32_t colLocal = node_mapping_[entry.nodes.node_1];
+                const uint32_t rowLocal = node_mapping_[entry.nodes.node_1];
+                const uint32_t colLocal = node_mapping_[entry.nodes.node_2];
                 if (rowLocal != localRow) continue;
                 const int colGlobal = globalNodeForLocal(colLocal);
                 const double vcol = colLocal < solve.size() ? solve[colLocal] : 0.0;
                 if (!useSpiceRhs) {
-                    rhs -= g * vcol;
+                    rhs += g * vcol;
                 }
                 if (colGlobal >= 0) {
-                    J.add(globalRow, colGlobal, -g);
+                    J.add(globalRow, colGlobal, g);
                 }
             }
             b.add(globalRow, rhs);

@@ -1,0 +1,7 @@
+GSPICE transient reference: one millisecond RC step
+.OPTIONS ACCURACY=HIGH ADAPTIVE=1 METHOD=AUTO LTE_RELTOL=3e-4 TRABSTOL=100n TRTOL=1 CHGTOL=1e-15 MAXORD=2
+V1 in 0 DC 0 PULSE(0 1 1m 1u 1u 10m 20m)
+R1 in out 1k
+C1 out 0 1u
+.TRAN 10u 5m 0 20u
+.END

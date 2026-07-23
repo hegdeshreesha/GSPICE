@@ -3,6 +3,8 @@
 
 #include "device.hpp"
 #include <string>
+#include <cstring>
+#include <cstdint>
 
 namespace gspice {
 
@@ -11,24 +13,59 @@ public:
     Inductor(const std::string& name, int nodePos, int nodeNeg, double value, int branchIndex = -1)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), value_(value), branchIndex_(branchIndex) {}
 
+    bool evaluateDae(
+        const VectorReal& x,
+        const DaeRequest& request,
+        DaeEvaluation& evaluation) override {
+        evaluation.clear();
+        if (branchIndex_ < 0) return true;
+        const double current = branchCurrent(x);
+        const double voltage = nodeVoltage(x, nodePos_) - nodeVoltage(x, nodeNeg_);
+        if (request.staticResidual) {
+            evaluation.staticResidual.push_back({nodePos_, current});
+            evaluation.staticResidual.push_back({nodeNeg_, -current});
+            evaluation.staticResidual.push_back({branchIndex_, voltage});
+        }
+        if (request.staticJacobian) {
+            evaluation.staticJacobian.push_back({nodePos_, branchIndex_, 1.0});
+            evaluation.staticJacobian.push_back({nodeNeg_, branchIndex_, -1.0});
+            evaluation.staticJacobian.push_back({branchIndex_, nodePos_, 1.0});
+            evaluation.staticJacobian.push_back({branchIndex_, nodeNeg_, -1.0});
+        }
+        // The branch equation is Vp - Vn - d(L*I)/dt = 0, therefore its
+        // conserved DAE quantity is -flux = -L*I.
+        if (request.dynamicResidual) {
+            evaluation.dynamicResidual.push_back({branchIndex_, -value_ * current});
+        }
+        if (request.dynamicJacobian) {
+            evaluation.dynamicJacobian.push_back({branchIndex_, branchIndex_, -value_});
+        }
+        return true;
+    }
+
+    bool daeAuditSafe() const override { return true; }
+
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (branchIndex_ < 0) return;
         if (timeStep <= 0) {
-            J.add(nodePos_, branchIndex_, 1.0);
-            J.add(nodeNeg_, branchIndex_, -1.0);
-            J.add(branchIndex_, nodePos_, 1.0);
-            J.add(branchIndex_, nodeNeg_, -1.0);
+            DaeRequest request;
+            DaeEvaluation evaluation;
+            evaluateDae(x, request, evaluation);
+            stampDaeStatic(evaluation, x, J, b);
             return;
         }
-        double Req = value_ / timeStep;
-        const VectorReal& x_prev = x_hist.back();
-        double Ibr_prev = x_prev[branchIndex_];
-        J.add(nodePos_, branchIndex_, 1.0);
-        J.add(nodeNeg_, branchIndex_, -1.0);
-        J.add(branchIndex_, nodePos_, 1.0);
-        J.add(branchIndex_, nodeNeg_, -1.0);
-        J.add(branchIndex_, branchIndex_, -Req);
-        b.add(branchIndex_, -Req * Ibr_prev);
+        if (x_hist.empty()) return;
+        DaeRequest request;
+        request.analysis = DaeAnalysis::Transient;
+        request.dynamicResidual = true;
+        request.dynamicJacobian = true;
+        DaeEvaluation current;
+        DaeEvaluation previous;
+        evaluateDae(x, request, current);
+        evaluateDae(x_hist.back(), request, previous);
+        DaeHistory history;
+        appendScaledDaeResidual(history, previous.dynamicResidual, -1.0 / timeStep);
+        stampDaeTransient(current, x, 1.0 / timeStep, history, J, b);
     }
 
     void tranStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, const TransientContext& ctx) override {
@@ -51,20 +88,26 @@ public:
             useSecond = false;
         }
 
-        const double iPrev = branchCurrent((*ctx.xHistory)[ctx.xHistory->size() - 1]);
-        const double iPrev2 = useSecond ? branchCurrent((*ctx.xHistory)[ctx.xHistory->size() - 2]) : iPrev;
-        const double Req = value_ * a0;
-        double rhs = value_ * (a1 * iPrev + (useSecond ? a2 * iPrev2 : 0.0));
-        if (useTrap) {
-            rhs -= prevVoltage_;
+        DaeRequest request;
+        request.analysis = DaeAnalysis::Transient;
+        request.time = ctx.currentTime;
+        request.dynamicResidual = true;
+        request.dynamicJacobian = true;
+        DaeEvaluation current;
+        DaeEvaluation previous;
+        DaeEvaluation previous2;
+        evaluateDae(x, request, current);
+        evaluateDae((*ctx.xHistory)[ctx.xHistory->size() - 1], request, previous);
+        DaeHistory history;
+        appendScaledDaeResidual(history, previous.dynamicResidual, a1);
+        if (useSecond) {
+            evaluateDae((*ctx.xHistory)[ctx.xHistory->size() - 2], request, previous2);
+            appendScaledDaeResidual(history, previous2.dynamicResidual, a2);
         }
-
-        J.add(nodePos_, branchIndex_, 1.0);
-        J.add(nodeNeg_, branchIndex_, -1.0);
-        J.add(branchIndex_, nodePos_, 1.0);
-        J.add(branchIndex_, nodeNeg_, -1.0);
-        J.add(branchIndex_, branchIndex_, -Req);
-        b.add(branchIndex_, rhs);
+        if (useTrap) {
+            history.push_back({branchIndex_, prevVoltage_});
+        }
+        stampDaeTransient(current, x, a0, history, J, b);
     }
 
     void acceptTransientStep(const VectorReal& x, double currentTime, const TransientContext& ctx) override {
@@ -74,14 +117,36 @@ public:
         prevVoltageValid_ = true;
     }
 
+    std::size_t transientStateBytes() const override {
+        return sizeof(prevVoltage_) + sizeof(std::uint8_t);
+    }
+
+    void saveTransientStateBytes(std::byte* destination, std::size_t size) const override {
+        if (size != transientStateBytes()) throw std::invalid_argument("inductor transient state size");
+        std::memcpy(destination, &prevVoltage_, sizeof(prevVoltage_));
+        const std::uint8_t valid = prevVoltageValid_ ? 1u : 0u;
+        std::memcpy(destination + sizeof(prevVoltage_), &valid, sizeof(valid));
+    }
+
+    void restoreTransientStateBytes(const std::byte* source, std::size_t size) override {
+        if (size != transientStateBytes()) throw std::invalid_argument("inductor transient state size");
+        std::memcpy(&prevVoltage_, source, sizeof(prevVoltage_));
+        std::uint8_t valid = 0;
+        std::memcpy(&valid, source + sizeof(prevVoltage_), sizeof(valid));
+        prevVoltageValid_ = valid != 0;
+    }
+
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
         if (branchIndex_ < 0) return;
-        std::complex<double> Z = {0.0, omega * value_};
-        J.add(nodePos_, branchIndex_, {1.0, 0.0});
-        J.add(nodeNeg_, branchIndex_, {-1.0, 0.0});
-        J.add(branchIndex_, nodePos_, {1.0, 0.0});
-        J.add(branchIndex_, nodeNeg_, {-1.0, 0.0});
-        J.add(branchIndex_, branchIndex_, -Z);
+        (void)b;
+        DaeRequest request;
+        request.analysis = DaeAnalysis::SmallSignal;
+        request.staticResidual = false;
+        request.dynamicResidual = false;
+        request.dynamicJacobian = true;
+        DaeEvaluation evaluation;
+        evaluateDae(x_dc, request, evaluation);
+        stampDaeSmallSignal(evaluation, omega, J);
     }
 
     void setBranchIndex(int index) { branchIndex_ = index; }

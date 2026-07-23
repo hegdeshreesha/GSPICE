@@ -15,20 +15,49 @@ public:
     int getNodePos() const { return nodePos_; }
     int getNodeNeg() const { return nodeNeg_; }
 
+    bool evaluateDae(
+        const VectorReal& x,
+        const DaeRequest& request,
+        DaeEvaluation& evaluation) override {
+        evaluation.clear();
+        const double conductance = getConductance();
+        const double voltage =
+            (nodePos_ >= 0 ? x[nodePos_] : 0.0) -
+            (nodeNeg_ >= 0 ? x[nodeNeg_] : 0.0);
+        if (request.staticResidual) {
+            const double current = conductance * voltage;
+            evaluation.staticResidual.push_back({nodePos_, current});
+            evaluation.staticResidual.push_back({nodeNeg_, -current});
+        }
+        if (request.staticJacobian) {
+            evaluation.staticJacobian.push_back({nodePos_, nodePos_, conductance});
+            evaluation.staticJacobian.push_back({nodePos_, nodeNeg_, -conductance});
+            evaluation.staticJacobian.push_back({nodeNeg_, nodePos_, -conductance});
+            evaluation.staticJacobian.push_back({nodeNeg_, nodeNeg_, conductance});
+        }
+        return true;
+    }
+
+    bool daeAuditSafe() const override { return true; }
+
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
-        double G = getConductance();
-        J.add(nodePos_, nodePos_, G);
-        J.add(nodeNeg_, nodeNeg_, G);
-        J.add(nodePos_, nodeNeg_, -G);
-        J.add(nodeNeg_, nodePos_, -G);
+        (void)timeStep;
+        (void)currentTime;
+        (void)x_hist;
+        DaeEvaluation evaluation;
+        DaeRequest request;
+        evaluateDae(x, request, evaluation);
+        stampDaeStatic(evaluation, x, J, b);
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        double G = getConductance();
-        J.add(nodePos_, nodePos_, {G, 0.0});
-        J.add(nodeNeg_, nodeNeg_, {G, 0.0});
-        J.add(nodePos_, nodeNeg_, {-G, 0.0});
-        J.add(nodeNeg_, nodePos_, {-G, 0.0});
+        (void)b;
+        DaeEvaluation evaluation;
+        DaeRequest request;
+        request.analysis = DaeAnalysis::SmallSignal;
+        request.staticResidual = false;
+        evaluateDae(x_dc, request, evaluation);
+        stampDaeSmallSignal(evaluation, omega, J);
     }
 
     double getNoisePSD(double omega, const VectorReal& x_dc) override {

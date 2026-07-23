@@ -217,10 +217,10 @@ private:
         if (!desc.jacobian_entries) return;
         for (uint32_t i = 0; i < desc.num_jacobian_entries; ++i) {
             const uint32_t flags = desc.jacobian_entries[i].flags;
-            if ((flags & (JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST)) != 0) {
+            if ((flags & JACOBIAN_ENTRY_RESIST) != 0) {
                 nonzero_resistive_jacobian_entries.push_back(i);
             }
-            if ((flags & (JACOBIAN_ENTRY_REACT | JACOBIAN_ENTRY_REACT_CONST)) != 0) {
+            if ((flags & JACOBIAN_ENTRY_REACT) != 0) {
                 nonzero_reactive_jacobian_entries.push_back(i);
             }
         }

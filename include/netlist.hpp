@@ -70,10 +70,17 @@ struct SimulationSettings {
     double t_max_step = 0.0;
     double t_min_step = 0.0;
     bool tran_adaptive = true;
-    bool tran_predictor = false;
+    bool tran_predictor = true;
     std::string tran_method = "AUTO";
+    std::string tran_lte_mode = "PREDICTOR";
+    int tran_lte_audit_interval = 16;
+    bool tran_order_adaptive = true;
+    bool tran_trap_ringing = true;
     double tran_lte_reltol = 5e-3;
     double tran_lte_abstol = 1e-6;
+    double tran_trtol = 1.0;
+    double chgtol = 1e-14;
+    int tran_max_order = 2;
     double f_start = 0.0;
     double f_stop = 0.0;
     int points_per_dec = 0;
@@ -92,8 +99,12 @@ struct SimulationSettings {
     int mc_runs = 0;
     unsigned int mc_seed = 1;
     std::string mc_source;
+    std::string mc_distribution = "GAUSSIAN";
     double mc_mean = 0.0;
     double mc_sigma = 0.0;
+    double mc_lower = 0.0;
+    double mc_upper = 0.0;
+    bool mc_latin_hypercube = false;
     std::vector<CornerSpec> corners;
     std::vector<OutputSpec> output_specs;
 
@@ -117,15 +128,26 @@ struct SimulationSettings {
     std::string solver_backend = "AUTO";
     std::string solver_ordering = "AUTO";
     bool solver_singletons = true;
+    bool solver_row_scaling = true;
+    int solver_refinement_steps = 1;
     bool source_stepping = true;
     bool gmin_stepping = true;
     bool line_search = true;
     bool nr_residual_check = true;
+    bool nr_bypass = true;
+    double nr_bypass_tolerance = 0.1;
+    int nodeset_iterations = 2;
+    double nodeset_conductance = 1e6;
+    bool dae_audit = false;
+    double dae_audit_tolerance = 2e-4;
     bool osdi_limiting_rhs = false;
     bool osdi_tran_jacobian = false;
-    bool osdi_bind_full_model_params = false;
+    bool osdi_bind_full_model_params = true;
     bool osdi_internal_nodes = false;
     bool osdi_spice_rhs = false;
+    bool fastspice = false;
+    bool multirate = false;
+    bool parallel_solve = false;
 
     // PSS / HB Parameters
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)
@@ -138,6 +160,7 @@ struct SimulationSettings {
     // Measurements
     std::vector<MeasureSpec> measures;
     std::vector<InitialConditionSpec> initial_conditions;
+    std::vector<InitialConditionSpec> nodesets;
     bool save_all = true;
     std::vector<SaveSpec> saves;
 

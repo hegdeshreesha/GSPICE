@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use GSPICE in academic work, please cite the software release."
+title: "GSPICE: Lumen's Experimental Native Circuit Simulator Core"
+type: software
+version: "1.3.0-academic-beta"
+date-released: 2026-07-20
+license: Apache-2.0
+repository-code: "https://github.com/hegdeshreesha/GSPICE"
+url: "https://github.com/hegdeshreesha/GSPICE"
+authors:
+  - family-names: Hegde
+    given-names: Shreesha
+keywords:
+  - circuit simulation
+  - SPICE
+  - electronic design automation
+  - academic software

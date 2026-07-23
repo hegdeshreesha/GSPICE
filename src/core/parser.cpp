@@ -1261,6 +1261,7 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_max_iter = std::max(settings.tran_max_iter, 160);
             settings.gmin = std::max(settings.gmin, 1e-12);
             settings.tran_lte_reltol = std::min(settings.tran_lte_reltol, 1e-3);
+            settings.osdi_limiting_rhs = true;
         } else if (policy == "FAST") {
             settings.source_stepping = false;
             settings.gmin_stepping = false;
@@ -1281,12 +1282,32 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "GMIN" && hasNumeric && numeric >= 0.0) settings.gmin = numeric;
     else if (key == "ACCURACY" && !value.empty()) applyPreset(value);
     else if ((key == "NUMERICAL" || key == "CONVERGENCE" || key == "POLICY") && !value.empty()) applyNumericalPolicy(value);
-    else if ((key == "TRTOL" || key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
+    else if (key == "TRTOL" && hasNumeric && numeric > 0.0) settings.tran_trtol = numeric;
+    else if ((key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
     else if ((key == "TRABSTOL" || key == "TRAN_ABSTOL" || key == "LTE_ABSTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_abstol = numeric;
+    else if (key == "CHGTOL" && hasNumeric && numeric > 0.0) settings.chgtol = numeric;
+    else if ((key == "MAXORD" || key == "MAXORDER") && hasNumeric) settings.tran_max_order = std::clamp(static_cast<int>(numeric), 1, 5);
     else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP") && hasNumeric && numeric > 0.0) settings.t_max_step = numeric;
     else if ((key == "MINSTEP" || key == "TMIN" || key == "TRAN_MINSTEP") && hasNumeric && numeric > 0.0) settings.t_min_step = numeric;
     else if (key == "ADAPTIVE" || key == "TRAN_ADAPTIVE") settings.tran_adaptive = value.empty() ? true : truthy(value);
     else if (key == "TRAN_PREDICTOR" || key == "PREDICTOR") settings.tran_predictor = value.empty() ? true : truthy(value);
+    else if (key == "TRAN_ORDER_ADAPTIVE" || key == "ORDER_ADAPTIVE" || key == "ADAPTIVE_ORDER") {
+        settings.tran_order_adaptive = value.empty() ? true : truthy(value);
+    }
+    else if (key == "TRAP_RINGING" || key == "TRAP_RINGING_CONTROL" || key == "TRAN_TRAP_RINGING") {
+        settings.tran_trap_ringing = value.empty() ? true : truthy(value);
+    }
+    else if (key == "LTE_MODE" || key == "TRAN_LTE_MODE") {
+        const std::string mode = toUpperCopy(value);
+        if (mode == "PREDICTOR" || mode == "PC" || mode == "PREDICTORCORRECTOR") {
+            settings.tran_lte_mode = "PREDICTOR";
+        } else if (mode == "STEPDOUBLING" || mode == "DOUBLING" || mode == "ORACLE") {
+            settings.tran_lte_mode = "STEPDOUBLING";
+        }
+    }
+    else if ((key == "LTE_AUDIT_INTERVAL" || key == "TRAN_LTE_AUDIT_INTERVAL") && hasNumeric) {
+        settings.tran_lte_audit_interval = std::clamp(static_cast<int>(numeric), 0, 1000000);
+    }
     else if ((key == "SOLVER" || key == "LINEAR_SOLVER" || key == "SPARSE_SOLVER") && !value.empty()) {
         settings.solver_backend = toUpperCopy(value);
     }
@@ -1295,6 +1316,13 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if (key == "SINGLETONS" || key == "SINGLETON_FILTER" || key == "SINGLETON_FILTERING") {
         settings.solver_singletons = value.empty() ? true : truthy(value);
+    }
+    else if (key == "SCALING" || key == "ROWSCALING" || key == "MATRIX_SCALING") {
+        settings.solver_row_scaling = value.empty() ? true : truthy(value);
+    }
+    else if (key == "REFINEMENT" || key == "ITERATIVE_REFINEMENT") {
+        if (hasNumeric) settings.solver_refinement_steps = std::clamp(static_cast<int>(numeric), 0, 3);
+        else settings.solver_refinement_steps = value.empty() || truthy(value) ? 1 : 0;
     }
     else if (key == "SOURCESTEPPING" || key == "SRCSTEP" || key == "SOURCE_STEPPING") {
         settings.source_stepping = value.empty() ? true : truthy(value);
@@ -1307,6 +1335,24 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if (key == "NR_RESIDUALCHECK" || key == "RESIDUALCHECK" || key == "RESIDUAL_CHECK") {
         settings.nr_residual_check = value.empty() ? true : truthy(value);
+    }
+    else if (key == "NR_BYPASS" || key == "BYPASS" || key == "DEVICE_BYPASS") {
+        settings.nr_bypass = value.empty() ? true : truthy(value);
+    }
+    else if ((key == "NR_BYPASS_TOL" || key == "BYPASS_TOL") && hasNumeric && numeric > 0.0) {
+        settings.nr_bypass_tolerance = std::clamp(numeric, 1e-6, 1.0);
+    }
+    else if ((key == "NODESET_ITERS" || key == "NODESET_ITERATIONS") && hasNumeric && numeric >= 0.0) {
+        settings.nodeset_iterations = std::clamp(static_cast<int>(numeric), 0, 20);
+    }
+    else if ((key == "NODESET_G" || key == "NODESET_CONDUCTANCE") && hasNumeric && numeric > 0.0) {
+        settings.nodeset_conductance = numeric;
+    }
+    else if (key == "DAE_AUDIT" || key == "CHARGE_AUDIT" || key == "QJAC_AUDIT") {
+        settings.dae_audit = value.empty() ? true : truthy(value);
+    }
+    else if ((key == "DAE_AUDIT_TOL" || key == "CHARGE_AUDIT_TOL") && hasNumeric && numeric > 0.0) {
+        settings.dae_audit_tolerance = numeric;
     }
     else if (key == "OSDI_LIMITING_RHS" || key == "OSDILIMITINGRHS" || key == "OSDI_LIM_RHS" || key == "OSDI_LIMITING") {
         settings.osdi_limiting_rhs = value.empty() ? true : truthy(value);
@@ -1323,12 +1369,23 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "OSDI_SPICE_RHS" || key == "OSDISPICERHS" || key == "OSDI_NATIVE_RHS") {
         settings.osdi_spice_rhs = value.empty() ? true : truthy(value);
     }
+    else if (key == "FASTSPICE" || key == "FAST_SPICE" || key == "EVENT_DRIVEN") {
+        settings.fastspice = value.empty() ? true : truthy(value);
+    }
+    else if (key == "MULTIRATE" || key == "MULTI_RATE" || key == "MULTI_TIMESTEP") {
+        settings.multirate = value.empty() ? true : truthy(value);
+    }
+    else if (key == "PARALLEL_SOLVE" || key == "PARALLEL_BTF" || key == "PARALLEL_SOLVER") {
+        settings.parallel_solve = value.empty() ? true : truthy(value);
+    }
     else if ((key == "METHOD" || key == "TRAN_METHOD") && !value.empty()) {
         std::string method = toUpperCopy(value);
         method.erase(std::remove(method.begin(), method.end(), '_'), method.end());
         method.erase(std::remove(method.begin(), method.end(), '-'), method.end());
         if (method == "AUTO" || method == "BE" || method == "BACKWARDEULER" ||
-            method == "TRAP" || method == "TRAPEZOIDAL" || method == "GEAR2") {
+            method == "TRAP" || method == "TRAPEZOIDAL" || method == "GEAR2" ||
+            method == "GEAR" || method == "BDF" || method == "ADAMS" ||
+            method == "ADAMSMOULTON" || method == "AM") {
             settings.tran_method = method;
         }
     }
@@ -1624,9 +1681,17 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 netlist.setSettings(settings);
             } else if (cmd == ".NODESET") {
-                netlist.addWarning(
-                    "Line " + std::to_string(lineNo) +
-                    ": .NODESET is accepted for compatibility but not yet used by the nonlinear solver.");
+                SimulationSettings settings = netlist.getSettings();
+                for (size_t i = 1; i < tokens.size(); ++i) {
+                    std::string node;
+                    double value = 0.0;
+                    if (!parseInitialConditionToken(tokens[i], node, value)) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NODESET token ignored: " + tokens[i]);
+                        continue;
+                    }
+                    settings.nodesets.push_back({netlist.getOrCreateNode(node), value});
+                }
+                netlist.setSettings(settings);
             } else if (cmd == ".GLOBAL") {
                 netlist.addWarning(
                     "Line " + std::to_string(lineNo) +
@@ -1731,17 +1796,39 @@ Netlist Parser::parse(const std::string& filePath) {
                 if (extractParenPayload(spec, "GAUSS", payload) || extractParenPayload(spec, "NORMAL", payload)) {
                     auto nums = parseParenNumberList(payload);
                     if (nums.size() >= 2) {
+                        settings.mc_distribution = "GAUSSIAN";
                         settings.mc_mean = nums[0];
                         settings.mc_sigma = nums[1];
+                    } else {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": Gaussian .MC requires mean and sigma: " + line);
+                    }
+                } else if (extractParenPayload(spec, "UNIFORM", payload) ||
+                           extractParenPayload(spec, "UNIF", payload)) {
+                    auto nums = parseParenNumberList(payload);
+                    if (nums.size() >= 2) {
+                        settings.mc_distribution = "UNIFORM";
+                        settings.mc_lower = nums[0];
+                        settings.mc_upper = nums[1];
+                        if (settings.mc_upper < settings.mc_lower) {
+                            std::swap(settings.mc_lower, settings.mc_upper);
+                        }
+                    } else {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": uniform .MC requires lower and upper bounds: " + line);
                     }
                 } else {
+                    settings.mc_distribution = "GAUSSIAN";
                     settings.mc_mean = Utils::parseValue(tokens[3]);
                     settings.mc_sigma = tokens.size() > 4 ? Utils::parseValue(tokens[4]) : 0.0;
                 }
                 for (size_t i = 4; i < tokens.size(); ++i) {
                     auto [key, value] = splitParameterToken(tokens[i]);
-                    if (toUpperCopy(key) == "SEED") {
+                    const std::string option = toUpperCopy(key);
+                    if (option == "SEED") {
                         settings.mc_seed = static_cast<unsigned int>(std::stoul(value));
+                    } else if (option == "LHS" || option == "LATINHYPERCUBE") {
+                        const std::string upperValue = toUpperCopy(value);
+                        settings.mc_latin_hypercube = value.empty() ||
+                            !(upperValue == "0" || upperValue == "NO" || upperValue == "FALSE" || upperValue == "OFF");
                     }
                 }
                 netlist.setSettings(settings);
@@ -1892,6 +1979,7 @@ Netlist Parser::parse(const std::string& filePath) {
                 for (const auto& [key, value] : model.params) {
                     modelContext[key] = value;
                 }
+                resolveParameterMapExpressions(modelContext);
                 for (auto& [key, value] : model.params) {
                     double evaluated = 0.0;
                     if (tryEvaluateParamExpression(value, modelContext, evaluated)) {
@@ -2321,15 +2409,6 @@ Netlist Parser::parse(const std::string& filePath) {
             }
             try {
                 const auto& settings = netlist.getSettings();
-                if (settings.osdi_internal_nodes) {
-                    for (uint32_t nodeIndex = static_cast<uint32_t>(nodes.size()); nodeIndex < desc->num_nodes; ++nodeIndex) {
-                    std::string nodeName = "n_" + tokens[0] + "_osdi_" + std::to_string(nodeIndex);
-                    if (desc->nodes && desc->nodes[nodeIndex].name) {
-                        nodeName += "_" + sanitizeIdentifier(desc->nodes[nodeIndex].name);
-                    }
-                    nodes.push_back(netlist.getOrCreateNode(nodeName));
-                    }
-                }
                 auto instanceParams = parseParameterTokens(tokens, 6);
                 netlist.addDevice(std::make_unique<OSDIDevice>(
                     tokens[0], *desc, nodes, model->params, instanceParams,
@@ -2345,8 +2424,7 @@ Netlist Parser::parse(const std::string& filePath) {
                     " type=" + model->type +
                     " descriptor=" + std::string(descName ? descName : "<unnamed>") +
                     " osdi_nodes=" + std::to_string(desc->num_nodes) +
-                    " internal_unknowns=" + std::to_string(nodes.size() > 4 ? nodes.size() - 4 : 0) +
-                    " internal_mode=" + std::string(settings.osdi_internal_nodes ? "expanded" : "local"));
+                    " internal_mode=" + std::string(settings.osdi_internal_nodes ? "bound-hidden" : "collapsed-only"));
             } catch (const std::exception& ex) {
                 netlist.addError(
                     "Line " + std::to_string(lineNo) +
@@ -2494,6 +2572,9 @@ Netlist Parser::parse(const std::string& filePath) {
             double br = 1.0;
             double nf = 1.0;
             double nr = 1.0;
+            double cje = 0.0;
+            double cjc = 0.0;
+            double tf = 0.0;
             if (modelCard) {
                 const std::string modelType = toUpperCopy(modelCard->type);
                 if (modelType == "PNP") type = -1;
@@ -2509,6 +2590,9 @@ Netlist Parser::parse(const std::string& filePath) {
                 br = paramValue(modelCard->params, {"BR", "BETA_R"}, br);
                 nf = paramValue(modelCard->params, {"NF"}, nf);
                 nr = paramValue(modelCard->params, {"NR"}, nr);
+                cje = paramValue(modelCard->params, {"CJE", "CBE"}, cje);
+                cjc = paramValue(modelCard->params, {"CJC", "CBC"}, cjc);
+                tf = paramValue(modelCard->params, {"TF"}, tf);
             } else {
                 netlist.addWarning(
                     "Line " + std::to_string(lineNo) +
@@ -2521,7 +2605,8 @@ Netlist Parser::parse(const std::string& filePath) {
             }
             auto instanceParams = parseParameterTokens(tokens, modelIdx + 1);
             area = paramValue(instanceParams, {"AREA", "M"}, area);
-            netlist.addDevice(std::make_unique<Bjt>(tokens[0], nC, nB, nE, type, is, bf, br, nf, nr, area));
+            netlist.addDevice(std::make_unique<Bjt>(
+                tokens[0], nC, nB, nE, type, is, bf, br, nf, nr, area, cje, cjc, tf));
         } else if (firstChar == 'D') {
             // Diode: Dname N1 N2 [model] [area]
             if (tokens.size() < 3) {

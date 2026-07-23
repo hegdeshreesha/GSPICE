@@ -1,8 +1,12 @@
 # GSPICE Beta Testing Guide
 
-Date: 2026-07-16
+Date: 2026-07-20
 
 GSPICE is Lumen's native experimental SPICE-like simulator. This beta focuses on correctness, diagnostics, reproducibility, and comparison against Ngspice/Xyce. It is not yet a signoff replacement for Spectre, Ngspice, Xyce, or VACASK.
+
+The 1.3 academic beta also adds CSV output, Gaussian/uniform source Monte Carlo
+with optional Latin-hypercube sampling, and `--capabilities`. Unimplemented
+periodic analyses now fail explicitly instead of returning substitute results.
 
 ## Beta Goal
 
@@ -81,6 +85,8 @@ Some controls are still experimental and should be validated against Ngspice/Xyc
 - Internal-node expansion is experimental.
 - Full foundry `.PARAM` expression binding is incomplete.
 - RF/PSS/HB/STB and exact pole-zero extraction are not production grade.
+- PSS, PAC, PNoise, SP execution, and periodic derivative analyses are
+  explicitly unsupported in 1.3; HB and STB remain experimental.
 - Primitive MOS is only a debug/simple-device model, not a production compact model.
 
 ## Better Than VACASK Direction
@@ -92,4 +98,3 @@ GSPICE aims to combine VACASK-inspired Verilog-A/OSDI rigor with:
 - reproducible run manifests through Lumen,
 - model-fidelity reporting per active instance,
 - and a growing regression suite for every advertised capability.
-

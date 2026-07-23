@@ -3,15 +3,21 @@
 
 #include "matrix.hpp"
 #include "sparse_matrix.hpp"
+#include "dae.hpp"
 #include <string>
 #include <vector>
+#include <memory>
+#include <cstddef>
+#include <stdexcept>
 
 namespace gspice {
 
 enum class TransientIntegrationMethod {
     BackwardEuler,
     Trapezoidal,
-    Gear2
+    Gear2,
+    Bdf,
+    AdamsMoulton
 };
 
 struct TransientContext {
@@ -22,6 +28,9 @@ struct TransientContext {
     double a1 = 0.0;
     double a2 = 0.0;
     bool hasSecondHistory = false;
+    int integrationOrder = 1;
+    std::vector<double> qWeights;
+    std::vector<double> derivativeWeights;
     const std::vector<VectorReal>* xHistory = nullptr;
     const std::vector<double>* timeHistory = nullptr;
 };
@@ -39,6 +48,29 @@ public:
     virtual ~Device() = default;
 
     std::string getName() const { return name_; }
+
+    /**
+     * Device-neutral DAE evaluation. New and migrated devices expose their
+     * instantaneous residual F, stored quantity Q, and the corresponding
+     * Jacobians here. Legacy analysis-specific stamps remain available during
+     * the staged migration.
+     */
+    virtual bool evaluateDae(
+        const VectorReal& x,
+        const DaeRequest& request,
+        DaeEvaluation& evaluation) {
+        (void)x;
+        (void)request;
+        evaluation.clear();
+        return false;
+    }
+
+    virtual bool daeAuditSafe() const { return false; }
+
+    // Compact models with stiff or noisy charge dynamics can request the
+    // numerically damped AUTO branch. Smooth native devices use trapezoidal
+    // integration after backward-Euler startup.
+    virtual bool prefersDampedAutoTransient() const { return false; }
 
     /**
      * Stamping for DC and Transient analysis (Real numbers).
@@ -82,6 +114,19 @@ public:
         acceptTransientStep(x, currentTime);
     }
 
+    // Fixed-size serialization for the simulator-owned transactional state
+    // arena. Adaptive candidates are copied and rolled back without per-step
+    // heap allocation or polymorphic snapshot objects.
+    virtual std::size_t transientStateBytes() const { return 0; }
+    virtual void saveTransientStateBytes(std::byte* destination, std::size_t size) const {
+        (void)destination;
+        if (size != 0) throw std::invalid_argument("unexpected transient state storage");
+    }
+    virtual void restoreTransientStateBytes(const std::byte* source, std::size_t size) {
+        (void)source;
+        if (size != 0) throw std::invalid_argument("unexpected transient state storage");
+    }
+
     /**
      * Time points where independent source waveforms or device behavior change
      * abruptly. Transient analysis uses these breakpoints to land on edges
@@ -98,6 +143,34 @@ public:
      */
     virtual double transientBoundStep() const {
         return 0.0;
+    }
+
+    // Normalized difference in stored charge between two candidate endpoint
+    // solutions. This supplements voltage/current LTE checks for dynamic
+    // devices. A value above one requests timestep rejection.
+    virtual double transientChargeError(
+        const VectorReal& coarse,
+        const VectorReal& fine,
+        double reltol,
+        double chgtol) {
+        (void)coarse;
+        (void)fine;
+        (void)reltol;
+        (void)chgtol;
+        return 0.0;
+    }
+
+    /**
+     * Limit a proposed transient Newton update using device physics.  The
+     * default is intentionally a no-op; exponential junction devices override
+     * this to prevent an otherwise harmless first Newton step from driving an
+     * exponential far outside its useful linearization region.
+     */
+    virtual void limitTransientNewton(
+        const VectorReal& previous,
+        VectorReal& candidate) const {
+        (void)previous;
+        (void)candidate;
     }
 
     /**

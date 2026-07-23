@@ -1,26 +1,55 @@
-name: Build GSPICE
+name: Build and test GSPICE
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+    tags: ["v*"]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows x64
+          - os: ubuntu-24.04
+            name: Ubuntu x86-64
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-    - name: Build
-      run: cmake --build build --config Release
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: gspice-win64
-        path: build/Release/gspice.exe
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify capability contract
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            build/Release/gspice.exe --capabilities
+          else
+            build/gspice --capabilities
+          fi
+
+      - name: Upload tested executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: gspice-1.3.0-academic-beta-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            build/Release/gspice.exe
+            build/gspice
+          if-no-files-found: error

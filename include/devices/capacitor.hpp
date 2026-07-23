@@ -3,6 +3,8 @@
 
 #include "device.hpp"
 #include <string>
+#include <cstring>
+#include <cstdint>
 
 namespace gspice {
 
@@ -11,19 +13,44 @@ public:
     Capacitor(const std::string& name, int nodePos, int nodeNeg, double value)
         : Device(name), nodePos_(nodePos), nodeNeg_(nodeNeg), value_(value) {}
 
+    bool evaluateDae(
+        const VectorReal& x,
+        const DaeRequest& request,
+        DaeEvaluation& evaluation) override {
+        evaluation.clear();
+        if (request.dynamicResidual) {
+            const double charge = value_ * voltage(x);
+            evaluation.dynamicResidual.push_back({nodePos_, charge, 0});
+            evaluation.dynamicResidual.push_back({nodeNeg_, -charge, 0});
+        }
+        if (request.dynamicJacobian) {
+            evaluation.dynamicJacobian.push_back({nodePos_, nodePos_, value_, 0});
+            evaluation.dynamicJacobian.push_back({nodePos_, nodeNeg_, -value_, 0});
+            evaluation.dynamicJacobian.push_back({nodeNeg_, nodePos_, -value_, 0});
+            evaluation.dynamicJacobian.push_back({nodeNeg_, nodeNeg_, value_, 0});
+        }
+        return true;
+    }
+
+    bool daeAuditSafe() const override { return true; }
+
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
-        if (timeStep <= 0) return; 
-        double Geq = value_ / timeStep;
+        (void)currentTime;
+        if (timeStep <= 0) return;
         if (x_hist.empty()) return;
-        const VectorReal& x_prev = x_hist.back();
-        double Vd_prev = ((nodePos_ >= 0) ? x_prev[nodePos_] : 0.0) - ((nodeNeg_ >= 0) ? x_prev[nodeNeg_] : 0.0);
-        double Ieq = Geq * Vd_prev;
-        J.add(nodePos_, nodePos_, Geq);
-        J.add(nodeNeg_, nodeNeg_, Geq);
-        J.add(nodePos_, nodeNeg_, -Geq);
-        J.add(nodeNeg_, nodePos_, -Geq);
-        b.add(nodePos_, Ieq);
-        b.add(nodeNeg_, -Ieq);
+        DaeRequest request;
+        request.analysis = DaeAnalysis::Transient;
+        request.staticResidual = false;
+        request.staticJacobian = false;
+        request.dynamicResidual = true;
+        request.dynamicJacobian = true;
+        DaeEvaluation current;
+        DaeEvaluation previous;
+        evaluateDae(x, request, current);
+        evaluateDae(x_hist.back(), request, previous);
+        DaeHistory history;
+        appendScaledDaeResidual(history, previous.dynamicResidual, -1.0 / timeStep);
+        stampDaeTransient(current, x, 1.0 / timeStep, history, J, b);
     }
 
     void tranStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, const TransientContext& ctx) override {
@@ -42,20 +69,29 @@ public:
             useSecond = false;
         }
 
-        const double vPrev = voltage((*ctx.xHistory)[ctx.xHistory->size() - 1]);
-        const double vPrev2 = useSecond ? voltage((*ctx.xHistory)[ctx.xHistory->size() - 2]) : vPrev;
-        const double Geq = value_ * a0;
-        double Ieq = -value_ * (a1 * vPrev + (useSecond ? a2 * vPrev2 : 0.0));
-        if (useTrap) {
-            Ieq += prevCurrent_;
+        DaeRequest request;
+        request.analysis = DaeAnalysis::Transient;
+        request.time = ctx.currentTime;
+        request.staticResidual = false;
+        request.staticJacobian = false;
+        request.dynamicResidual = true;
+        request.dynamicJacobian = true;
+        DaeEvaluation current;
+        DaeEvaluation previous;
+        DaeEvaluation previous2;
+        evaluateDae(x, request, current);
+        evaluateDae((*ctx.xHistory)[ctx.xHistory->size() - 1], request, previous);
+        DaeHistory history;
+        appendScaledDaeResidual(history, previous.dynamicResidual, a1);
+        if (useSecond) {
+            evaluateDae((*ctx.xHistory)[ctx.xHistory->size() - 2], request, previous2);
+            appendScaledDaeResidual(history, previous2.dynamicResidual, a2);
         }
-
-        J.add(nodePos_, nodePos_, Geq);
-        J.add(nodeNeg_, nodeNeg_, Geq);
-        J.add(nodePos_, nodeNeg_, -Geq);
-        J.add(nodeNeg_, nodePos_, -Geq);
-        b.add(nodePos_, Ieq);
-        b.add(nodeNeg_, -Ieq);
+        if (useTrap) {
+            history.push_back({nodePos_, -prevCurrent_});
+            history.push_back({nodeNeg_, prevCurrent_});
+        }
+        stampDaeTransient(current, x, a0, history, J, b);
     }
 
     void acceptTransientStep(const VectorReal& x, double currentTime, const TransientContext& ctx) override {
@@ -85,12 +121,47 @@ public:
         prevCurrentValid_ = true;
     }
 
+    std::size_t transientStateBytes() const override {
+        return sizeof(prevCurrent_) + sizeof(std::uint8_t);
+    }
+
+    void saveTransientStateBytes(std::byte* destination, std::size_t size) const override {
+        if (size != transientStateBytes()) throw std::invalid_argument("capacitor transient state size");
+        std::memcpy(destination, &prevCurrent_, sizeof(prevCurrent_));
+        const std::uint8_t valid = prevCurrentValid_ ? 1u : 0u;
+        std::memcpy(destination + sizeof(prevCurrent_), &valid, sizeof(valid));
+    }
+
+    void restoreTransientStateBytes(const std::byte* source, std::size_t size) override {
+        if (size != transientStateBytes()) throw std::invalid_argument("capacitor transient state size");
+        std::memcpy(&prevCurrent_, source, sizeof(prevCurrent_));
+        std::uint8_t valid = 0;
+        std::memcpy(&valid, source + sizeof(prevCurrent_), sizeof(valid));
+        prevCurrentValid_ = valid != 0;
+    }
+
+    double transientChargeError(
+        const VectorReal& coarse,
+        const VectorReal& fine,
+        double reltol,
+        double chgtol) override {
+        const double qCoarse = value_ * voltage(coarse);
+        const double qFine = value_ * voltage(fine);
+        const double tol = chgtol + reltol * std::max(std::abs(qCoarse), std::abs(qFine));
+        return std::abs(qFine - qCoarse) / std::max(tol, 1e-30);
+    }
+
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        std::complex<double> Y = {0.0, omega * value_};
-        J.add(nodePos_, nodePos_, Y);
-        J.add(nodeNeg_, nodeNeg_, Y);
-        J.add(nodePos_, nodeNeg_, -Y);
-        J.add(nodeNeg_, nodePos_, -Y);
+        (void)b;
+        DaeRequest request;
+        request.analysis = DaeAnalysis::SmallSignal;
+        request.staticResidual = false;
+        request.staticJacobian = false;
+        request.dynamicResidual = false;
+        request.dynamicJacobian = true;
+        DaeEvaluation evaluation;
+        evaluateDae(x_dc, request, evaluation);
+        stampDaeSmallSignal(evaluation, omega, J);
     }
 
     void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) override {

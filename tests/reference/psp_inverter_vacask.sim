@@ -1,0 +1,23 @@
+VACASK PSP103.4 inverter transient reference
+
+ground 0
+load "psp103v4.osdi"
+load "capacitor.osdi"
+
+model nch psp103va type=1
+model pch psp103va type=-1
+model vsource vsource
+model capacitor capacitor
+
+vdd (vdd 0) vsource dc=2
+vin (in 0) vsource type="pulse" val0=0 val1=2 delay=100p rise=20p fall=20p width=200p period=500p
+mp (out in vdd vdd) pch w=1u l=0.13u nf=1 mult=1
+mn (out in 0 0) nch w=1u l=0.13u nf=1 mult=1
+cload (out 0) capacitor c=20f
+
+control
+  abort always
+  options rawfile="ascii" strictsave=0 reltol=1e-3 vntol=300n abstol=1e-13
+  options tran_method="gear" tran_lteratio=1
+  analysis psp_ref tran stop=1n step=2p maxstep=5p icmode="op"
+endc

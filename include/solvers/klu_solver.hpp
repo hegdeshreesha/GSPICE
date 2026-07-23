@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <complex>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include <vector>
 #include <omp.h>
 #include "sparse_matrix.hpp"
+#include "parallel_sparse_solver.hpp"
 
 #if defined(GSPICE_HAVE_SUITESPARSE_KLU) && GSPICE_HAVE_SUITESPARSE_KLU
 #include <klu.h>
@@ -31,17 +33,27 @@ struct LinearSolveContext {
     std::string backend = "AUTO";
     std::string ordering = "AUTO";
     bool use_singletons = true;
+    bool scale_rows = true;
+    bool scale_cols = true;  // Pillar 1: column equilibration (new)
 #if defined(GSPICE_HAVE_SUITESPARSE_KLU) && GSPICE_HAVE_SUITESPARSE_KLU
     klu_symbolic* external_symbolic = nullptr;
-    std::size_t external_symbolic_hash = 0;
-    int external_symbolic_size = 0;
+    std::size_t   external_symbolic_hash = 0;
+    int           external_symbolic_size = 0;
+    // Pillar 1: persist the numeric factorisation across Newton iterations.
+    // When the sparsity pattern is unchanged, klu_refactor() reuses the
+    // existing symbolic and only updates the numeric values — 3-5x faster
+    // than a full klu_factor() call.
+    klu_numeric*  external_numeric       = nullptr;
+    std::size_t   external_numeric_hash  = 0; // pattern hash at last factor
 #endif
 
     ~LinearSolveContext() {
+        freeExternalNumeric();
         freeExternalSymbolic();
     }
 
     void clear() {
+        freeExternalNumeric();
         freeExternalSymbolic();
         size = 0;
         pattern_hash = 0;
@@ -51,6 +63,8 @@ struct LinearSolveContext {
         backend = "AUTO";
         ordering = "AUTO";
         use_singletons = true;
+        scale_rows = true;
+        scale_cols = true;
     }
 
     void freeExternalSymbolic() {
@@ -62,6 +76,25 @@ struct LinearSolveContext {
             external_symbolic = nullptr;
             external_symbolic_hash = 0;
             external_symbolic_size = 0;
+        }
+#endif
+    }
+
+    void freeExternalNumeric() {
+#if defined(GSPICE_HAVE_SUITESPARSE_KLU) && GSPICE_HAVE_SUITESPARSE_KLU
+        if (external_numeric && external_symbolic) {
+            klu_common common;
+            klu_defaults(&common);
+            if constexpr (std::is_same_v<T, double>) {
+                klu_free_numeric(&external_numeric, &common);
+            } else {
+                klu_z_free_numeric(&external_numeric, &common);
+            }
+            external_numeric = nullptr;
+            external_numeric_hash = 0;
+        } else {
+            external_numeric = nullptr;
+            external_numeric_hash = 0;
         }
 #endif
     }
@@ -81,6 +114,7 @@ struct LinearSolverStats {
     long long external_klu_calls = 0;
     long long external_klu_symbolic_reuse = 0;
     long long external_klu_symbolic_rebuilds = 0;
+    long long external_klu_refactor_hits = 0;   // Pillar 1: klu_refactor() calls
     long long external_klu_failures = 0;
     double structure_seconds = 0.0;
     double numeric_fill_seconds = 0.0;
@@ -122,6 +156,11 @@ public:
             }
         }
 
+        if (context && backendName(context) == "PARALLELBTF") {
+            ParallelBtfSolver<T> pbtf;
+            return pbtf.solve(matrix, b);
+        }
+
         auto structure_start = std::chrono::steady_clock::now();
         const std::size_t signature = patternHash(entries, n);
         std::vector<Row> rows = instantiateRows(entries, n, signature, context);
@@ -133,6 +172,17 @@ public:
 
         auto factor_start = std::chrono::steady_clock::now();
         std::vector<T> rhs = rhs_values;
+        if (!context || context->scale_rows) {
+            for (int row = 0; row < n; ++row) {
+                double scale = 0.0;
+                for (const auto& entry : rows[static_cast<size_t>(row)]) {
+                    scale = std::max(scale, static_cast<double>(std::abs(entry.value)));
+                }
+                if (!(scale > 0.0) || !std::isfinite(scale)) continue;
+                for (auto& entry : rows[static_cast<size_t>(row)]) entry.value /= scale;
+                rhs[static_cast<size_t>(row)] /= scale;
+            }
+        }
         const bool use_singletons = !context || context->use_singletons;
         Vector<T> solution = solveRows(rows, rhs, use_singletons);
         auto factor_end = std::chrono::steady_clock::now();
@@ -233,6 +283,7 @@ private:
 #if defined(GSPICE_HAVE_SUITESPARSE_KLU) && GSPICE_HAVE_SUITESPARSE_KLU
     static void configureKluCommon(klu_common& common, const Context* context) {
         klu_defaults(&common);
+        common.scale = (!context || context->scale_rows) ? 2 : 0;
         const std::string ordering = normalizeOption(context ? context->ordering : "AUTO");
         if (ordering == "AMD") {
             common.ordering = 0;
@@ -297,8 +348,37 @@ private:
 
         std::vector<int> Ap;
         std::vector<int> Ai;
-        std::vector<T> Ax;
+        std::vector<T>   Ax;
         buildCcs(entries, n, Ap, Ai, Ax);
+
+        // ----------------------------------------------------------------
+        // Pillar 1: Column equilibration.
+        // Normalise each column of J by its maximum absolute value before
+        // factorisation. This improves the condition number for circuits
+        // that mix voltage equations (~1V) with current equations (~1mA),
+        // which would otherwise differ by three orders of magnitude.
+        // We undo the scaling on the solution after the back-solve.
+        // ----------------------------------------------------------------
+        const bool do_col_scale = context && context->scale_cols;
+        std::vector<double> col_scale;
+        if (do_col_scale) {
+            col_scale.assign(static_cast<std::size_t>(n), 1.0);
+            for (int j = 0; j < n; ++j) {
+                double col_max = 0.0;
+                for (int k = Ap[static_cast<std::size_t>(j)];
+                         k < Ap[static_cast<std::size_t>(j) + 1]; ++k) {
+                    col_max = std::max(col_max,
+                        static_cast<double>(std::abs(Ax[static_cast<std::size_t>(k)])));
+                }
+                if (col_max > 0.0 && std::isfinite(col_max)) {
+                    col_scale[static_cast<std::size_t>(j)] = col_max;
+                    for (int k = Ap[static_cast<std::size_t>(j)];
+                             k < Ap[static_cast<std::size_t>(j) + 1]; ++k) {
+                        Ax[static_cast<std::size_t>(k)] /= static_cast<T>(col_max);
+                    }
+                }
+            }
+        }
 
         klu_common common;
         configureKluCommon(common, context);
@@ -309,41 +389,127 @@ private:
         bool ok = false;
         if constexpr (std::is_same_v<T, double>) {
             std::vector<double> rhs = rhs_values;
-            klu_numeric* numeric = klu_factor(Ap.data(), Ai.data(), Ax.data(), symbolic, &common);
+
+            // ----------------------------------------------------------------
+            // Pillar 1: klu_refactor() fast path.
+            // If the symbolic pattern is unchanged AND we have a cached
+            // numeric factorisation from the previous iteration, reuse it
+            // via klu_refactor() (numeric-only update, 3-5x faster than
+            // klu_factor()).
+            // ----------------------------------------------------------------
+            klu_numeric* numeric = nullptr;
+            bool used_refactor = false;
+            if (context &&
+                context->external_numeric &&
+                context->external_numeric_hash == signature) {
+                // Fast path: refactor in place.
+                if (klu_refactor(Ap.data(), Ai.data(), Ax.data(),
+                                 symbolic, context->external_numeric, &common)) {
+                    numeric = context->external_numeric;
+                    used_refactor = true;
+                    ++stats().external_klu_refactor_hits;
+                } else {
+                    // Refactor failed (e.g. numerical singularity) — fall
+                    // through to full factor and free the stale numeric.
+                    context->freeExternalNumeric();
+                }
+            }
+
+            if (!numeric) {
+                // Slow path (first call, pattern change, or refactor failure).
+                numeric = klu_factor(Ap.data(), Ai.data(), Ax.data(),
+                                     symbolic, &common);
+                // Cache for next iteration.
+                if (numeric && context) {
+                    context->freeExternalNumeric();
+                    context->external_numeric      = numeric;
+                    context->external_numeric_hash = signature;
+                }
+            }
+
             if (numeric && klu_solve(symbolic, numeric, n, 1, rhs.data(), &common)) {
+                // Undo column scaling on the solution vector.
+                if (do_col_scale) {
+                    for (int i = 0; i < n; ++i) {
+                        rhs[static_cast<std::size_t>(i)] /=
+                            col_scale[static_cast<std::size_t>(i)];
+                    }
+                }
                 solution = Vector<T>(n);
-                for (int i = 0; i < n; ++i) solution[i] = rhs[static_cast<size_t>(i)];
+                for (int i = 0; i < n; ++i) {
+                    solution[i] = rhs[static_cast<std::size_t>(i)];
+                }
                 ok = true;
             }
-            if (numeric) {
+
+            // Free numeric only if we did NOT cache it in context.
+            if (!used_refactor && numeric && (!context || numeric != context->external_numeric)) {
                 klu_free_numeric(&numeric, &common);
             }
         } else if constexpr (std::is_same_v<T, std::complex<double>>) {
             std::vector<double> complexAx(entries.size() * 2, 0.0);
             for (size_t i = 0; i < Ax.size(); ++i) {
-                complexAx[2 * i] = Ax[i].real();
+                complexAx[2 * i]     = Ax[i].real();
                 complexAx[2 * i + 1] = Ax[i].imag();
             }
-            std::vector<double> rhs(static_cast<size_t>(n) * 2, 0.0);
+            std::vector<double> rhs(static_cast<std::size_t>(n) * 2, 0.0);
             for (int i = 0; i < n; ++i) {
-                rhs[2 * static_cast<size_t>(i)] = rhs_values[static_cast<size_t>(i)].real();
-                rhs[2 * static_cast<size_t>(i) + 1] = rhs_values[static_cast<size_t>(i)].imag();
+                rhs[2 * static_cast<std::size_t>(i)]     = rhs_values[static_cast<std::size_t>(i)].real();
+                rhs[2 * static_cast<std::size_t>(i) + 1] = rhs_values[static_cast<std::size_t>(i)].imag();
             }
-            klu_numeric* numeric = klu_z_factor(Ap.data(), Ai.data(), complexAx.data(), symbolic, &common);
+
+            // Complex path: refactor reuse.
+            klu_numeric* numeric = nullptr;
+            bool used_refactor = false;
+            if (context &&
+                context->external_numeric &&
+                context->external_numeric_hash == signature) {
+                if (klu_z_refactor(Ap.data(), Ai.data(), complexAx.data(),
+                                   symbolic, context->external_numeric, &common)) {
+                    numeric = context->external_numeric;
+                    used_refactor = true;
+                    ++stats().external_klu_refactor_hits;
+                } else {
+                    context->freeExternalNumeric();
+                }
+            }
+            if (!numeric) {
+                numeric = klu_z_factor(Ap.data(), Ai.data(), complexAx.data(),
+                                       symbolic, &common);
+                if (numeric && context) {
+                    context->freeExternalNumeric();
+                    context->external_numeric      = numeric;
+                    context->external_numeric_hash = signature;
+                }
+            }
+
             if (numeric && klu_z_solve(symbolic, numeric, n, 1, rhs.data(), &common)) {
+                // Undo column scaling.
+                if (do_col_scale) {
+                    for (int i = 0; i < n; ++i) {
+                        rhs[2 * static_cast<std::size_t>(i)]     /=
+                            col_scale[static_cast<std::size_t>(i)];
+                        rhs[2 * static_cast<std::size_t>(i) + 1] /=
+                            col_scale[static_cast<std::size_t>(i)];
+                    }
+                }
                 solution = Vector<T>(n);
                 for (int i = 0; i < n; ++i) {
-                    solution[i] = T(rhs[2 * static_cast<size_t>(i)], rhs[2 * static_cast<size_t>(i) + 1]);
+                    solution[i] = T(rhs[2 * static_cast<std::size_t>(i)],
+                                   rhs[2 * static_cast<std::size_t>(i) + 1]);
                 }
                 ok = true;
             }
-            if (numeric) {
+            if (!used_refactor && numeric &&
+                (!context || numeric != context->external_numeric)) {
                 klu_z_free_numeric(&numeric, &common);
             }
         }
 
         if (!ok) {
             ++stats().external_klu_failures;
+            // Invalidate the cached numeric on failure so next call does full factor.
+            if (context) context->freeExternalNumeric();
         }
         stats().external_klu_seconds += secondsBetween(external_start, std::chrono::steady_clock::now());
         if (!context && symbolic) {
