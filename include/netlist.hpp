@@ -148,6 +148,8 @@ struct SimulationSettings {
     bool fastspice = false;
     bool multirate = false;
     bool parallel_solve = false;
+    bool ticer = false;
+    double ticer_fmax = 1e9;
 
     // PSS / HB Parameters
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)

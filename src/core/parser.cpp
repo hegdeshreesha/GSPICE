@@ -1378,6 +1378,12 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "PARALLEL_SOLVE" || key == "PARALLEL_BTF" || key == "PARALLEL_SOLVER") {
         settings.parallel_solve = value.empty() ? true : truthy(value);
     }
+    else if (key == "TICER" || key == "MOR" || key == "INTERCONNECT_REDUCTION") {
+        settings.ticer = value.empty() ? true : truthy(value);
+    }
+    else if ((key == "TICER_FMAX" || key == "TICERFMAX") && hasNumeric && numeric > 0.0) {
+        settings.ticer_fmax = numeric;
+    }
     else if ((key == "METHOD" || key == "TRAN_METHOD") && !value.empty()) {
         std::string method = toUpperCopy(value);
         method.erase(std::remove(method.begin(), method.end(), '_'), method.end());

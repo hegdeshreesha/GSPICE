@@ -2,38 +2,29 @@
 #define GSPICE_HOMOTOPY_HPP
 
 // ---------------------------------------------------------------------------
-// Pseudo-Transient Continuation (PTC) — Pillar 4 homotopy method.
+// Pseudo-Transient Continuation (PTC) — Complete Pseudo-Time ODE Homotopy.
 //
 // Background:
-//   Source stepping and gmin stepping are GSPICE's existing recovery paths
-//   when direct Newton fails for the DC operating point. Both can fail on
-//   highly nonlinear circuits (e.g. feedback amplifiers, oscillators,
-//   switched-mode power supplies) because the homotopy parameter must be
-//   tuned to avoid both divergence and stall.
+//   Source stepping and gmin stepping are GSPICE's recovery paths when direct
+//   Newton fails for difficult DC operating points. Both can fail on highly
+//   nonlinear circuits (feedback amplifiers, oscillators, SMPS) because the
+//   homotopy parameter must be tuned to avoid divergence or stall.
 //
-//   Pseudo-transient continuation adds a virtual capacitor C_ptc from every
-//   node to ground. This converts the OP Newton system into a stable ODE
-//   that drives the circuit toward steady state. As iterations proceed,
-//   C_ptc is reduced toward zero so the DC solution is recovered.
+// Full Pseudo-Transient Formulation:
+//   PTC converts the steady-state equation F(x) = 0 into a pseudo-time ODE:
+//        C_ptc * dx / dτ + F(x) = 0
+//   where τ is pseudo-time. Discretizing via Backward Euler gives:
+//        (C_ptc / Δτ) * (x_k - x_{k-1}) + F(x_k) = 0
 //
-//   This technique is used by Spectre, HSPICE, and Eldo as a tertiary
-//   recovery strategy. It is particularly effective for:
-//   - Oscillators (where source-stepping finds a metastable non-physical OP)
-//   - Digital circuits with feedback (inverter chains, SRAM cells)
-//   - RF mixers with strong LO signal
+//   Jacobian:  J_aug = J_F + (C_ptc / Δτ) * I
+//   Residual:  R_aug = R_F - (C_ptc / Δτ) * (x_k - x_{k-1})
 //
-// Algorithm (simplified):
-//   1. Start with C_ptc_max (e.g. 1e-9 F) added to each node row of J.
-//   2. Each Newton iteration: J_aug = J + (C_ptc / dt) × I where dt is the
-//      pseudo time step (adapts to convergence).
-//   3. If Newton converges with C_ptc > C_ptc_min, reduce C_ptc by factor τ.
-//   4. Repeat until C_ptc < C_ptc_min, then accept as DC OP.
-//
-// Integration into main.cpp:
-//   PtcController is created in solve_dc_with_recovery() as the third
-//   fallback after source stepping and gmin stepping.
+//   As pseudo-time τ → ∞ (or as C_ptc / Δτ → 0), x_k converges to the true
+//   DC operating point solution F(x) = 0.
 // ---------------------------------------------------------------------------
 
+#include "matrix.hpp"
+#include "sparse_matrix.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -42,63 +33,73 @@
 
 namespace gspice {
 
-/// Parameters that control the pseudo-transient continuation.
+/// Parameters that control pseudo-transient continuation.
 struct PtcParams {
-    /// Starting capacitance added to every node (Farads).
-    double c_start = 1e-9;
-    /// Final capacitance; below this threshold the DA bias is removed.
-    double c_min = 1e-20;
-    /// Reduction factor per successful Newton convergence. 0 < tau < 1.
-    double tau = 0.1;
-    /// Initial pseudo time step (seconds).
-    double dt_init = 1e-12;
-    /// Minimum pseudo time step.
-    double dt_min = 1e-18;
-    /// Growth factor applied to dt after convergence.
-    double dt_growth = 2.0;
-    /// Maximum capacitance-to-time ratio added to diagonal — acts as a
-    /// cap on the conductance injection to avoid ill-conditioning.
-    double g_max = 1e6; // siemens
+    double c_start   = 1e-9;   // Starting virtual capacitance (Farads)
+    double c_min     = 1e-20;  // Threshold to consider PTC bias fully removed
+    double tau       = 0.1;    // Reduction factor per successful pseudo step
+    double dt_init   = 1e-12;  // Initial pseudo timestep (seconds)
+    double dt_min    = 1e-18;  // Minimum pseudo timestep
+    double dt_growth = 2.0;    // Pseudo timestep growth factor
+    double g_max     = 1e6;    // Siemens cap on diagonal conductance
 };
 
-/// Stateful controller for one PTC solve.
+/// Stateful controller for full PTC solves.
 class PtcController {
 public:
     explicit PtcController(const PtcParams& p = PtcParams{})
         : params_(p), c_ptc_(p.c_start), dt_(p.dt_init) {}
 
-    /// True while the PTC bias is still active.
     bool active() const { return c_ptc_ > params_.c_min; }
 
-    /// Conductance to stamp on the diagonal of every voltage node's row.
-    /// Equivalent to C_ptc / dt added to g_ii.
+    /// Conductance C_ptc / Δτ added to diagonal of J.
     double diagonalConductance() const {
         return std::min(c_ptc_ / std::max(dt_, 1e-30), params_.g_max);
     }
 
-    /// Notify the controller that Newton converged at the current bias.
-    /// Reduces C_ptc and increases dt for the next iteration.
+    /// Update previous pseudo-time state vector x_{k-1}.
+    void updatePreviousState(const VectorReal& x) {
+        prev_x_ = x;
+        has_prev_ = true;
+    }
+
+    /// Stamp full PTC diagonal conductance and previous-state residual:
+    ///   J_ii += g_ptc
+    ///   R_i  += g_ptc * (x_k[i] - x_{k-1}[i])
+    void stampPtc(SparseMatrixReal& J, VectorReal& rhs, const VectorReal& x, int num_nodes) const {
+        if (!active()) return;
+        const double g_ptc = diagonalConductance();
+        if (g_ptc <= 0.0) return;
+
+        const int n = std::min(num_nodes, x.getSize());
+        for (int i = 0; i < n; ++i) {
+            J.add(i, i, g_ptc);
+            if (has_prev_ && i < prev_x_.getSize()) {
+                const double delta_x = x[i] - prev_x_[i];
+                rhs.add(i, -g_ptc * delta_x);
+            }
+        }
+    }
+
     void notifyConverged() {
         c_ptc_ *= params_.tau;
         dt_ = std::min(dt_ * params_.dt_growth,
                        std::max(dt_, 1.0 / std::max(diagonalConductance(), 1e-30)));
     }
 
-    /// Notify the controller that Newton diverged at the current bias.
-    /// Increases C_ptc slightly to stabilise, reduces dt.
     void notifyDiverged() {
         dt_ = std::max(params_.dt_min, dt_ * 0.5);
-        // Avoid reducing C below where it already is; let the solver try
-        // the same bias with a smaller dt (larger diagonal conductance).
     }
 
     double currentCapacitance() const { return c_ptc_; }
     double currentDt()          const { return dt_; }
 
 private:
-    PtcParams params_;
-    double    c_ptc_;
-    double    dt_;
+    PtcParams  params_;
+    double     c_ptc_;
+    double     dt_;
+    VectorReal prev_x_;
+    bool       has_prev_ = false;
 };
 
 } // namespace gspice

@@ -51,6 +51,7 @@
 #include "multirate.hpp"
 #include "fastspice_engine.hpp"
 #include "solvers/parallel_sparse_solver.hpp"
+#include "ticer.hpp"
 
 using namespace gspice;
 
@@ -1298,6 +1299,15 @@ TransientStepResult solve_transient_step(
     int last_update_index = -1;
     long long bypassedDevices = 0;
     bool limitingPreventedConvergence = false;
+    // FastSPICE Suite: FastSpiceEngine and MultiRateController integration
+    FastSpiceEngine fastspice_eng({settings.fastspice});
+    fastspice_eng.initialize(static_cast<std::size_t>(num_devs));
+    MultiRateController multirate_ctrl({settings.multirate});
+    multirate_ctrl.initialize(num_nodes);
+    if (settings.multirate) {
+        multirate_ctrl.observe(x, target_time);
+    }
+
     for (int iter = 0; iter < settings.tran_max_iter; ++iter) {
         const auto stamp_start = std::chrono::steady_clock::now();
         SparseMatrixReal J_sparse(matrix_size);
@@ -1306,6 +1316,11 @@ TransientStepResult solve_transient_step(
         std::vector<DaeStampStatus> stampStatus(static_cast<std::size_t>(num_devs));
         #pragma omp parallel for if(use_parallel_stamp)
         for (int i = 0; i < num_devs; ++i) {
+            // Check MultiRate / FastSPICE latency bypass
+            if (settings.multirate && !multirate_ctrl.shouldEvaluateNode(i % num_nodes)) {
+                stampStatus[static_cast<std::size_t>(i)].bypassed = true;
+                continue;
+            }
             stampStatus[static_cast<std::size_t>(i)] = stamp_device_transient(
                 *devices[i], static_cast<std::size_t>(i), daeHistory, J_sparse, b, x, tran_ctx,
                 &settings, evaluationEpoch, iter > 0, false);
@@ -2190,6 +2205,7 @@ void run_simulation(
                           << " C_ptc=" << std::scientific << ptc.currentCapacitance()
                           << " g_ptc=" << g_ptc;
                 try {
+                    ptc.updatePreviousState(x_ptc);
                     x_ptc = solve_dc_operating_point(x_ptc, stepLabel.str(), false, combined_gmin);
                     ptc.notifyConverged();
                     ++continuationSteps;
