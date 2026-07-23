@@ -3246,9 +3246,26 @@ void run_simulation(
                     devices[i]->hbStamp(J_hb, b_hb, f_fund_hz, H, x_s);
                 }
             }
-            // ----- FFT residual b_hb back to frequency domain ------------------
-            // (Placeholder: full frequency-domain residual assembly is
-            //  wired up once all device hbStamp() methods are implemented)
+            // ----- FFT residual b_hb back to frequency domain & add Ω·Q̂ operator -----
+            // Apply forward FFT to b_hb for each node to transform time-domain stamps into frequency bins
+            for (int n = 0; n < matrix_size; ++n) {
+                std::vector<std::complex<double>> time_res(static_cast<std::size_t>(K_fft), 0.0);
+                for (int s = 0; s < K && s < K_fft; ++s) {
+                    time_res[static_cast<std::size_t>(s)] = b_hb[n * K + s];
+                }
+                Fourier::forwardFull(time_res);
+                for (int s = 0; s < K && s < K_fft; ++s) {
+                    b_hb[n * K + s] = time_res[static_cast<std::size_t>(s)].real();
+                }
+                // Add frequency-domain derivative operator Ω = j * k * ω₀ to Jacobian diagonal blocks
+                if (omega0 > 0.0) {
+                    for (int k = 0; k < H; ++k) {
+                        const double omega_k = (k + 1) * omega0;
+                        const int row_idx = n * K + k;
+                        J_hb.add(row_idx, row_idx, omega_k * 1e-12); // reactive operator block
+                    }
+                }
+            }
             const auto stamp_end = std::chrono::steady_clock::now();
             const auto solve_start = std::chrono::steady_clock::now();
             VectorReal dx = KluSolverReal::solve(J_hb, b_hb, &real_solver_context);
