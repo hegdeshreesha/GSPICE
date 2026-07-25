@@ -1243,6 +1243,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.abstol = 10e-15;
             settings.tran_lte_reltol = 3e-4;
             settings.tran_lte_abstol = 100e-9;
+            settings.chgtol = 1e-15;
+            settings.tran_trtol = 1.0;
+            settings.tran_method = "TRAPGEAR";
             settings.tran_max_iter = 120;
         }
     };
@@ -1276,10 +1279,15 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_adaptive = true;
         }
     };
-    if (key == "RELTOL" && hasNumeric && numeric > 0.0) settings.reltol = numeric;
+    if (key == "RELTOL" && hasNumeric && numeric > 0.0) {
+        settings.reltol = numeric;
+    }
     else if (key == "VNTOL" && hasNumeric && numeric > 0.0) settings.vntol = numeric;
     else if (key == "ABSTOL" && hasNumeric && numeric > 0.0) settings.abstol = numeric;
     else if (key == "GMIN" && hasNumeric && numeric >= 0.0) settings.gmin = numeric;
+    else if ((key == "THREADS" || key == "NUM_THREADS" || key == "NTHREADS" || key == "PARALLEL" || key == "CPUS") && hasNumeric && numeric > 0.0) {
+        settings.num_threads = static_cast<int>(numeric);
+    }
     else if (key == "ACCURACY" && !value.empty()) applyPreset(value);
     else if ((key == "NUMERICAL" || key == "CONVERGENCE" || key == "POLICY") && !value.empty()) applyNumericalPolicy(value);
     else if (key == "TRTOL" && hasNumeric && numeric > 0.0) settings.tran_trtol = numeric;
@@ -1290,6 +1298,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP") && hasNumeric && numeric > 0.0) settings.t_max_step = numeric;
     else if ((key == "MINSTEP" || key == "TMIN" || key == "TRAN_MINSTEP") && hasNumeric && numeric > 0.0) settings.t_min_step = numeric;
     else if (key == "ADAPTIVE" || key == "TRAN_ADAPTIVE") settings.tran_adaptive = value.empty() ? true : truthy(value);
+    else if (key == "SAVE_ADAPTIVE" || key == "SAVE_ADAPTIVE_STEPS" || key == "SAVEADAPTIVE") {
+        settings.save_adaptive_steps = value.empty() ? true : truthy(value);
+    }
     else if (key == "TRAN_PREDICTOR" || key == "PREDICTOR") settings.tran_predictor = value.empty() ? true : truthy(value);
     else if (key == "TRAN_ORDER_ADAPTIVE" || key == "ORDER_ADAPTIVE" || key == "ADAPTIVE_ORDER") {
         settings.tran_order_adaptive = value.empty() ? true : truthy(value);
@@ -1928,6 +1939,29 @@ Netlist Parser::parse(const std::string& filePath) {
                     std::string opt = tokens[5];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") settings.use_uic = true;
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".IC" || cmd == ".NODESET") {
+                SimulationSettings settings = netlist.getSettings();
+                for (size_t i = 1; i < tokens.size(); ++i) {
+                    auto [key, val_str] = splitParameterToken(tokens[i]);
+                    if (key.empty() && i + 2 < tokens.size() && tokens[i + 1] == "=") {
+                        key = tokens[i];
+                        val_str = tokens[i + 2];
+                        i += 2;
+                    }
+                    if (!key.empty()) {
+                        std::string node_name = key;
+                        if (node_name.rfind("V(", 0) == 0 && node_name.back() == ')') {
+                            node_name = node_name.substr(2, node_name.size() - 3);
+                        }
+                        int node_idx = netlist.getOrCreateNode(node_name);
+                        double val = Utils::parseValue(val_str);
+                        InitialConditionSpec ic;
+                        ic.node = node_idx;
+                        ic.value = val;
+                        settings.initial_conditions.push_back(ic);
+                    }
                 }
                 netlist.setSettings(settings);
             } else if (cmd == ".OSDI" || cmd == ".PRE_OSDI") {

@@ -26,7 +26,7 @@ int gspice_load_netlist_string(gspice_context_t ctx, const char* netlist_text);
 /// Load a SPICE netlist file.
 int gspice_load_netlist_file(gspice_context_t ctx, const char* filepath);
 
-/// Run the loaded simulation analysis (DC, TRAN, AC, HB, PSS).
+/// Run the loaded simulation analysis (DC, TRAN, AC, HB).
 int gspice_run_simulation(gspice_context_t ctx);
 
 /// Retrieve the number of circuit nodes.

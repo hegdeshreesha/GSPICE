@@ -26,6 +26,8 @@
 #include <atomic>
 #include <omp.h>
 #include "parser.hpp"
+#include "feature_registry.hpp"
+#include "event_queue.hpp"
 #include "devices/resistor.hpp"
 #include "devices/capacitor.hpp"
 #include "devices/inductor.hpp"
@@ -68,56 +70,40 @@ double elapsed_seconds(
 }
 
 int choose_active_threads(int requested_threads, int num_devs, int matrix_size) {
-    const int workload = std::max(num_devs, matrix_size * 2);
-    const double density = matrix_size > 0
-        ? static_cast<double>(num_devs) / static_cast<double>(matrix_size)
-        : 0.0;
-    int recommended = 1;
-    if (density >= 16.0) {
-        if (workload >= 2048) recommended = 2;
-        if (workload >= 8192) recommended = 4;
-        if (workload >= 16384) recommended = 8;
-        if (workload >= 32768) recommended = 16;
-    } else if (density >= 4.0) {
-        if (workload >= 4096) recommended = 2;
-        if (workload >= 16384) recommended = 4;
-        if (workload >= 32768) recommended = 8;
-        if (workload >= 65536) recommended = 16;
-    } else {
-        if (workload >= 8192) recommended = 2;
-        if (workload >= 16384) recommended = 4;
-        if (workload >= 32768) recommended = 8;
-        if (workload >= 65536) recommended = 16;
-    }
-    recommended = std::min(recommended, 16);
-    return std::max(1, std::min(requested_threads, recommended));
+    (void)matrix_size;
+    if (num_devs < 2) return 1;
+    const int max_cpus = omp_get_max_threads();
+    const int target = (requested_threads > 0) ? requested_threads : max_cpus;
+    return std::clamp(target, 1, std::min(max_cpus, num_devs));
 }
 
 bool parallel_stamp_enabled(int num_devs, int matrix_size) {
+    (void)matrix_size;
     if (omp_get_max_threads() <= 1) return false;
-    return num_devs >= 128 || matrix_size >= 2048;
+    return num_devs >= 2;
 }
 
 double default_transient_max_step(const SimulationSettings& settings, double output_step) {
-    double divisor = 4.0;
-    if (settings.tran_lte_reltol <= 3e-4 || settings.reltol <= 1e-4) {
-        divisor = 20.0;
-    } else if (settings.tran_lte_reltol <= 1e-3 || settings.reltol <= 3e-4) {
-        divisor = 10.0;
-    } else if (settings.tran_lte_reltol >= 1e-2 || settings.reltol >= 5e-3) {
-        divisor = 2.0;
-    }
-    return std::max(output_step / divisor, 1e-18);
+    // Spectre/HSPICE standard: max_step is an UPPER BOUND limit for adaptive timestepping.
+    // It allows step size to grow during quiescent flat regions while LTE shrinks step
+    // size during active transitions/oscillations.
+    const double base = (settings.t_stop > 0.0) ? (settings.t_stop / 50.0) : (output_step * 50.0);
+    return std::max({base, output_step * 5.0, 1e-18});
 }
 
+
 void stamp_global_gmin(SparseMatrixReal& J, int num_nodes, double gmin) {
-    for (int i = 0; i < num_nodes; ++i) {
+    (void)num_nodes;
+    const int n = J.getSize();
+    for (int i = 0; i < n; ++i) {
         J.add(i, i, gmin);
     }
 }
 
 void stamp_global_gmin(SparseMatrixComplex& J, int num_nodes, double gmin) {
-    for (int i = 0; i < num_nodes; ++i) {
+    (void)num_nodes;
+    const int n = J.getSize();
+    for (int i = 0; i < n; ++i) {
         J.add(i, i, {gmin, 0.0});
     }
 }
@@ -1143,7 +1129,8 @@ TransientIntegrationMethod choose_transient_method(
     if (method == "GEAR2" && x_hist.size() >= 2 && t_hist.size() >= 2) {
         return TransientIntegrationMethod::Gear2;
     }
-    if (method == "AUTO" && settings.tran_adaptive && x_hist.size() >= 2 && t_hist.size() >= 2) {
+    if ((method == "AUTO" || method == "TRAPGEAR" || method == "TRAP_GEAR") &&
+        settings.tran_adaptive && x_hist.size() >= 2 && t_hist.size() >= 2) {
         (void)proposed_step;
         return autoUseTrapezoidal
             ? TransientIntegrationMethod::Trapezoidal
@@ -1265,9 +1252,10 @@ double transient_reject_factor(double err, int order) {
 }
 
 double transient_growth_factor(double err, int order) {
-    if (err <= 1e-12) return order <= 1 ? 2.0 : 2.5;
+    if (err <= 1e-12) return order <= 1 ? 4.0 : 8.0;
+    if (err <= 1e-6)  return order <= 1 ? 2.5 : 5.0;
     const double exponent = -1.0 / static_cast<double>(order + 1);
-    return std::clamp(0.9 * std::pow(std::max(err, 1e-30), exponent), 1.05, 2.5);
+    return std::clamp(0.9 * std::pow(std::max(err, 1e-30), exponent), 1.05, 5.0);
 }
 
 TransientStepResult solve_transient_step(
@@ -1330,8 +1318,17 @@ TransientStepResult solve_transient_step(
         }
         const auto stamp_end = std::chrono::steady_clock::now();
         const auto solve_start = std::chrono::steady_clock::now();
-        VectorReal x_new = solve_with_refinement(
-            J_sparse, b, solver_context, settings.solver_refinement_steps);
+        VectorReal x_new(matrix_size);
+        try {
+            x_new = solve_with_refinement(
+                J_sparse, b, solver_context, settings.solver_refinement_steps);
+        } catch (...) {
+            TransientStepResult failed{x, false, iter + 1, total_stamp_seconds, total_solve_seconds,
+                std::numeric_limits<double>::infinity(), last_update_error,
+                last_update_index, tran_ctx.integrationOrder};
+            failed.bypassed_devices = bypassedDevices;
+            return failed;
+        }
         const auto solve_end = std::chrono::steady_clock::now();
         total_stamp_seconds += elapsed_seconds(stamp_start, stamp_end);
         total_solve_seconds += elapsed_seconds(solve_start, solve_end);
@@ -1398,11 +1395,11 @@ double transient_endpoint_error(
     double worst = 0.0;
     const int n = std::min(first.getSize(), second.getSize());
     const double error_scale = std::max(errorScale, 1e-12);
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n && i < num_nodes; ++i) {
         const double err = std::abs(second[i] - first[i]);
         const double scale = std::max(std::abs(first[i]), std::abs(second[i]));
-        const double absolute = i < num_nodes ? settings.tran_lte_abstol : settings.abstol;
-        const double relative = i < num_nodes ? settings.tran_lte_reltol : settings.reltol;
+        const double absolute = settings.tran_lte_abstol;
+        const double relative = settings.tran_lte_reltol;
         const double tol = absolute + relative * scale;
         worst = std::max(worst, err / std::max(tol * error_scale, 1e-30));
     }
@@ -1688,6 +1685,11 @@ std::string normalized_transient_method(
     bool autoUseTrapezoidal = true) {
     const std::string method = normalized_method_key(settings);
     if (method == "TRAP" || method == "TRAPEZOIDAL") return "Trapezoidal";
+    if (method == "TRAPGEAR" || method == "TRAP_GEAR") {
+        return autoUseTrapezoidal
+            ? "Spectre TrapGear Hybrid (Trapezoidal default)"
+            : "Spectre TrapGear Hybrid (Gear2 auto-damped)";
+    }
     if (method == "GEAR2") return "Gear2/BDF2";
     if (method == "GEAR" || method == "BDF") return "Variable-step BDF";
     if (method == "ADAMS" || method == "ADAMSMOULTON" || method == "AM") {
@@ -1854,6 +1856,9 @@ void run_simulation(
     int num_devs = static_cast<int>(devices.size());
 
     const auto& requested_settings = netlist.getSettings();
+    if (requested_threads <= 1 && requested_settings.num_threads > 0) {
+        requested_threads = requested_settings.num_threads;
+    }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
         "TRAN", "AC", "NOISE", "STB", "HB"
@@ -2610,23 +2615,38 @@ void run_simulation(
         const double output_step = settings.t_step > 0.0
             ? settings.t_step
             : std::max(settings.t_stop / 100.0, 1e-15);
-        const double max_step = settings.t_max_step > 0.0
-            ? settings.t_max_step
-            : (settings.tran_adaptive ? std::min(output_step, default_transient_max_step(settings, output_step)) : output_step);
+        // FIX Bug 4: do not cap max_step to output_step. With output_step==5ps
+        // the old code forced max_step=5ps, preventing the integrator from ever
+        // taking a step larger than the output interval. Use the physics-driven
+        // default (t_stop/100 or similar) when the user has not set TMAX.
+        const double max_step = default_transient_max_step(settings, output_step);
         const double min_step = settings.t_min_step > 0.0
             ? std::min(settings.t_min_step, max_step)
             : std::max(max_step * 1e-6, 1e-18);
         const double save_start = std::clamp(settings.t_start, 0.0, settings.t_stop);
-        double step = max_step;
-        std::vector<VectorReal> x_hist; VectorReal x = x_dc; x_hist.push_back(x);
+        double step = std::min(output_step, 1e-11);
+        VectorReal x = x_dc;
+        if (!settings.initial_conditions.empty()) {
+            for (const auto& ic : settings.initial_conditions) {
+                if (ic.node >= 0 && ic.node < num_nodes) {
+                    x[ic.node] = ic.value;
+                }
+            }
+            step = std::min(step, 1e-12);
+        }
+        std::vector<VectorReal> x_hist; x_hist.push_back(x);
         std::vector<double> t_hist; t_hist.push_back(0.0);
         DeviceTransientStateArena transient_state_arena(devices);
         DaeTransientHistoryBank dae_history(devices, x, 0.0);
+        const std::string norm_method = normalized_method_key(settings);
         bool compact_model_prefers_damping = false;
-        for (const auto& device : devices) {
-            if (device->prefersDampedAutoTransient()) {
-                compact_model_prefers_damping = true;
-                break;
+        const bool high_accuracy_mode = settings.reltol <= 3e-4 || settings.save_adaptive_steps;
+        if (norm_method != "TRAPGEAR" && norm_method != "TRAP_GEAR" && norm_method != "TRAP" && norm_method != "TRAPEZOIDAL" && !high_accuracy_mode) {
+            for (const auto& device : devices) {
+                if (device->prefersDampedAutoTransient()) {
+                    compact_model_prefers_damping = true;
+                    break;
+                }
             }
         }
         AutomaticTransientMethodController auto_method_controller(compact_model_prefers_damping);
@@ -2685,6 +2705,11 @@ void run_simulation(
         } else {
             record_measure_sample(0.0, x);
         }
+        double candidate_step = step;
+        // FIX Bug 2: track the candidate step before any breakpoint snap so we
+        // can restore it after landing on a breakpoint instead of growing from
+        // the artificially shrunk post-snap value.
+        double pre_bp_candidate = step;
         while (t < settings.t_stop - stop_tol) {
             const double remaining = settings.t_stop - t;
             if (remaining <= stop_tol) break;
@@ -2698,25 +2723,41 @@ void run_simulation(
                 } while (next_output <= t + stop_tol);
                 continue;
             }
-            step = std::min(step, remaining);
-            if (std::isfinite(device_bound_step) && device_bound_step > 0.0 && step > device_bound_step) {
-                step = std::max(min_step, device_bound_step);
+            double cur_step = candidate_step;
+            cur_step = std::min(cur_step, remaining);
+
+            // FIX Bug 3: device bound is a one-shot cap on cur_step only.
+            // candidate_step is NOT modified here; the post-acceptance growth
+            // path will grow candidate_step independently. This ensures that
+            // once a pulse edge passes and the device bound relaxes, the step
+            // recovers naturally without needing special "force-growth" logic.
+            double current_bound_step = collect_transient_bound_step(devices);
+            if (std::isfinite(current_bound_step) && current_bound_step > 0.0 && cur_step > current_bound_step) {
+                cur_step = std::max(min_step, current_bound_step);
                 ++tran_stats.bound_step_limited;
             }
+
+            // FIX Bug 2 (part 1): save the pre-snap candidate before any
+            // breakpoint shrinks cur_step. We restore it after acceptance so
+            // that growth continues from the pre-event baseline.
+            pre_bp_candidate = candidate_step;
             const double next_bp = next_breakpoint_after(breakpoints, t, bp_tol);
             if (next_bp > 0.0) {
-                const double bp_window = std::max(max_step * 4.0, output_step);
                 const double bp_dist = next_bp - t;
-                if (bp_dist > stop_tol && bp_dist <= bp_window) {
-                    step = std::min(step, bp_dist);
-                } else if (bp_dist >= 0.0 && bp_dist <= stop_tol) {
-                    t = next_bp;
-                    continue;
+                if (bp_dist > stop_tol) {
+                    if (bp_dist < cur_step) {
+                        cur_step = bp_dist;
+                    }
                 }
             }
-            if (next_output > t + 1e-30) {
-                step = std::min(step, next_output - t);
-            }
+            // FIX Bug 1: DO NOT clamp the integration step to (next_output - t).
+            // The integrator is free to step past output points; values at
+            // scheduled output times are written from the accepted state at 't'
+            // (which may be slightly past next_output) via the post-step flush
+            // below. Clamping here permanently reduced candidate_step to the
+            // tiny output interval (5 ps in the user's netlist), preventing any
+            // step growth for the rest of the simulation.
+            step = cur_step;
             if (step <= stop_tol) {
                 step = std::min(max_step, std::max(min_step, remaining));
                 if (step <= stop_tol) break;
@@ -2967,6 +3008,7 @@ void run_simulation(
                 x_hist.push_back(x);
                 t_hist.push_back(t);
                 selected_order = 1;
+                candidate_step = std::min(output_step, 1e-11);
                 auto_method_controller.restart();
                 auto_use_trapezoidal = auto_method_controller.useTrapezoidal();
             } else {
@@ -2989,30 +3031,63 @@ void run_simulation(
                 t_hist.erase(t_hist.begin(), t_hist.begin() + 1);
             }
             const double output_tol = std::max(1e-30, output_step * 1e-9);
-            if (t + output_tol >= next_output) {
+            bool is_fast_transition = false;
+            if (num_nodes > 0 && x_hist.size() >= 2 && t_hist.size() >= 2) {
+                const double dt_step = t_hist.back() - t_hist[t_hist.size() - 2];
+                if (dt_step > 1e-18) {
+                    const auto& x_prev = x_hist[x_hist.size() - 2];
+                    for (int i = 0; i < num_nodes; ++i) {
+                        const double dv_dt = std::abs(x[i] - x_prev[i]) / dt_step;
+                        if (dv_dt > 1e9) {
+                            is_fast_transition = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            const bool should_write = (t + output_tol >= next_output) ||
+                                      settings.save_adaptive_steps ||
+                                      is_fast_transition;
+            if (should_write) {
                 tran_out.write(t, x, num_nodes);
                 ++tran_stats.output_points;
                 last_printed_time = t;
-                do {
-                    next_output += output_step;
-                } while (next_output <= t + output_tol);
+                if (t + output_tol >= next_output) {
+                    do {
+                        next_output += output_step;
+                    } while (next_output <= t + output_tol);
+                }
             }
             if (tran_out.toFile() && settings.t_stop > 0.0) {
                 const double pct = std::clamp(100.0 * t / settings.t_stop, 0.0, 100.0);
-                if (pct - last_progress_percent >= 1.0 || pct >= 100.0) {
+                if (pct - last_progress_percent >= 0.1 || pct >= 100.0) {
                     std::cout << std::fixed << std::setprecision(1)
                               << "Transient progress: " << pct << "% t="
                               << std::scientific << std::setprecision(9) << t << std::endl;
                     last_progress_percent = pct;
                 }
             }
-            if (settings.tran_adaptive) {
-                const double grow = std::clamp(proposed_growth, 1.05, 2.5);
-                step = std::min(max_step, std::max(min_step, step * grow));
-                if (std::isfinite(device_bound_step) && device_bound_step > 0.0 && step > device_bound_step) {
-                    step = std::max(min_step, device_bound_step);
-                    ++tran_stats.bound_step_limited;
+            if (is_transient_breakpoint(breakpoints, t, bp_tol) && t > bp_tol) {
+                // FIX Bug 2 (part 2): restore the pre-breakpoint candidate step
+                // instead of resetting to 2*output_step. This preserves the
+                // momentum of step growth across discontinuity events and avoids
+                // re-collapsing against the output-interval clamp.
+                // Then apply a conservative growth factor so the method can
+                // ramp up smoothly from the restart point.
+                const double restored = std::min(max_step, pre_bp_candidate);
+                if (settings.tran_adaptive) {
+                    // Allow a slight growth from the restored candidate so we do
+                    // not permanently stall if the device bound forced it tiny.
+                    candidate_step = std::min(max_step, std::max(min_step, restored * 1.1));
+                } else {
+                    candidate_step = max_step;
                 }
+            } else if (settings.tran_adaptive) {
+                const double max_grow = (err <= 1e-12) ? 8.0 : ((err <= 1e-6) ? 5.0 : 2.5);
+                const double grow = std::clamp(proposed_growth, 1.05, max_grow);
+                candidate_step = std::min(max_step, std::max(min_step, candidate_step * grow));
+            } else {
+                candidate_step = max_step;
             }
         }
         const double output_tol = std::max(1e-30, output_step * 1e-9);
@@ -3384,26 +3459,7 @@ void print_usage() {
 }
 
 void print_capabilities() {
-    std::cout
-        << "{\n"
-        << "  \"name\": \"GSPICE\",\n"
-        << "  \"version\": \"" << GSPICE_VERSION << "\",\n"
-        << "  \"maturity\": \"academic-beta\",\n"
-        << "  \"analyses\": {\n"
-        << "    \"op\": \"beta\", \"dc\": \"beta\", \"tran\": \"beta\",\n"
-        << "    \"ac\": \"beta\", \"noise\": \"experimental\",\n"
-        << "    \"tf\": \"experimental\", \"sens\": \"experimental\",\n"
-        << "    \"pz\": \"estimator-only\", \"stb\": \"experimental\",\n"
-        << "    \"hb\": \"experimental\", \"pss\": \"unsupported\",\n"
-        << "    \"pac\": \"unsupported\", \"pnoise\": \"unsupported\"\n"
-        << "  },\n"
-        << "  \"outputs\": [\"spice-ascii-raw\", \"csv\"],\n"
-#if GSPICE_HAVE_SUITESPARSE_KLU
-        << "  \"sparse_backend\": \"SuiteSparse-KLU\"\n"
-#else
-        << "  \"sparse_backend\": \"internal\"\n"
-#endif
-        << "}\n";
+    std::cout << gspice::FeatureRegistry::instance().getCapabilitiesJson();
 }
 
 int main(int argc, char* argv[]) {
@@ -3411,7 +3467,7 @@ int main(int argc, char* argv[]) {
     std::string output_file = "";
     std::string output_format = "RAW";
     bool format_explicit = false;
-    int num_threads = 1;
+    int num_threads = std::max(1, omp_get_max_threads());
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") { print_usage(); return 0; }

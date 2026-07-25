@@ -81,6 +81,7 @@ struct SimulationSettings {
     double tran_trtol = 1.0;
     double chgtol = 1e-14;
     int tran_max_order = 2;
+    bool save_adaptive_steps = false;
     double f_start = 0.0;
     double f_stop = 0.0;
     int points_per_dec = 0;
@@ -143,13 +144,14 @@ struct SimulationSettings {
     bool osdi_limiting_rhs = false;
     bool osdi_tran_jacobian = false;
     bool osdi_bind_full_model_params = true;
-    bool osdi_internal_nodes = false;
+    bool osdi_internal_nodes = true;
     bool osdi_spice_rhs = false;
     bool fastspice = false;
     bool multirate = false;
     bool parallel_solve = false;
     bool ticer = false;
     double ticer_fmax = 1e9;
+    int num_threads = 0;
 
     // PSS / HB Parameters
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)

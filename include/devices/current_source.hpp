@@ -98,7 +98,6 @@ private:
     static constexpr double PI_ = 3.14159265358979323846;
 
     double evaluateAt(double time) const {
-        if (time <= 0.0) return dcValue_;
         if (waveformType_ == VoltageSource::WaveformType::PULSE) return evalPulse(time);
         if (waveformType_ == VoltageSource::WaveformType::SIN) return evalSin(time);
         if (waveformType_ == VoltageSource::WaveformType::PWL) return evalPwl(time);

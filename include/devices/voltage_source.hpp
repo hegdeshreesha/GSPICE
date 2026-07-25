@@ -135,10 +135,6 @@ private:
 
 public:
     double evaluateAt(double time) const {
-        if (time <= 0.0) {
-            return dcValue_;
-        }
-
         if (waveformType_ == WaveformType::PULSE) return evalPulse(time);
         if (waveformType_ == WaveformType::SIN) return evalSin(time);
         if (waveformType_ == WaveformType::PWL) return evalPwl(time);
