@@ -6,6 +6,8 @@
 #endif
 #include <windows.h>
 #include <algorithm>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -15,6 +17,27 @@
 #include "osdi_metadata.hpp"
 
 namespace gspice {
+
+inline void osdiLogMessage(void*, char* message, uint32_t level) {
+    std::ostream& stream = (level & LOG_LVL_MASK) >= LOG_LVL_WARN
+        ? std::cerr
+        : std::cout;
+    stream << "OSDI";
+    switch (level & LOG_LVL_MASK) {
+    case LOG_LVL_DEBUG: stream << "(debug)"; break;
+    case LOG_LVL_INFO: stream << "(info)"; break;
+    case LOG_LVL_WARN: stream << "(warn)"; break;
+    case LOG_LVL_ERR: stream << "(error)"; break;
+    case LOG_LVL_FATAL: stream << "(fatal)"; break;
+    default: break;
+    }
+    if ((level & LOG_FMT_ERR) != 0) {
+        stream << ": failed to format \"" << (message ? message : "") << "\"\n";
+        return;
+    }
+    stream << ": " << (message ? message : "");
+    std::free(message);
+}
 
 class OSDILoader {
 public:
@@ -34,6 +57,43 @@ public:
             return;
         }
 
+        auto* major_ptr = reinterpret_cast<uint32_t*>(
+            GetProcAddress(hModule_, "OSDI_VERSION_MAJOR"));
+        auto* minor_ptr = reinterpret_cast<uint32_t*>(
+            GetProcAddress(hModule_, "OSDI_VERSION_MINOR"));
+        if (!major_ptr || !minor_ptr ||
+            (*major_ptr == 0u && *minor_ptr < OSDI_VERSION_MINOR_CURR)) {
+            error_ = "Unsupported OSDI interface version in " + libraryPath +
+                "; GSPICE requires OSDI 0.4 or newer";
+            std::cerr << error_ << std::endl;
+            return;
+        }
+        version_major_ = *major_ptr;
+        version_minor_ = *minor_ptr;
+
+        auto* nature_count = reinterpret_cast<uint32_t*>(
+            GetProcAddress(hModule_, "OSDI_NATURES_LEN"));
+        auto* discipline_count = reinterpret_cast<uint32_t*>(
+            GetProcAddress(hModule_, "OSDI_DISCIPLINES_LEN"));
+        auto* attribute_count = reinterpret_cast<uint32_t*>(
+            GetProcAddress(hModule_, "OSDI_ATTRIBUTES_LEN"));
+        const auto* natures = reinterpret_cast<const OsdiNature*>(
+            GetProcAddress(hModule_, "OSDI_NATURES"));
+        const auto* disciplines = reinterpret_cast<const OsdiDiscipline*>(
+            GetProcAddress(hModule_, "OSDI_DISCIPLINES"));
+        const auto* attributes = reinterpret_cast<const OsdiAttribute*>(
+            GetProcAddress(hModule_, "OSDI_ATTRIBUTES"));
+        nature_count_ = nature_count ? *nature_count : 0u;
+        discipline_count_ = discipline_count ? *discipline_count : 0u;
+        attribute_count_ = attribute_count ? *attribute_count : 0u;
+
+        // OSDI exports a writable function-pointer slot used by generated
+        // $display/$warning/$error code.
+        if (auto** logger = reinterpret_cast<void**>(
+                GetProcAddress(hModule_, "osdi_log"))) {
+            *logger = reinterpret_cast<void*>(&osdiLogMessage);
+        }
+
         // Standard OSDI exports
         auto* num_desc_ptr = reinterpret_cast<uint32_t*>(GetProcAddress(hModule_, "OSDI_NUM_DESCRIPTORS"));
         auto* descriptor_size_ptr = reinterpret_cast<uint32_t*>(GetProcAddress(hModule_, "OSDI_DESCRIPTOR_SIZE"));
@@ -42,18 +102,27 @@ public:
         if (num_desc_ptr && descriptor_size_ptr && descriptors_base) {
             uint32_t num = *num_desc_ptr;
             uint32_t descriptor_size = *descriptor_size_ptr;
-            if (descriptor_size == 0 || descriptor_size > sizeof(OsdiDescriptor)) {
+            constexpr std::size_t supported_descriptor_size =
+                offsetof(OsdiDescriptor, model_name);
+            if (descriptor_size < supported_descriptor_size) {
                 error_ = "OSDI descriptor size is unsupported in " + libraryPath +
                     " (module size " + std::to_string(descriptor_size) +
-                    ", GSPICE size " + std::to_string(sizeof(OsdiDescriptor)) + ")";
+                    ", required prefix " + std::to_string(supported_descriptor_size) + ")";
                 std::cerr << error_ << std::endl;
                 return;
             }
             for (uint32_t i = 0; i < num; ++i) {
                 OsdiDescriptor desc{};
-                std::memcpy(&desc, descriptors_base + static_cast<size_t>(i) * descriptor_size, descriptor_size);
+                std::memcpy(
+                    &desc,
+                    descriptors_base + static_cast<size_t>(i) * descriptor_size,
+                    supported_descriptor_size);
                 available_models_.push_back(desc);
-                metadata_.emplace_back(available_models_.back());
+                metadata_.emplace_back(
+                    available_models_.back(),
+                    natures, nature_count_,
+                    disciplines, discipline_count_,
+                    attributes, attribute_count_);
             }
             loaded_ = true;
         } else {
@@ -77,12 +146,22 @@ public:
     bool isLoaded() const { return loaded_; }
     const std::string& getError() const { return error_; }
     const std::string& getPath() const { return library_path_; }
+    uint32_t getVersionMajor() const { return version_major_; }
+    uint32_t getVersionMinor() const { return version_minor_; }
+    uint32_t getNatureCount() const { return nature_count_; }
+    uint32_t getDisciplineCount() const { return discipline_count_; }
+    uint32_t getAttributeCount() const { return attribute_count_; }
 
 private:
     HMODULE hModule_ = nullptr;
     bool loaded_ = false;
     std::string library_path_;
     std::string error_;
+    uint32_t version_major_ = 0;
+    uint32_t version_minor_ = 0;
+    uint32_t nature_count_ = 0;
+    uint32_t discipline_count_ = 0;
+    uint32_t attribute_count_ = 0;
     std::vector<OsdiDescriptor> available_models_;
     std::vector<OsdiDescriptorMetadata> metadata_;
 };

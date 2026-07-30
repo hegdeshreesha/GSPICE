@@ -18,6 +18,9 @@ public:
         J.add(nodeNeg_, nodeNeg_, G);
         J.add(nodePos_, nodeNeg_, -G);
         J.add(nodeNeg_, nodePos_, -G);
+        if (branchIndex_ >= 0) {
+            J.add(branchIndex_, branchIndex_, 1.0);
+        }
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {

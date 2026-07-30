@@ -8,6 +8,9 @@
 extern "C" {
 #endif
 
+#define OSDI_VERSION_MAJOR_CURR 0u
+#define OSDI_VERSION_MINOR_CURR 4u
+
 #define PARA_TY_MASK 3u
 #define PARA_TY_REAL 0u
 #define PARA_TY_INT 1u
@@ -50,6 +53,34 @@ extern "C" {
 #define EVAL_RET_FLAG_STOP 8u
 
 #define INIT_ERR_OUT_OF_BOUNDS 1u
+
+#define LOG_LVL_MASK 7u
+#define LOG_LVL_DEBUG 0u
+#define LOG_LVL_DISPLAY 1u
+#define LOG_LVL_INFO 2u
+#define LOG_LVL_WARN 3u
+#define LOG_LVL_ERR 4u
+#define LOG_LVL_FATAL 5u
+#define LOG_FMT_ERR 16u
+
+#define ATTR_TYPE_STR 0u
+#define ATTR_TYPE_INT 1u
+#define ATTR_TYPE_REAL 2u
+
+#define NATREF_NONE 0u
+#define NATREF_NATURE 1u
+#define NATREF_DISCIPLINE_FLOW 2u
+#define NATREF_DISCIPLINE_POTENTIAL 3u
+
+#define DOMAIN_NOT_GIVEN 0u
+#define DOMAIN_DISCRETE 1u
+#define DOMAIN_CONTINUOUS 2u
+
+#define NOISE_TYPE_WHITE 0u
+#define NOISE_TYPE_FLICKER 1u
+#define NOISE_TYPE_TABLE 2u
+
+#define MODULEFLAG_ABSTIME 1u
 
 typedef struct OsdiSimParas {
     char** names;
@@ -181,6 +212,39 @@ typedef struct OsdiDescriptor {
     void (*legacy_evaluate)(void* instance_data, const double* voltages, double* currents, double* charges, double* jacobian);
     void* (*legacy_create_instance)(void* model_data);
 } OsdiDescriptor;
+
+typedef struct OsdiNature {
+    char* name;
+    uint32_t parent_type;
+    uint32_t parent;
+    uint32_t ddt;
+    uint32_t idt;
+    uint32_t attr_start;
+    uint32_t num_attr;
+} OsdiNature;
+
+typedef struct OsdiDiscipline {
+    char* name;
+    uint32_t flow;
+    uint32_t potential;
+    uint32_t domain;
+    uint32_t attr_start;
+    uint32_t num_flow_attr;
+    uint32_t num_potential_attr;
+    uint32_t num_user_attr;
+} OsdiDiscipline;
+
+typedef union OsdiAttributeValue {
+    char* string;
+    int32_t integer;
+    double real;
+} OsdiAttributeValue;
+
+typedef struct OsdiAttribute {
+    char* name;
+    uint32_t value_type;
+    OsdiAttributeValue value;
+} OsdiAttribute;
 
 #ifdef __cplusplus
 }

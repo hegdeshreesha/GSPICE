@@ -37,7 +37,9 @@ public:
         TransientControlOptions opts;
         opts.t_stop = ctx.settings().t_stop;
         opts.output_step = ctx.settings().t_step;
-        opts.max_step = ctx.settings().t_max_step > 0.0 ? ctx.settings().t_max_step : ctx.settings().t_step;
+        opts.max_step = (!ctx.settings().ignore_tran_tmax && ctx.settings().t_max_step > 0.0)
+            ? ctx.settings().t_max_step
+            : ctx.settings().t_step;
         opts.min_step = ctx.settings().t_min_step > 0.0 ? ctx.settings().t_min_step : 1e-12;
 
         TransientController controller(opts);

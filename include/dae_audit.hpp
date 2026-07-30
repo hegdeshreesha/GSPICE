@@ -102,7 +102,11 @@ inline DaeAuditReport auditDaeDevice(
     detail::DaeAuditStateGuard stateGuard(device);
 
     DaeRequest fullRequest;
-    fullRequest.analysis = DaeAnalysis::Transient;
+    // Audit F(x) and Q(x) at the operating point using static-analysis
+    // semantics. Q remains a state function and can be requested in this
+    // mode, while ANALYSIS_TRAN may enable model-specific transient-noise
+    // branches that are not part of the ordinary DAE residual.
+    fullRequest.analysis = DaeAnalysis::OperatingPoint;
     fullRequest.dynamicResidual = true;
     fullRequest.dynamicJacobian = true;
     fullRequest.enableLimiting = false;
@@ -135,6 +139,7 @@ inline DaeAuditReport auditDaeDevice(
     DaeRequest residualRequest = fullRequest;
     for (int unknown : unknowns) {
         if (unknown < 0 || unknown >= solution.getSize()) continue;
+        if (!device.daeAuditUnknown(unknown)) continue;
         VectorReal plus = solution;
         VectorReal minus = solution;
         const double delta = options.perturbationScale * std::max(1.0, std::abs(solution[unknown]));

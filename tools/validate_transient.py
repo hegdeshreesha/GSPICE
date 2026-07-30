@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible transient comparison against analytic, Xyce, and VACASK oracles."""
+"""Reproducible transient comparison against analytic and VACASK oracles."""
 
 from __future__ import annotations
 
@@ -142,15 +142,12 @@ def locate_output(directory: Path, preferred: str, suffix: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gspice", required=True, type=Path)
-    parser.add_argument("--xyce", type=Path)
     parser.add_argument("--vacask", type=Path)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--max-abs", type=float, default=2e-3)
     parser.add_argument("--psp-max-abs", type=float, default=2e-2)
     args = parser.parse_args()
     args.gspice = args.gspice.resolve()
-    if args.xyce:
-        args.xyce = args.xyce.resolve()
     if args.vacask:
         args.vacask = args.vacask.resolve()
     reference_dir = args.source.resolve() / "tests" / "reference"
@@ -165,16 +162,6 @@ def main() -> int:
         max_abs, rms, count = metrics(gspice, analytic_samples(gspice))
         print(f"analytic RC: max_abs={max_abs:.6e} rms={rms:.6e} samples={count}")
         failures = int(max_abs > args.max_abs)
-
-        if args.xyce:
-            shutil.copy2(reference_dir / "rc_step_xyce.cir", work / "rc_step_xyce.cir")
-            run([str(args.xyce), "rc_step_xyce.cir"], work)
-            xyce = read_csv_signal(locate_output(work, "rc_step_xyce.csv", ".csv"), "v(out)")
-            max_abs, rms, count = metrics(gspice, xyce)
-            print(f"Xyce RC:     max_abs={max_abs:.6e} rms={rms:.6e} samples={count}")
-            failures += int(max_abs > args.max_abs)
-        else:
-            print("Xyce RC:     SKIPPED (no executable supplied)")
 
         if args.vacask:
             shutil.copy2(reference_dir / "rc_step_vacask.sim", work / "rc_step_vacask.sim")

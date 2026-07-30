@@ -183,10 +183,10 @@ inline bool detectTrapezoidalRinging(
         const double d1 = x2[i] - x1[i];
         const double d2 = x3[i] - x2[i];
         const double scale = std::max({std::abs(x0[i]), std::abs(x1[i]), std::abs(x2[i]), std::abs(x3[i])});
-        const double floor = 4.0 * (absoluteTolerance + relativeTolerance * scale);
+        const double floor = 1.0 * (absoluteTolerance + relativeTolerance * scale);
         if (std::abs(d1) <= floor || std::abs(d2) <= floor) continue;
         const bool alternating = d0 * d1 < 0.0 && d1 * d2 < 0.0;
-        const bool weaklyDamped = std::abs(d2) >= 0.70 * std::abs(d1);
+        const bool weaklyDamped = std::abs(d2) >= 0.50 * std::abs(d1);
         if (alternating && weaklyDamped) return true;
     }
     return false;

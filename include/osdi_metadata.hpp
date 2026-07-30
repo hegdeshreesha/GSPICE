@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -43,6 +45,12 @@ struct OsdiNodeInfo {
     bool is_flow = false;
     bool has_resistive_residual = false;
     bool has_reactive_residual = false;
+    OsdiNatureRef unknown_nature{NATREF_NONE, UINT32_MAX};
+    OsdiNatureRef residual_nature{NATREF_NONE, UINT32_MAX};
+    double unknown_abstol = std::numeric_limits<double>::infinity();
+    double integrated_unknown_abstol = std::numeric_limits<double>::infinity();
+    double residual_abstol = std::numeric_limits<double>::infinity();
+    double integrated_residual_abstol = std::numeric_limits<double>::infinity();
 };
 
 struct OsdiNoiseInfo {
@@ -54,7 +62,20 @@ struct OsdiNoiseInfo {
 
 class OsdiDescriptorMetadata {
 public:
-    explicit OsdiDescriptorMetadata(const OsdiDescriptor& desc) {
+    explicit OsdiDescriptorMetadata(
+        const OsdiDescriptor& desc,
+        const OsdiNature* natures = nullptr,
+        uint32_t natureCount = 0,
+        const OsdiDiscipline* disciplines = nullptr,
+        uint32_t disciplineCount = 0,
+        const OsdiAttribute* attributes = nullptr,
+        uint32_t attributeCount = 0)
+        : natures_(natures),
+          nature_count_(natureCount),
+          disciplines_(disciplines),
+          discipline_count_(disciplineCount),
+          attributes_(attributes),
+          attribute_count_(attributeCount) {
         descriptor_name = desc.name ? desc.name : (desc.model_name ? desc.model_name : "<unnamed>");
         has_bound_step = desc.bound_step_offset != UINT32_MAX;
         has_collapsible_nodes = desc.num_collapsible != 0 && desc.collapsible != nullptr;
@@ -114,7 +135,7 @@ public:
         out << descriptor_name
             << "{nodes=" << nodes.size()
             << ",terms=" << terminal_count_
-            << ",params=" << parameters.size()
+            << ",params=" << (model_parameter_ids.size() + instance_parameter_ids.size())
             << ",inst_params=" << instance_parameter_ids.size()
             << ",opvars=" << opvar_ids.size()
             << ",jac=" << (nonzero_resistive_jacobian_entries.size() + nonzero_reactive_jacobian_entries.size());
@@ -124,6 +145,12 @@ public:
         if (has_spice_rhs) out << ",spice_rhs";
         if (has_noise) out << ",noise=" << noise_sources.size();
         if (has_collapsible_nodes) out << ",collapsible";
+        const auto natureTolerances = std::count_if(
+            nodes.begin(), nodes.end(), [](const OsdiNodeInfo& node) {
+                return std::isfinite(node.unknown_abstol) &&
+                    std::isfinite(node.residual_abstol);
+            });
+        if (natureTolerances != 0) out << ",nature_tolerances=" << natureTolerances;
         out << "}";
         return out.str();
     }
@@ -154,6 +181,12 @@ private:
             info.units = cstr(node.units);
             info.residual_units = cstr(node.residual_units);
             info.is_flow = node.is_flow;
+            if (desc.unknown_nature) info.unknown_nature = desc.unknown_nature[i];
+            if (desc.residual_nature) info.residual_nature = desc.residual_nature[i];
+            info.unknown_abstol = resolveAbstol(info.unknown_nature);
+            info.integrated_unknown_abstol = resolveIntegratedAbstol(info.unknown_nature);
+            info.residual_abstol = resolveAbstol(info.residual_nature);
+            info.integrated_residual_abstol = resolveIntegratedAbstol(info.residual_nature);
             info.has_resistive_residual = desc.load_residual_resist != nullptr && node.resist_residual_off != UINT32_MAX;
             info.has_reactive_residual = desc.load_residual_react != nullptr && node.react_residual_off != UINT32_MAX;
             if (info.has_resistive_residual) nonzero_resistive_residual_nodes.push_back(i);
@@ -165,8 +198,9 @@ private:
 
     void buildParameters(const OsdiDescriptor& desc) {
         if (!desc.param_opvar) return;
-        parameters.reserve(desc.num_params);
-        for (uint32_t id = 0; id < desc.num_params; ++id) {
+        const uint32_t total = desc.num_params + desc.num_opvars;
+        parameters.reserve(total);
+        for (uint32_t id = 0; id < total; ++id) {
             const OsdiParamOpvar& raw = desc.param_opvar[id];
             OsdiParameterInfo info;
             info.id = id;
@@ -238,6 +272,90 @@ private:
             noise_name_to_indices[normalize(info.name)].push_back(i);
             noise_sources.push_back(std::move(info));
         }
+    }
+
+    const OsdiNature* natures_ = nullptr;
+    uint32_t nature_count_ = 0;
+    const OsdiDiscipline* disciplines_ = nullptr;
+    uint32_t discipline_count_ = 0;
+    const OsdiAttribute* attributes_ = nullptr;
+    uint32_t attribute_count_ = 0;
+
+    double attributeAbstol(uint32_t start, uint32_t count) const {
+        if (!attributes_ || start >= attribute_count_) {
+            return std::numeric_limits<double>::infinity();
+        }
+        const uint32_t end = std::min(attribute_count_, start + count);
+        for (uint32_t i = start; i < end; ++i) {
+            const OsdiAttribute& attribute = attributes_[i];
+            if (!attribute.name || normalize(attribute.name) != "abstol") continue;
+            if (attribute.value_type == ATTR_TYPE_REAL) return attribute.value.real;
+            if (attribute.value_type == ATTR_TYPE_INT) {
+                return static_cast<double>(attribute.value.integer);
+            }
+        }
+        return std::numeric_limits<double>::infinity();
+    }
+
+    double resolveAbstol(OsdiNatureRef ref, uint32_t depth = 0) const {
+        if (depth > nature_count_ + discipline_count_ + 1u) {
+            return std::numeric_limits<double>::infinity();
+        }
+        if (ref.ref_type == NATREF_NATURE && natures_ && ref.index < nature_count_) {
+            const OsdiNature& nature = natures_[ref.index];
+            const double direct = attributeAbstol(nature.attr_start, nature.num_attr);
+            if (std::isfinite(direct)) return direct;
+            return resolveAbstol({nature.parent_type, nature.parent}, depth + 1u);
+        }
+        if ((ref.ref_type == NATREF_DISCIPLINE_FLOW ||
+             ref.ref_type == NATREF_DISCIPLINE_POTENTIAL) &&
+            disciplines_ && ref.index < discipline_count_) {
+            const OsdiDiscipline& discipline = disciplines_[ref.index];
+            uint32_t start = discipline.attr_start;
+            uint32_t count = discipline.num_flow_attr;
+            uint32_t nature = discipline.flow;
+            if (ref.ref_type == NATREF_DISCIPLINE_POTENTIAL) {
+                start += discipline.num_flow_attr;
+                count = discipline.num_potential_attr;
+                nature = discipline.potential;
+            }
+            const double direct = attributeAbstol(start, count);
+            if (std::isfinite(direct)) return direct;
+            if (nature != UINT32_MAX) {
+                return resolveAbstol({NATREF_NATURE, nature}, depth + 1u);
+            }
+        }
+        return std::numeric_limits<double>::infinity();
+    }
+
+    uint32_t resolveIntegratedNature(OsdiNatureRef ref, uint32_t depth = 0) const {
+        if (depth > nature_count_ + discipline_count_ + 1u) return UINT32_MAX;
+        if (ref.ref_type == NATREF_NATURE && natures_ && ref.index < nature_count_) {
+            const OsdiNature& nature = natures_[ref.index];
+            if (nature.idt != UINT32_MAX && nature.idt < nature_count_) return nature.idt;
+            return resolveIntegratedNature({nature.parent_type, nature.parent}, depth + 1u);
+        }
+        if ((ref.ref_type == NATREF_DISCIPLINE_FLOW ||
+             ref.ref_type == NATREF_DISCIPLINE_POTENTIAL) &&
+            disciplines_ && ref.index < discipline_count_) {
+            const OsdiDiscipline& discipline = disciplines_[ref.index];
+            const uint32_t nature = ref.ref_type == NATREF_DISCIPLINE_FLOW
+                ? discipline.flow
+                : discipline.potential;
+            if (nature != UINT32_MAX) {
+                return resolveIntegratedNature({NATREF_NATURE, nature}, depth + 1u);
+            }
+        }
+        return UINT32_MAX;
+    }
+
+    double resolveIntegratedAbstol(OsdiNatureRef ref) const {
+        const uint32_t integrated = resolveIntegratedNature(ref);
+        if (integrated != UINT32_MAX) {
+            const double tolerance = resolveAbstol({NATREF_NATURE, integrated});
+            if (std::isfinite(tolerance)) return tolerance;
+        }
+        return resolveAbstol(ref);
     }
 };
 

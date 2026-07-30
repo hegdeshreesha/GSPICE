@@ -1,0 +1,7 @@
+* Transient noise smoke deck
+V1 in 0 PULSE(0 1 0 1n 1n 5n 10n)
+R1 in out 1k
+C1 out 0 1p
+.OPTIONS TRAN_PROGRESS_INTERVAL=0
+.TRANNOISE 1n 5n FMAX=1e6 SEED=123 SCALE=0.01
+.END

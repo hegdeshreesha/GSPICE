@@ -12,6 +12,8 @@
 
 namespace gspice {
 
+struct NodeCollapse;
+
 enum class TransientIntegrationMethod {
     BackwardEuler,
     Trapezoidal,
@@ -40,6 +42,16 @@ struct NoiseSource {
     int nodePos = -1;
     int nodeNeg = -1;
     double currentPsd = 0.0;
+    uint32_t type = UINT32_MAX;
+    double power = 0.0;
+    double exponent = 0.0;
+};
+
+struct OperatingPointVariable {
+    std::string name;
+    std::string units;
+    std::vector<double> numericValues;
+    std::string stringValue;
 };
 
 class Device {
@@ -67,10 +79,52 @@ public:
 
     virtual bool daeAuditSafe() const { return false; }
 
+    // Some compact-model unknowns represent auxiliary flow quantities whose
+    // contributions are analysis-conditional (for example correlated-noise
+    // branches). They are part of MNA, but are not independent deterministic
+    // state variables for an OP F/Q finite-difference audit.
+    virtual bool daeAuditUnknown(int unknown) const {
+        (void)unknown;
+        return true;
+    }
+
+    // Annotate global MNA unknowns owned or referenced by this device. The
+    // simulator initializes ordinary circuit nodes as Potential and auxiliary
+    // branch equations as Flow; compact models refine hidden-node natures.
+    virtual void annotateDaeUnknowns(std::vector<DaeUnknownKind>& kinds) const {
+        (void)kinds;
+    }
+
+    virtual void annotateDaeTolerances(
+        std::vector<double>& unknownAbsolute,
+        std::vector<double>& residualAbsolute) const {
+        (void)unknownAbsolute;
+        (void)residualAbsolute;
+    }
+
+    // Publish circuit-node equivalences selected during device setup. Internal
+    // compact-model collapsing remains device-local; only equivalences between
+    // externally visible circuit terminals belong here.
+    virtual void collectNodeCollapses(std::vector<NodeCollapse>& collapses) const {
+        (void)collapses;
+    }
+
     // Compact models with stiff or noisy charge dynamics can request the
     // numerically damped AUTO branch. Smooth native devices use trapezoidal
     // integration after backward-Euler startup.
     virtual bool prefersDampedAutoTransient() const { return false; }
+
+    // Multi-rate transient is allowed to omit a device only when the omitted
+    // contribution is represented elsewhere, for example by a future cached
+    // partition stamp.  The default is deliberately conservative: removing a
+    // device's fresh stamp from Newton changes the circuit equations.
+    virtual bool canBypassTransientStampForMultirate() const { return false; }
+
+    virtual bool canCacheTransientStamp() const { return false; }
+
+    virtual void collectTransientFootprint(std::vector<int>& unknowns) const {
+        (void)unknowns;
+    }
 
     /**
      * Stamping for DC and Transient analysis (Real numbers).
@@ -112,6 +166,14 @@ public:
         const TransientContext& ctx) {
         (void)ctx;
         acceptTransientStep(x, currentTime);
+    }
+
+    // After acceptTransientStep(), devices may expose Q(x_n) for the accepted
+    // endpoint. This lets the DAE history bank commit charge history without
+    // re-evaluating an expensive compact model at the same accepted state.
+    virtual bool acceptedDaeDynamicResidual(DaeHistory& residual) const {
+        (void)residual;
+        return false;
     }
 
     // Fixed-size serialization for the simulator-owned transactional state
@@ -195,6 +257,15 @@ public:
         (void)omega;
         (void)x_dc;
         (void)sources;
+    }
+
+    // Device model operating-point variables (for example gm, gds, vth).
+    // OSDI devices populate these after a CALC_OP evaluation.
+    virtual void collectOperatingPointVariables(
+        const VectorReal& x,
+        std::vector<OperatingPointVariable>& variables) {
+        (void)x;
+        (void)variables;
     }
 
     /**

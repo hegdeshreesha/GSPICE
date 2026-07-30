@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <complex>
 
 namespace gspice {
 
@@ -39,6 +40,10 @@ public:
 
     void setAcMagnitude(double value) {
         acMagnitude_ = value;
+    }
+
+    void setAcPhaseDeg(double value) {
+        acPhaseDeg_ = value;
     }
 
     void setDcValue(double value) {
@@ -83,8 +88,11 @@ public:
     }
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
-        b.add(nodePos_, {-acMagnitude_, 0.0});
-        b.add(nodeNeg_, {acMagnitude_, 0.0});
+        const double phase = acPhaseDeg_ * PI_ / 180.0;
+        const std::complex<double> excitation{
+            acMagnitude_ * std::cos(phase), acMagnitude_ * std::sin(phase)};
+        b.add(nodePos_, -excitation);
+        b.add(nodeNeg_, excitation);
     }
 
     void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) override {
@@ -145,6 +153,7 @@ private:
     int nodeNeg_;
     double dcValue_;
     double acMagnitude_ = 1.0;
+    double acPhaseDeg_ = 0.0;
     VoltageSource::WaveformType waveformType_ = VoltageSource::WaveformType::DC;
     VoltageSource::PulseParams pulse_;
     VoltageSource::SinParams sin_;

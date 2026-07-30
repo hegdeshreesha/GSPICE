@@ -7,6 +7,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -27,6 +28,15 @@ enum class DaeAnalysis {
     HarmonicBalance
 };
 
+// Physical nature of an MNA unknown. Potential-like quantities use voltage
+// tolerances and may receive numerical gmin stabilization. Flow-like
+// quantities use current tolerances and must never receive a diagonal gmin.
+enum class DaeUnknownKind {
+    Unspecified,
+    Potential,
+    Flow
+};
+
 struct DaeRequest {
     DaeAnalysis analysis = DaeAnalysis::OperatingPoint;
     double time = 0.0;
@@ -41,6 +51,9 @@ struct DaeRequest {
     bool allowBypass = false;
     double bypassRelativeTolerance = 0.0;
     double bypassAbsoluteTolerance = 0.0;
+    double simulationGmin = std::numeric_limits<double>::quiet_NaN();
+    int newtonIteration = 0;
+    double sourceScaleFactor = 1.0;
     std::uint64_t evaluationEpoch = 0;
 };
 
@@ -63,6 +76,8 @@ struct DaeEvaluation {
     std::vector<DaeJacobianTerm> staticJacobian;
     std::vector<DaeJacobianTerm> dynamicJacobian;
     bool limitingApplied = false;
+    bool finishRequested = false;
+    bool stopRequested = false;
     bool bypassed = false;
     double maximumTimeStep = 0.0;
 
@@ -72,6 +87,8 @@ struct DaeEvaluation {
         staticJacobian.clear();
         dynamicJacobian.clear();
         limitingApplied = false;
+        finishRequested = false;
+        stopRequested = false;
         bypassed = false;
         maximumTimeStep = 0.0;
     }
@@ -93,6 +110,19 @@ struct DaeEvaluation {
             jacobianFinite(staticJacobian) && jacobianFinite(dynamicJacobian);
     }
 };
+
+// OSDI requires an iteration that invoked a limiting function to perform at
+// least one more Newton evaluation. This gate is independent of whether the
+// optional residual-norm convergence check is enabled.
+inline bool daeNewtonIterationConverged(
+    bool updateConverged,
+    bool temporaryConstraintActive,
+    bool residualCheckEnabled,
+    double residualError,
+    bool limitingApplied) {
+    if (!updateConverged || temporaryConstraintActive || limitingApplied) return false;
+    return !residualCheckEnabled || residualError <= 1.0;
+}
 
 using DaeHistory = std::vector<DaeResidualTerm>;
 

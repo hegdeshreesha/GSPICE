@@ -60,6 +60,10 @@ public:
         acMagnitude_ = value;
     }
 
+    void setAcPhaseDeg(double value) {
+        acPhaseDeg_ = value;
+    }
+
     void setDcValue(double value) {
         dcValue_ = value;
     }
@@ -129,6 +133,8 @@ public:
 
     void setBranchIndex(int index) { branchIndex_ = index; }
     int getBranchIndex() const { return branchIndex_; }
+    int getNodePos() const { return nodePos_; }
+    int getNodeNeg() const { return nodeNeg_; }
 
 private:
     static constexpr double PI_ = 3.14159265358979323846;
@@ -190,6 +196,7 @@ private:
     int nodePos_, nodeNeg_;
     double dcValue_ = 0.0;
     double acMagnitude_ = 1.0;
+    double acPhaseDeg_ = 0.0;
     int branchIndex_;
     WaveformType waveformType_ = WaveformType::DC;
     PulseParams pulse_;

@@ -17,8 +17,9 @@
 //   2. Nodes with small derivative |dx_i / dt| < tol are assigned to a SLOW
 //      rate group (timestep multiplier M_i > 1).
 //   3. Fast nodes step at Δt_fine; slow nodes step at Δt_coarse = M_i * Δt_fine.
-//   4. During intermediate fast steps, slow nodes are held constant or linearly
-//      interpolated from their previous and projected state.
+//   4. During intermediate fast steps, slow partitions may reuse cached
+//      contributions. Devices must explicitly opt in before their transient
+//      stamp is omitted; otherwise Newton always sees the complete DAE.
 //   5. If a slow node experiences an event (excitation |ΔV| > vntol), it is
 //      immediately promoted back to the FAST rate group.
 // ---------------------------------------------------------------------------

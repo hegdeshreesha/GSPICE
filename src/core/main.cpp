@@ -84,11 +84,30 @@ bool parallel_stamp_enabled(int num_devs, int matrix_size) {
 }
 
 double default_transient_max_step(const SimulationSettings& settings, double output_step) {
+    if (settings.t_max_step > 0.0) {
+        return std::max(settings.t_max_step, 1e-18);
+    }
     // Spectre/HSPICE standard: max_step is an UPPER BOUND limit for adaptive timestepping.
     // It allows step size to grow during quiescent flat regions while LTE shrinks step
     // size during active transitions/oscillations.
     const double base = (settings.t_stop > 0.0) ? (settings.t_stop / 50.0) : (output_step * 50.0);
     return std::max({base, output_step * 5.0, 1e-18});
+}
+
+VectorReal interpolate_transient_state(
+    const VectorReal& previous,
+    const VectorReal& current,
+    double previous_time,
+    double current_time,
+    double sample_time) {
+    if (current_time <= previous_time) return current;
+    const double alpha = std::clamp(
+        (sample_time - previous_time) / (current_time - previous_time), 0.0, 1.0);
+    VectorReal sample = previous;
+    for (int i = 0; i < sample.getSize(); ++i) {
+        sample[i] = previous[i] + alpha * (current[i] - previous[i]);
+    }
+    return sample;
 }
 
 
@@ -615,6 +634,18 @@ struct TransientStepResult {
     int integration_order = 1;
     long long bypassed_devices = 0;
     bool limiting_prevented_convergence = false;
+};
+
+struct TransientMatrixWorkspace {
+    explicit TransientMatrixWorkspace(int matrix_size)
+        : jacobian(matrix_size), rhs(matrix_size) {}
+
+    void setStructureCacheEnabled(bool enabled) {
+        jacobian.setStructureCacheEnabled(enabled);
+    }
+
+    SparseMatrixReal jacobian;
+    VectorReal rhs;
 };
 
 std::string transient_failure_message(
@@ -1272,7 +1303,8 @@ TransientStepResult solve_transient_step(
     double step,
     double target_time,
     const TransientIntegrationMethod* forced_method = nullptr,
-    int forced_order = 0) {
+    int forced_order = 0,
+    TransientMatrixWorkspace* matrix_workspace = nullptr) {
     bool converged = false;
     double total_stamp_seconds = 0.0;
     double total_solve_seconds = 0.0;
@@ -1295,11 +1327,16 @@ TransientStepResult solve_transient_step(
     if (settings.multirate) {
         multirate_ctrl.observe(x, target_time);
     }
+    TransientMatrixWorkspace local_matrix_workspace(matrix_size);
+    TransientMatrixWorkspace& workspace = matrix_workspace ? *matrix_workspace : local_matrix_workspace;
+    workspace.setStructureCacheEnabled(settings.transient_stamp_cache);
 
     for (int iter = 0; iter < settings.tran_max_iter; ++iter) {
         const auto stamp_start = std::chrono::steady_clock::now();
-        SparseMatrixReal J_sparse(matrix_size);
-        VectorReal b(matrix_size);
+        workspace.jacobian.clear();
+        workspace.rhs.clear();
+        SparseMatrixReal& J_sparse = workspace.jacobian;
+        VectorReal& b = workspace.rhs;
         stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
         std::vector<DaeStampStatus> stampStatus(static_cast<std::size_t>(num_devs));
         #pragma omp parallel for if(use_parallel_stamp)
@@ -1388,6 +1425,7 @@ double transient_endpoint_error(
     DeviceTransientStateArena& stateArena,
     const VectorReal& first,
     const VectorReal& second,
+    const std::vector<VectorReal>& xHistory,
     int num_nodes,
     const SimulationSettings& settings,
     double errorScale,
@@ -1395,9 +1433,32 @@ double transient_endpoint_error(
     double worst = 0.0;
     const int n = std::min(first.getSize(), second.getSize());
     const double error_scale = std::max(errorScale, 1e-12);
+    const std::string lte_reference = upper_copy(settings.tran_lte_reference);
+    double global_reference = 0.0;
+    if (lte_reference == "GLOBAL" || lte_reference == "HISTORY") {
+        for (int i = 0; i < n && i < num_nodes; ++i) {
+            global_reference = std::max(global_reference, std::abs(first[i]));
+            global_reference = std::max(global_reference, std::abs(second[i]));
+        }
+        if (lte_reference == "HISTORY") {
+            for (const auto& sample : xHistory) {
+                const int m = std::min(sample.getSize(), num_nodes);
+                for (int i = 0; i < m; ++i) {
+                    global_reference = std::max(global_reference, std::abs(sample[i]));
+                }
+            }
+        }
+    }
     for (int i = 0; i < n && i < num_nodes; ++i) {
         const double err = std::abs(second[i] - first[i]);
-        const double scale = std::max(std::abs(first[i]), std::abs(second[i]));
+        double scale = std::max(std::abs(first[i]), std::abs(second[i]));
+        if (lte_reference == "GLOBAL" || lte_reference == "HISTORY") {
+            scale = std::max(scale, global_reference);
+        } else if (lte_reference == "SIGNAL_HISTORY") {
+            for (const auto& sample : xHistory) {
+                if (i < sample.getSize()) scale = std::max(scale, std::abs(sample[i]));
+            }
+        }
         const double absolute = settings.tran_lte_abstol;
         const double relative = settings.tran_lte_reltol;
         const double tol = absolute + relative * scale;
@@ -1457,6 +1518,7 @@ double transient_lte_error(
     DeviceTransientStateArena& stateArena,
     const VectorReal& xFull,
     const VectorReal& xHalf,
+    const std::vector<VectorReal>& xHistory,
     int numNodes,
     const SimulationSettings& settings,
     int integrationOrder,
@@ -1464,7 +1526,7 @@ double transient_lte_error(
     const double richardson = std::max(
         std::pow(2.0, static_cast<double>(integrationOrder)) - 1.0, 1.0);
     return transient_endpoint_error(
-        devices, stateArena, xFull, xHalf, numNodes, settings,
+        devices, stateArena, xFull, xHalf, xHistory, numNodes, settings,
         richardson * std::max(settings.tran_trtol, 1e-12), targetTime);
 }
 
@@ -1511,7 +1573,7 @@ PredictorCorrectorEstimate predictor_corrector_lte_error(
     if (!(estimate.factor > 0.0) || !std::isfinite(estimate.factor)) return estimate;
     estimate.prediction = prediction.value;
     estimate.error = transient_endpoint_error(
-        devices, stateArena, prediction.value, corrected, numNodes, settings,
+        devices, stateArena, prediction.value, corrected, xHistory, numNodes, settings,
         std::max(settings.tran_trtol, 1e-12) / estimate.factor,
         context.currentTime);
     estimate.valid = std::isfinite(estimate.error);
@@ -1533,11 +1595,17 @@ struct SavedOutputSignal {
 std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int num_nodes) {
     const auto& settings = netlist.getSettings();
     std::vector<SavedOutputSignal> signals;
-    if (settings.save_all || settings.saves.empty()) {
+    if (settings.save_none) {
+        return signals;
+    }
+    if (settings.save_all) {
         signals.reserve(static_cast<size_t>(num_nodes));
         for (int i = 0; i < num_nodes; ++i) {
             signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1});
         }
+        return signals;
+    }
+    if (settings.saves.empty()) {
         return signals;
     }
 
@@ -1557,10 +1625,7 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
         signals.push_back({label, pos, neg});
     }
     if (signals.empty()) {
-        std::cout << "WARNING: no valid .SAVE voltage signals were resolved; writing all node voltages." << std::endl;
-        for (int i = 0; i < num_nodes; ++i) {
-            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1});
-        }
+        std::cout << "WARNING: no valid .SAVE voltage signals were resolved; writing time only." << std::endl;
     }
     return signals;
 }
@@ -1861,7 +1926,7 @@ void run_simulation(
     }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
-        "TRAN", "AC", "NOISE", "STB", "HB"
+        "TRAN", "AC", "NOISE", "STB", "PSS", "HB"
     };
     if (std::find(implemented_analyses.begin(), implemented_analyses.end(), requested_settings.type) ==
         implemented_analyses.end()) {
@@ -2675,9 +2740,20 @@ void run_simulation(
                   << " adaptive=" << (settings.tran_adaptive ? "on" : "off")
                   << " predictor=" << (settings.tran_predictor ? "on" : "off")
                   << " lte=" << (settings.tran_lte_mode == "STEPDOUBLING" ? "step-doubling" : "predictor-corrector")
+                  << " lte_reference=" << settings.tran_lte_reference
+                  << " lte_audit_interval=" << settings.tran_lte_audit_interval
+                  << " trtol=" << settings.tran_trtol
                   << " order_control=" << (settings.tran_order_adaptive ? "adaptive" : "ramp")
+                  << " stamp_cache=" << (settings.transient_stamp_cache ? "on" : "matrix-reuse")
                   << " method=" << normalized_transient_method(settings, auto_use_trapezoidal)
                   << std::endl;
+        if (settings.tran_adaptive && settings.t_max_step > 0.0 &&
+            max_step <= output_step * (1.0 + 1e-9)) {
+            std::cout << "Transient note: user maxstep/tmax is at or below the output step; "
+                      << "internal adaptive steps cannot grow beyond this ceiling. "
+                      << "Omit .TRAN tmax or use a larger MAXSTEP for faster low/medium runs."
+                      << std::endl;
+        }
         if (!tran_out.toFile()) {
             std::cout << "time | ";
             for (int i = 0; i < num_nodes; ++i) {
@@ -2694,6 +2770,7 @@ void run_simulation(
         double last_printed_time = -1.0;
         double last_progress_percent = -1.0;
         int consecutive_min_step_lte_violations = 0;
+        int recent_step_rejection_streak = 0;
         constexpr int max_min_step_lte_violations = 1024;
         double next_output = save_start;
         if (next_output <= 1e-30) {
@@ -2706,6 +2783,8 @@ void run_simulation(
             record_measure_sample(0.0, x);
         }
         double candidate_step = step;
+        TransientMatrixWorkspace transient_matrix_workspace(matrix_size);
+        transient_matrix_workspace.setStructureCacheEnabled(settings.transient_stamp_cache);
         // FIX Bug 2: track the candidate step before any breakpoint snap so we
         // can restore it after landing on a breakpoint instead of growing from
         // the artificially shrunk post-snap value.
@@ -2782,11 +2861,13 @@ void run_simulation(
                         settings, x_hist, t_hist, step, auto_use_trapezoidal);
                 TransientStepResult full = solve_transient_step(
                     devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                    x, x_hist, t_hist, step, target_time, &attempted_method, selected_order);
+                    x, x_hist, t_hist, step, target_time, &attempted_method, selected_order,
+                    &transient_matrix_workspace);
                 tran_stats.noteSolve(full);
                 if (!full.converged && step > min_step) {
                     ++tran_stats.rejected_steps;
                     ++tran_stats.convergence_rejections;
+                    ++recent_step_rejection_streak;
                     selected_order = std::max(1, selected_order - 1);
                     step = std::max(min_step, step * 0.5);
                     continue;
@@ -2836,6 +2917,7 @@ void run_simulation(
                             const double factor = transient_reject_factor(err, full.integration_order);
                             ++tran_stats.rejected_steps;
                             ++tran_stats.lte_rejections;
+                            ++recent_step_rejection_streak;
                             selected_order = std::max(1, selected_order - 1);
                             step = std::max(min_step, step * factor);
                             continue;
@@ -2889,7 +2971,8 @@ void run_simulation(
                     const double half_step = step * 0.5;
                     TransientStepResult half1 = solve_transient_step(
                         devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                        x, x_hist, t_hist, half_step, t + half_step, &attempted_method, selected_order);
+                        x, x_hist, t_hist, half_step, t + half_step, &attempted_method, selected_order,
+                        &transient_matrix_workspace);
                     tran_stats.noteSolve(half1);
                     if (!half1.converged) {
                         transient_state_arena.restore(baseline_device_states);
@@ -2897,6 +2980,7 @@ void run_simulation(
                         if (step > min_step) {
                             ++tran_stats.rejected_steps;
                             ++tran_stats.convergence_rejections;
+                            ++recent_step_rejection_streak;
                             selected_order = std::max(1, selected_order - 1);
                             step = std::max(min_step, half_step);
                             continue;
@@ -2916,7 +3000,8 @@ void run_simulation(
                     half_time_hist.push_back(t + half_step);
                     TransientStepResult half2 = solve_transient_step(
                         devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                        half1.x, half_hist, half_time_hist, half_step, target_time, &attempted_method, selected_order);
+                        half1.x, half_hist, half_time_hist, half_step, target_time, &attempted_method, selected_order,
+                        &transient_matrix_workspace);
                     tran_stats.noteSolve(half2);
                     if (!half2.converged) {
                         transient_state_arena.restore(baseline_device_states);
@@ -2924,6 +3009,7 @@ void run_simulation(
                         if (step > min_step) {
                             ++tran_stats.rejected_steps;
                             ++tran_stats.convergence_rejections;
+                            ++recent_step_rejection_streak;
                             selected_order = std::max(1, selected_order - 1);
                             step = std::max(min_step, half_step);
                             continue;
@@ -2934,7 +3020,7 @@ void run_simulation(
                     }
                     err = transient_lte_error(
                         devices, transient_state_arena, full.x, half2.x,
-                        num_nodes, settings, full.integration_order, target_time);
+                        x_hist, num_nodes, settings, full.integration_order, target_time);
                     if (pcEstimate.valid) err = std::max(err, pcEstimate.error);
                     if (err > 1.0 && step > min_step) {
                         transient_state_arena.restore(baseline_device_states);
@@ -2942,6 +3028,7 @@ void run_simulation(
                         const double factor = transient_reject_factor(err, full.integration_order);
                         ++tran_stats.rejected_steps;
                         ++tran_stats.lte_rejections;
+                        ++recent_step_rejection_streak;
                         selected_order = std::max(1, selected_order - 1);
                         step = std::max(min_step, step * factor);
                         continue;
@@ -2984,11 +3071,15 @@ void run_simulation(
                 if (err <= 1.0) consecutive_min_step_lte_violations = 0;
                 accepted = true;
             }
+            const double previous_t = t;
+            const VectorReal previous_x = x;
             t += step;
             if (settings.t_stop - t < stop_tol) {
                 t = settings.t_stop;
             }
             tran_stats.noteAccepted(step, err);
+            const int rejection_streak_before_accept = recent_step_rejection_streak;
+            recent_step_rejection_streak = 0;
             x = accepted_x;
             record_measure_sample(t, x);
             device_bound_step = collect_transient_bound_step(devices);
@@ -3045,22 +3136,28 @@ void run_simulation(
                     }
                 }
             }
-            const bool should_write = (t + output_tol >= next_output) ||
-                                      settings.save_adaptive_steps ||
-                                      is_fast_transition;
-            if (should_write) {
+            while (t + output_tol >= next_output) {
+                const VectorReal sample_x = interpolate_transient_state(
+                    previous_x, x, previous_t, t, next_output);
+                tran_out.write(next_output, sample_x, num_nodes);
+                ++tran_stats.output_points;
+                last_printed_time = next_output;
+                do {
+                    next_output += output_step;
+                } while (next_output <= last_printed_time + output_tol);
+            }
+            const bool should_write_adaptive =
+                settings.save_adaptive_steps || is_fast_transition;
+            if (should_write_adaptive && last_printed_time < t - output_tol) {
                 tran_out.write(t, x, num_nodes);
                 ++tran_stats.output_points;
                 last_printed_time = t;
-                if (t + output_tol >= next_output) {
-                    do {
-                        next_output += output_step;
-                    } while (next_output <= t + output_tol);
-                }
             }
             if (tran_out.toFile() && settings.t_stop > 0.0) {
                 const double pct = std::clamp(100.0 * t / settings.t_stop, 0.0, 100.0);
-                if (pct - last_progress_percent >= 0.1 || pct >= 100.0) {
+                if ((settings.tran_progress_interval > 0.0 &&
+                     pct - last_progress_percent >= settings.tran_progress_interval) ||
+                    pct >= 100.0) {
                     std::cout << std::fixed << std::setprecision(1)
                               << "Transient progress: " << pct << "% t="
                               << std::scientific << std::setprecision(9) << t << std::endl;
@@ -3069,23 +3166,28 @@ void run_simulation(
             }
             if (is_transient_breakpoint(breakpoints, t, bp_tol) && t > bp_tol) {
                 // FIX Bug 2 (part 2): restore the pre-breakpoint candidate step
-                // instead of resetting to 2*output_step. This preserves the
-                // momentum of step growth across discontinuity events and avoids
-                // re-collapsing against the output-interval clamp.
-                // Then apply a conservative growth factor so the method can
-                // ramp up smoothly from the restart point.
+                // as a ceiling, but grow from the accepted breakpoint step.
+                // This avoids both extremes: staying at an absurdly tiny
+                // post-breakpoint step or jumping straight back to a step that
+                // the discontinuity has just invalidated.
                 const double restored = std::min(max_step, pre_bp_candidate);
                 if (settings.tran_adaptive) {
-                    // Allow a slight growth from the restored candidate so we do
-                    // not permanently stall if the device bound forced it tiny.
-                    candidate_step = std::min(max_step, std::max(min_step, restored * 1.1));
+                    const double bp_growth = std::clamp(settings.tran_breakpoint_growth, 1.0, 20.0);
+                    candidate_step = std::min(
+                        max_step,
+                        std::max(min_step, std::min(restored, step * bp_growth)));
                 } else {
                     candidate_step = max_step;
                 }
             } else if (settings.tran_adaptive) {
-                const double max_grow = (err <= 1e-12) ? 8.0 : ((err <= 1e-6) ? 5.0 : 2.5);
+                double max_grow = (err <= 1e-12) ? 8.0 : ((err <= 1e-6) ? 5.0 : 2.5);
+                if (rejection_streak_before_accept >= 3) {
+                    max_grow = std::min(max_grow, 1.20);
+                } else if (rejection_streak_before_accept >= 1) {
+                    max_grow = std::min(max_grow, 1.50);
+                }
                 const double grow = std::clamp(proposed_growth, 1.05, max_grow);
-                candidate_step = std::min(max_step, std::max(min_step, candidate_step * grow));
+                candidate_step = std::min(max_step, std::max(min_step, step * grow));
             } else {
                 candidate_step = max_step;
             }
@@ -3246,9 +3348,435 @@ void run_simulation(
             std::cout << "  Warning: Multi-tone PSS requires finding a common periodic denominator, which can result in massive transient integration times." << std::endl;
             std::cout << "  For " << n_tones << " non-harmonically related tones, Quasi-Periodic Harmonic Balance (QPHB) is recommended." << std::endl;
         }
-        std::cout << "  Executing Shooting Method (Prototype)..." << std::endl;
-        // PSS Shooting Method stub
-        std::cout << "PSS Converged." << std::endl;
+        if (settings.f_fund.empty() || !(settings.f_fund[0] > 0.0)) {
+            throw std::runtime_error(".PSS requires a positive fundamental frequency or oscillator frequency estimate.");
+        }
+        const double initial_period = 1.0 / settings.f_fund[0];
+        const double tstab = settings.pss_tstab > 0.0
+            ? settings.pss_tstab
+            : static_cast<double>(settings.pss_autonomous
+                  ? std::max(5, settings.pss_tstab_periods)
+                  : std::max(0, settings.pss_tstab_periods)) * initial_period;
+        const double report_base_step = initial_period / static_cast<double>(std::max(16, settings.n_harms * 8));
+        const double report_max_step = settings.t_max_step > 0.0
+            ? settings.t_max_step
+            : report_base_step;
+        std::cout << std::scientific << std::setprecision(9)
+                  << "  Executing Shooting Newton PSS: mode="
+                  << (settings.pss_autonomous ? "autonomous" : "driven")
+                  << " period=" << initial_period
+                  << " tstab=" << tstab
+                  << " max_step=" << report_max_step
+                  << " residual_goal=" << settings.pss_residual_goal
+                  << " max_iter=" << settings.max_pss_iter
+                  << std::endl;
+
+        struct PssOrbitResult {
+            VectorReal end;
+            VectorReal endpoint_time_sensitivity;
+            std::vector<VectorReal> transition;
+            bool variational = false;
+            bool direct_period_sensitivity = false;
+            int variational_steps = 0;
+        };
+
+        auto identity_transition = [&](int size) {
+            std::vector<VectorReal> phi;
+            phi.reserve(static_cast<std::size_t>(size));
+            for (int col = 0; col < size; ++col) {
+                VectorReal column(size);
+                column[col] = 1.0;
+                phi.push_back(column);
+            }
+            return phi;
+        };
+
+        auto stamp_dynamic_jacobian = [&](SparseMatrixReal& dynamic, const VectorReal& state, double time) {
+            dynamic.setStructureCacheEnabled(settings.transient_stamp_cache);
+            DaeRequest request;
+            request.analysis = DaeAnalysis::Transient;
+            request.time = time;
+            request.staticResidual = false;
+            request.dynamicResidual = false;
+            request.staticJacobian = false;
+            request.dynamicJacobian = true;
+            request.readOnlyState = true;
+            request.enableLimiting = false;
+            for (const auto& device : devices) {
+                DaeEvaluation evaluation;
+                if (!device->evaluateDae(state, request, evaluation)) continue;
+                if (!evaluation.finite()) {
+                    throw std::runtime_error("non-finite value in PSS variational DAE Jacobian");
+                }
+                for (const auto& term : evaluation.dynamicJacobian) {
+                    dynamic.add(term.equation, term.unknown, term.value);
+                }
+            }
+            dynamic.getEntries();
+        };
+
+        auto multiply_sparse_vector = [&](const SparseMatrixReal& matrix, const VectorReal& vector) {
+            VectorReal result(matrix_size);
+            for (const auto& entry : matrix.getEntries()) {
+                if (entry.row < 0 || entry.row >= matrix_size ||
+                    entry.col < 0 || entry.col >= vector.getSize()) {
+                    continue;
+                }
+                result.add(entry.row, entry.value * vector[entry.col]);
+            }
+            return result;
+        };
+
+        auto integrate_pss_interval = [&](const VectorReal& start, double duration, double start_time, bool propagate_variational) {
+            PssOrbitResult orbit;
+            orbit.end = start;
+            orbit.endpoint_time_sensitivity = VectorReal(matrix_size);
+            if (propagate_variational) {
+                orbit.transition = identity_transition(matrix_size);
+                orbit.variational = true;
+            }
+            VectorReal x = start;
+            if (!(duration > 0.0)) return orbit;
+            const double base_step = duration / static_cast<double>(std::max(16, settings.n_harms * 8));
+            const double pss_max_step = settings.t_max_step > 0.0
+                ? settings.t_max_step
+                : std::max(base_step, 1e-18);
+            const double pss_min_step = std::max(pss_max_step * 1e-6, 1e-18);
+            std::vector<VectorReal> x_hist; x_hist.push_back(x);
+            std::vector<double> t_hist; t_hist.push_back(start_time);
+            DeviceTransientStateArena transient_state_arena(devices);
+            DaeTransientHistoryBank dae_history(devices, x, start_time);
+            TransientMatrixWorkspace pss_transient_matrix_workspace(matrix_size);
+            pss_transient_matrix_workspace.setStructureCacheEnabled(settings.transient_stamp_cache);
+            transient_state_arena.restoreCurrent();
+            double local_t = start_time;
+            const double stop_time = start_time + duration;
+            double candidate_step = std::min(pss_max_step, std::max(pss_min_step, base_step));
+            int selected_order = 1;
+            const double stop_tol = std::max(std::max(1e-30, std::abs(stop_time) * 1e-9), pss_min_step * 10.0);
+            while (local_t < stop_time - stop_tol) {
+                double step = std::min(candidate_step, stop_time - local_t);
+                bool accepted = false;
+                double err = 0.0;
+                int accepted_order = selected_order;
+                int proposed_next_order = selected_order;
+                double proposed_growth = 1.0;
+                const auto baseline_device_states = transient_state_arena.checkpoint();
+                const auto baseline_dae_history = dae_history.checkpoint();
+                while (!accepted) {
+                    transient_state_arena.restore(baseline_device_states);
+                    dae_history.rollback(baseline_dae_history);
+                    const double target_time = local_t + step;
+                    const TransientIntegrationMethod attempted_method =
+                        choose_transient_method(settings, x_hist, t_hist, step, true);
+                    TransientStepResult full = solve_transient_step(
+                        devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
+                        x, x_hist, t_hist, step, target_time, &attempted_method, selected_order,
+                        &pss_transient_matrix_workspace);
+                    if (!full.converged && step > pss_min_step) {
+                        step = std::max(pss_min_step, step * 0.5);
+                        selected_order = std::max(1, selected_order - 1);
+                        continue;
+                    }
+                    if (!full.converged) {
+                        throw std::runtime_error(transient_failure_message(
+                            "PSS shooting transient step failed to converge",
+                            target_time, step, full, num_nodes));
+                    }
+                    const TransientContext full_ctx = make_transient_context(
+                        settings, x_hist, t_hist, step, target_time, &attempted_method, selected_order);
+                    PredictorCorrectorEstimate pcEstimate;
+                    if (settings.tran_adaptive || settings.pss_adaptive) {
+                        pcEstimate = predictor_corrector_lte_error(
+                            devices, transient_state_arena, full.x, x_hist, t_hist,
+                            full_ctx, num_nodes, settings);
+                    }
+                    if (pcEstimate.valid) {
+                        err = pcEstimate.error;
+                        if (err > 1.0 && step > pss_min_step) {
+                            step = std::max(pss_min_step, step * transient_reject_factor(err, full.integration_order));
+                            selected_order = std::max(1, selected_order - 1);
+                            continue;
+                        }
+                    }
+                    if (propagate_variational) {
+                        SparseMatrixReal step_matrix(matrix_size);
+                        step_matrix.setStructureCacheEnabled(settings.transient_stamp_cache);
+                        VectorReal step_rhs(matrix_size);
+                        stamp_global_gmin(step_matrix, num_nodes, settings.gmin);
+                        const std::uint64_t variational_epoch = next_evaluation_epoch();
+                        for (std::size_t device_index = 0; device_index < devices.size(); ++device_index) {
+                            stamp_device_transient(
+                                *devices[device_index], device_index, dae_history,
+                                step_matrix, step_rhs, full.x, full_ctx, &settings,
+                                variational_epoch, false, true);
+                        }
+                        step_matrix.getEntries();
+                        SparseMatrixReal previous_dynamic(matrix_size);
+                        stamp_dynamic_jacobian(previous_dynamic, x, local_t);
+                        for (auto& column : orbit.transition) {
+                            VectorReal rhs = multiply_sparse_vector(previous_dynamic, column);
+                            for (int row = 0; row < rhs.getSize(); ++row) {
+                                rhs[row] *= -full_ctx.a1;
+                            }
+                            column = solve_with_refinement(
+                                step_matrix, rhs, &real_solver_context, settings.solver_refinement_steps);
+                        }
+                        ++orbit.variational_steps;
+                    }
+                    accept_device_transient_step(devices, full.x, target_time, full_ctx);
+                    dae_history.commitAccepted(devices, full.x, target_time, full_ctx);
+                    transient_state_arena.commitDeviceState();
+                    for (int i = 0; i < matrix_size; ++i) {
+                        orbit.endpoint_time_sensitivity[i] = (full.x[i] - x[i]) / std::max(step, 1e-30);
+                    }
+                    orbit.direct_period_sensitivity = true;
+                    x = full.x;
+                    local_t = target_time;
+                    accepted_order = full.integration_order;
+                    if (pcEstimate.valid) {
+                        proposed_growth = transient_growth_factor(err, accepted_order);
+                    } else {
+                        proposed_growth = 1.5;
+                    }
+                    if ((attempted_method == TransientIntegrationMethod::Bdf ||
+                         attempted_method == TransientIntegrationMethod::AdamsMoulton) &&
+                        settings.tran_order_adaptive) {
+                        if (err < 0.05 && accepted_order < settings.tran_max_order &&
+                            t_hist.size() >= static_cast<std::size_t>(accepted_order + 1)) {
+                            proposed_next_order = accepted_order + 1;
+                        } else if (err > 0.8 && accepted_order > 1) {
+                            proposed_next_order = accepted_order - 1;
+                        }
+                    }
+                    accepted = true;
+                }
+                x_hist.push_back(x);
+                t_hist.push_back(local_t);
+                while (x_hist.size() > 8) {
+                    x_hist.erase(x_hist.begin(), x_hist.begin() + 1);
+                    t_hist.erase(t_hist.begin(), t_hist.begin() + 1);
+                }
+                selected_order = std::clamp(proposed_next_order, 1, settings.tran_max_order);
+                const double grow = std::clamp(proposed_growth, 1.05, 2.5);
+                candidate_step = std::min(pss_max_step, std::max(pss_min_step, candidate_step * grow));
+            }
+            orbit.end = x;
+            return orbit;
+        };
+
+        VectorReal pss_state = x_dc;
+        double pss_time = 0.0;
+        double period = initial_period;
+        if (tstab > 0.0) {
+            std::cout << "  PSS stabilization transient..." << std::endl;
+            pss_state = integrate_pss_interval(pss_state, tstab, pss_time, false).end;
+            pss_time += tstab;
+        }
+        double residual = std::numeric_limits<double>::infinity();
+        int converged_iter = 0;
+        int shooting_newton_iterations = 0;
+        int monodromy_columns = 0;
+        int variational_steps = 0;
+        int direct_period_columns = 0;
+        int finite_difference_period_columns = 0;
+        int phase_index = -1;
+        double phase_reference = 0.0;
+        double frequency_hz = settings.f_fund[0];
+        for (int iter = 1; iter <= settings.max_pss_iter; ++iter) {
+            const VectorReal cycle_start = pss_state;
+            const double cycle_time = pss_time;
+            DeviceTransientStateArena cycle_baseline(devices);
+            auto run_cycle_from = [&](const VectorReal& start, double trial_period, bool variational) {
+                cycle_baseline.restoreCurrent();
+                return integrate_pss_interval(start, trial_period, cycle_time, variational);
+            };
+            PssOrbitResult nominal_orbit = run_cycle_from(cycle_start, period, settings.pss_continuation);
+            VectorReal cycle_end = nominal_orbit.end;
+            pss_time = cycle_time + period;
+            const auto periodic_error = worst_solution_update(cycle_end, cycle_start, num_nodes, settings);
+            pss_state = cycle_end;
+            residual = periodic_error.first;
+            if (settings.pss_autonomous && phase_index < 0) {
+                double best_swing = 0.0;
+                const int phase_limit = std::max(0, std::min(num_nodes, matrix_size));
+                for (int i = 0; i < phase_limit; ++i) {
+                    const double swing = std::abs(cycle_end[i] - cycle_start[i]);
+                    if (swing > best_swing) {
+                        best_swing = swing;
+                        phase_index = i;
+                    }
+                }
+                if (phase_index < 0 && periodic_error.second >= 0) {
+                    phase_index = periodic_error.second;
+                }
+                if (phase_index < 0) phase_index = 0;
+                phase_reference = cycle_start[phase_index];
+                std::cout << "  Autonomous PSS phase condition: unknown="
+                          << phase_index << " reference=" << phase_reference << std::endl;
+            }
+            std::cout << std::scientific << std::setprecision(9)
+                      << "PSS iteration " << iter
+                      << ": residual=" << residual
+                      << " worst_unknown=" << periodic_error.second
+                      << " period=" << period
+                      << std::endl;
+            if (residual <= settings.pss_residual_goal) {
+                converged_iter = iter;
+                break;
+            }
+            if (!settings.pss_continuation || matrix_size <= 0) {
+                continue;
+            }
+            const int shooting_size = matrix_size + (settings.pss_autonomous ? 1 : 0);
+            const int period_col = matrix_size;
+            SparseMatrixReal shooting_matrix(shooting_size);
+            shooting_matrix.setStructureCacheEnabled(settings.transient_stamp_cache);
+            VectorReal shooting_rhs(shooting_size);
+            for (int row = 0; row < matrix_size; ++row) {
+                shooting_rhs.add(row, cycle_start[row] - cycle_end[row]);
+            }
+            if (nominal_orbit.variational &&
+                static_cast<int>(nominal_orbit.transition.size()) == matrix_size) {
+                for (int col = 0; col < matrix_size; ++col) {
+                    for (int row = 0; row < matrix_size; ++row) {
+                        const double monodromy = nominal_orbit.transition[static_cast<std::size_t>(col)][row];
+                        shooting_matrix.add(row, col, monodromy - (row == col ? 1.0 : 0.0));
+                    }
+                    ++monodromy_columns;
+                }
+                variational_steps += nominal_orbit.variational_steps;
+            } else {
+                for (int col = 0; col < matrix_size; ++col) {
+                    VectorReal perturbed = cycle_start;
+                    const double abs_floor = col < num_nodes ? settings.vntol : settings.abstol;
+                    const double delta = std::max(1e-9 * std::max(1.0, std::abs(cycle_start[col])), abs_floor * 10.0);
+                    perturbed[col] += delta;
+                    VectorReal perturbed_end = run_cycle_from(perturbed, period, false).end;
+                    for (int row = 0; row < matrix_size; ++row) {
+                        const double monodromy = (perturbed_end[row] - cycle_end[row]) / delta;
+                        shooting_matrix.add(row, col, monodromy - (row == col ? 1.0 : 0.0));
+                    }
+                    ++monodromy_columns;
+                }
+            }
+            if (settings.pss_autonomous) {
+                if (nominal_orbit.direct_period_sensitivity &&
+                    nominal_orbit.endpoint_time_sensitivity.getSize() == matrix_size) {
+                    for (int row = 0; row < matrix_size; ++row) {
+                        shooting_matrix.add(row, period_col, nominal_orbit.endpoint_time_sensitivity[row]);
+                    }
+                    ++direct_period_columns;
+                } else {
+                    const double delta_period = std::max(1e-7 * period, 1e-18);
+                    VectorReal period_end = run_cycle_from(cycle_start, period + delta_period, false).end;
+                    for (int row = 0; row < matrix_size; ++row) {
+                        shooting_matrix.add(row, period_col, (period_end[row] - cycle_end[row]) / delta_period);
+                    }
+                    ++finite_difference_period_columns;
+                }
+                shooting_matrix.add(matrix_size, phase_index, 1.0);
+                shooting_rhs.add(matrix_size, phase_reference - cycle_start[phase_index]);
+                ++monodromy_columns;
+            }
+            shooting_matrix.getEntries();
+            ++shooting_newton_iterations;
+            if (!nominal_orbit.variational) {
+                variational_steps += shooting_size;
+            }
+            VectorReal correction(shooting_size);
+            try {
+                correction = solve_with_refinement(
+                    shooting_matrix, shooting_rhs, &real_solver_context, settings.solver_refinement_steps);
+            } catch (...) {
+                pss_state = run_cycle_from(cycle_start, period, false).end;
+                continue;
+            }
+            bool improved = false;
+            double best_residual = residual;
+            VectorReal best_state = pss_state;
+            double best_period = period;
+            double alpha = 1.0;
+            for (int trial = 0; trial < 5; ++trial) {
+                VectorReal candidate_start = cycle_start;
+                for (int i = 0; i < matrix_size; ++i) {
+                    candidate_start[i] += alpha * correction[i];
+                }
+                double candidate_period = period;
+                if (settings.pss_autonomous) {
+                    candidate_period += alpha * correction[period_col];
+                }
+                if (!(candidate_period > initial_period * 0.05 && candidate_period < initial_period * 20.0)) {
+                    alpha *= 0.5;
+                    continue;
+                }
+                VectorReal candidate_end = run_cycle_from(candidate_start, candidate_period, false).end;
+                const double candidate_residual =
+                    worst_solution_update(candidate_end, candidate_start, num_nodes, settings).first;
+                const double candidate_phase_error = settings.pss_autonomous
+                    ? std::abs(candidate_start[phase_index] - phase_reference) /
+                          std::max(settings.vntol + settings.reltol * std::abs(phase_reference), 1e-30)
+                    : 0.0;
+                const double candidate_merit = std::max(candidate_residual, candidate_phase_error);
+                const double best_phase_error = settings.pss_autonomous
+                    ? std::abs(cycle_start[phase_index] - phase_reference) /
+                          std::max(settings.vntol + settings.reltol * std::abs(phase_reference), 1e-30)
+                    : 0.0;
+                const double best_merit = std::max(best_residual, best_phase_error);
+                if (std::isfinite(candidate_merit) && candidate_merit < best_merit) {
+                    best_residual = candidate_residual;
+                    best_state = candidate_end;
+                    best_period = candidate_period;
+                    improved = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            if (improved) {
+                pss_state = best_state;
+                residual = best_residual;
+                period = best_period;
+                frequency_hz = 1.0 / period;
+                std::cout << std::scientific << std::setprecision(9)
+                          << "PSS Newton correction: residual=" << residual
+                          << " period=" << period
+                          << " frequency=" << frequency_hz
+                          << " damping=" << alpha
+                          << std::endl;
+                if (residual <= settings.pss_residual_goal) {
+                    converged_iter = iter;
+                    break;
+                }
+            } else {
+                pss_state = run_cycle_from(cycle_start, period, false).end;
+            }
+        }
+        if (converged_iter <= 0) {
+            throw std::runtime_error("PSS did not converge to the requested periodic residual; increase TSTAB, MAX_PSS_ITER, improve the oscillator frequency estimate, or use HB for mildly nonlinear RF circuits.");
+        }
+        x_dc = pss_state;
+        std::cout << std::scientific << std::setprecision(9)
+                  << "PSS Converged: iterations=" << converged_iter
+                  << " residual=" << residual
+                  << " period=" << period
+                  << " frequency=" << frequency_hz
+                  << std::endl;
+        std::cout << std::scientific << std::setprecision(9)
+                  << "PSS summary: oscillator=" << (settings.pss_autonomous ? "yes" : "no")
+                  << " autonomous=" << (settings.pss_autonomous ? "yes" : "no")
+                  << " tstab_seconds=" << tstab
+                  << " adaptive_orbit=" << ((settings.tran_adaptive || settings.pss_adaptive) ? "yes" : "no")
+                  << " shooting_iterations=" << converged_iter
+                  << " newton_iterations=" << shooting_newton_iterations
+                  << " monodromy_columns=" << monodromy_columns
+                  << " variational_steps=" << variational_steps
+                  << " direct_period_columns=" << direct_period_columns
+                  << " finite_difference_period_columns=" << finite_difference_period_columns
+                  << " residual=" << residual
+                  << " period=" << period
+                  << " frequency=" << frequency_hz
+                  << " phase_unknown=" << phase_index
+                  << std::endl;
     } else if (settings.type == "HB") {
         std::cout << "Starting Harmonic Balance Analysis (Multi-Tone, FFT-accelerated)..." << std::endl;
         // ----------------------------------------------------------------
@@ -3447,19 +3975,80 @@ void run_simulation(
     std::cout << "Simulation Completed Successfully." << std::endl;
 }
 
+std::string find_tools_script(const std::string& exe_path, const std::string& script_name) {
+    namespace fs = std::filesystem;
+    fs::path exe_dir = fs::absolute(fs::path(exe_path).parent_path());
+    fs::path candidates[] = {
+        exe_dir / ".." / ".." / "tools" / script_name,
+        exe_dir / ".." / "tools" / script_name,
+        exe_dir / script_name,
+        fs::path("tools") / script_name,
+    };
+    for (const auto& p : candidates) {
+        fs::path norm = p.lexically_normal();
+        if (fs::exists(norm)) return norm.string();
+    }
+    return (fs::path("tools") / script_name).string();
+}
+
 void print_usage() {
     std::cout << "Usage: gspice <input_file.sp> [options]\nOptions:\n";
-    std::cout << "  -v, --version    Display version information\n";
-    std::cout << "  -h, --help       Display this help message\n";
-    std::cout << "  -t, --threads <n> Set parallel threads (1-16, default: 1)\n";
-    std::cout << "  -o, --output <file>  Write transient results to a file\n";
-    std::cout << "  --format <raw|csv>   Select transient output format (default: extension or raw)\n";
-    std::cout << "  --capabilities       Print machine-readable capability maturity information\n";
-    std::cout << "  --self-test          Run the built-in OSDI smoke test\n";
+    std::cout << "  -v, --version            Display version information\n";
+    std::cout << "  -h, --help               Display this help message\n";
+    std::cout << "  -t, --threads <n>        Set parallel threads (1-16, default: 1)\n";
+    std::cout << "  -o, --output <file>      Write transient results to a file\n";
+    std::cout << "  --format <raw|csv>       Select transient output format (default: extension or raw)\n";
+    std::cout << "  --save <all|selected|none> Override transient waveform save mode\n";
+    std::cout << "  --adaptive-maxstep       Ignore .TRAN tmax and use adaptive LTE step ceiling\n";
+    std::cout << "  --sim-env <local|ssh>    Simulation environment (default: local)\n";
+    std::cout << "  --ssh-host <host>        Remote hostname or IP\n";
+    std::cout << "  --ssh-user <user>        SSH username\n";
+    std::cout << "  --ssh-key <file>         SSH private key path (optional)\n";
+    std::cout << "  --remote-gspice <path>   Path to gspice binary on remote\n";
+    std::cout << "  --capabilities           Print machine-readable capability maturity information\n";
+    std::cout << "  --self-test              Run the built-in OSDI smoke test\n";
+    std::cout << "\nSSH mode (-–sim-env ssh) streams the netlist via SCP, runs gspice on the\n";
+    std::cout << "remote machine, and downloads the .raw result back. Requires SSH access\n";
+    std::cout << "and Python on this machine.\n";
 }
 
 void print_capabilities() {
     std::cout << gspice::FeatureRegistry::instance().getCapabilitiesJson();
+}
+
+int run_ssh_simulation(
+    const std::string& input_file,
+    const std::string& output_file,
+    const std::string& host,
+    const std::string& user,
+    const std::string& key,
+    const std::string& remote_gspice,
+    const std::string& exe_path,
+    const std::string& save_mode_override,
+    bool adaptive_maxstep_override) {
+
+    std::string script = find_tools_script(exe_path, "gspice_ssh.py");
+    const std::string effective_output_file = output_file.empty()
+        ? (std::filesystem::path(input_file).stem().string() + ".raw")
+        : output_file;
+
+    std::string cmd = "python \"" + script + "\"";
+    cmd += " \"" + input_file + "\"";
+    cmd += " --host " + host;
+    cmd += " --user " + user;
+    if (!key.empty()) cmd += " --key \"" + key + "\"";
+    if (!remote_gspice.empty() && remote_gspice != "gspice") cmd += " --remote-gspice \"" + remote_gspice + "\"";
+    cmd += " --output \"" + effective_output_file + "\"";
+    if (!save_mode_override.empty()) cmd += " --save " + save_mode_override;
+    if (adaptive_maxstep_override) cmd += " --adaptive-maxstep";
+    cmd += " --deploy-binary";
+    if (!exe_path.empty()) cmd += " --local-binary \"" + exe_path + "\"";
+
+    int rc = std::system(cmd.c_str());
+    if (rc != 0 && rc != -1) {
+        return rc;
+    }
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -3467,7 +4056,11 @@ int main(int argc, char* argv[]) {
     std::string output_file = "";
     std::string output_format = "RAW";
     bool format_explicit = false;
+    std::string save_mode_override;
+    bool adaptive_maxstep_override = false;
     int num_threads = std::max(1, omp_get_max_threads());
+    std::string sim_env = "local";
+    std::string ssh_host, ssh_user, ssh_key, remote_gspice;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") { print_usage(); return 0; }
@@ -3498,6 +4091,53 @@ int main(int argc, char* argv[]) {
             }
             continue;
         }
+        if (arg == "--save") {
+            if (i + 1 >= argc) { std::cerr << "ERROR: --save requires all, selected, or none\n"; return 64; }
+            save_mode_override = upper_copy(argv[++i]);
+            if (save_mode_override != "ALL" && save_mode_override != "SELECTED" &&
+                save_mode_override != "NONE") {
+                std::cerr << "ERROR: --save must be all, selected, or none\n";
+                return 64;
+            }
+            continue;
+        }
+        if (arg == "--save-all") {
+            save_mode_override = "ALL";
+            continue;
+        }
+        if (arg == "--adaptive-maxstep" || arg == "--ignore-tran-tmax") {
+            adaptive_maxstep_override = true;
+            continue;
+        }
+        if (arg == "--sim-env") {
+            if (i + 1 >= argc) { std::cerr << "ERROR: --sim-env requires local or ssh\n"; return 64; }
+            sim_env = upper_copy(argv[++i]);
+            if (sim_env != "LOCAL" && sim_env != "SSH") {
+                std::cerr << "ERROR: --sim-env must be 'local' or 'ssh'\n";
+                return 64;
+            }
+            continue;
+        }
+        if (arg == "--ssh-host") {
+            if (i + 1 >= argc) { std::cerr << "ERROR: --ssh-host requires a hostname\n"; return 64; }
+            ssh_host = argv[++i];
+            continue;
+        }
+        if (arg == "--ssh-user") {
+            if (i + 1 >= argc) { std::cerr << "ERROR: --ssh-user requires a username\n"; return 64; }
+            ssh_user = argv[++i];
+            continue;
+        }
+        if (arg == "--ssh-key") {
+            if (i + 1 >= argc) { std::cerr << "ERROR: --ssh-key requires a file path\n"; return 64; }
+            ssh_key = argv[++i];
+            continue;
+        }
+        if (arg == "--remote-gspice") {
+            if (i + 1 >= argc) { std::cerr << "ERROR: --remote-gspice requires a path\n"; return 64; }
+            remote_gspice = argv[++i];
+            continue;
+        }
         if (!arg.empty() && arg[0] == '-') {
             std::cerr << "ERROR: unknown option '" << arg << "'\n";
             return 64;
@@ -3508,13 +4148,51 @@ int main(int argc, char* argv[]) {
         }
         input_file = arg;
     }
-    num_threads = std::clamp(num_threads, 1, 16);
     if (input_file.empty()) { print_usage(); return 0; }
+
+    if (sim_env == "SSH") {
+        if (ssh_host.empty()) {
+            std::cout << "Remote host: ";
+            std::getline(std::cin, ssh_host);
+        }
+        if (ssh_user.empty()) {
+            std::cout << "SSH user: ";
+            std::getline(std::cin, ssh_user);
+        }
+        if (remote_gspice.empty()) {
+            remote_gspice = "gspice";
+        }
+        return run_ssh_simulation(input_file, output_file, ssh_host, ssh_user,
+                                  ssh_key, remote_gspice, argv[0],
+                                  save_mode_override, adaptive_maxstep_override);
+    }
+
+    num_threads = std::clamp(num_threads, 1, 16);
     if (!format_explicit && !output_file.empty()) {
         std::string extension = upper_copy(std::filesystem::path(output_file).extension().string());
         if (extension == ".CSV") output_format = "CSV";
     }
     Netlist netlist = Parser::parse(input_file);
+    if (adaptive_maxstep_override || !save_mode_override.empty()) {
+        SimulationSettings settings = netlist.getSettings();
+        if (adaptive_maxstep_override) {
+            settings.ignore_tran_tmax = true;
+            settings.t_max_step = 0.0;
+        }
+        if (save_mode_override == "ALL") {
+            settings.save_all = true;
+            settings.save_none = false;
+            settings.saves.clear();
+        } else if (save_mode_override == "SELECTED") {
+            settings.save_all = false;
+            settings.save_none = false;
+        } else if (save_mode_override == "NONE") {
+            settings.save_all = false;
+            settings.save_none = true;
+            settings.saves.clear();
+        }
+        netlist.setSettings(settings);
+    }
     for (const auto& status : netlist.getModelStatus()) {
         std::cout << "MODEL_STATUS: " << status << std::endl;
     }

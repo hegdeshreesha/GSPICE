@@ -12,6 +12,7 @@
 #include <utility>
 #include "device.hpp"
 #include "osdi_loader.hpp"
+#include "osdi_model_state.hpp"
 
 namespace gspice {
 
@@ -69,24 +70,35 @@ struct SimulationSettings {
     double t_start = 0.0;
     double t_max_step = 0.0;
     double t_min_step = 0.0;
+    bool ignore_tran_tmax = false;
     bool tran_adaptive = true;
     bool tran_predictor = true;
     std::string tran_method = "AUTO";
     std::string tran_lte_mode = "PREDICTOR";
-    int tran_lte_audit_interval = 16;
+    int tran_lte_audit_interval = 0;
+    int tran_lte_charge_interval = 16;
+    std::string tran_lte_reference = "HISTORY";
+    double tran_breakpoint_growth = 4.0;
     bool tran_order_adaptive = true;
     bool tran_trap_ringing = true;
     double tran_lte_reltol = 5e-3;
     double tran_lte_abstol = 1e-6;
     double tran_trtol = 1.0;
     double chgtol = 1e-14;
+    double fluxtol = 1e-12;
     int tran_max_order = 2;
     bool save_adaptive_steps = false;
+    double tran_progress_interval = 1.0;
     double f_start = 0.0;
     double f_stop = 0.0;
     int points_per_dec = 0;
+    std::string frequency_sweep_type = "DEC";
+    double frequency_step = 0.0;
+    std::vector<double> frequency_values;
     bool use_uic = false;
     double temperature_c = 27.0;
+    double nominal_temperature_c = 27.0;
+    double geometry_scale = 1.0;
 
     // DC sweep parameters
     std::string dc_sweep_source;
@@ -124,6 +136,7 @@ struct SimulationSettings {
     double vntol = 1e-6;
     double abstol = 1e-12;
     double gmin = 1e-12;
+    double minr = 1e-12;
     int op_max_iter = 100;
     int tran_max_iter = 50;
     std::string solver_backend = "AUTO";
@@ -141,13 +154,15 @@ struct SimulationSettings {
     double nodeset_conductance = 1e6;
     bool dae_audit = false;
     double dae_audit_tolerance = 2e-4;
-    bool osdi_limiting_rhs = false;
+    bool osdi_limiting_rhs = true;
     bool osdi_tran_jacobian = false;
     bool osdi_bind_full_model_params = true;
     bool osdi_internal_nodes = true;
     bool osdi_spice_rhs = false;
+    bool osdi_output_opvars = false;
     bool fastspice = false;
     bool multirate = false;
+    bool transient_stamp_cache = true;
     bool parallel_solve = false;
     bool ticer = false;
     double ticer_fmax = 1e9;
@@ -157,15 +172,35 @@ struct SimulationSettings {
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)
     int n_harms = 0;             // Number of harmonics per tone
     int max_pss_iter = 10;       // Max shooting iterations
+    bool pss_autonomous = false; // Solve period as an unknown with a phase condition
+    double pss_tstab = 0.0;      // Stabilization/runup time before shooting
+    int pss_tstab_periods = 0;   // Stabilization/runup periods before shooting
+    bool pss_adaptive = false;   // Use adaptive transient substeps inside each PSS sample interval
+    bool pss_continuation = true;
+    int pss_continuation_steps = 3;
+    double pss_residual_goal = 1.0;
+    bool pnoise_phase_noise = false;
+    bool pnoise_jitter = false;
+    double pnoise_carrier_hz = 0.0;
 
     // Noise Parameters
     int out_node = -1;
+    std::string noise_input_source;
+    bool transient_noise = false;
+    double transient_noise_fmin = 0.0;
+    double transient_noise_fmax = 0.0;
+    double transient_noise_scale = 1.0;
+    unsigned int transient_noise_seed = 1;
+    std::string transient_noise_mode = "ZOH";
+    int transient_noise_oversample = 6;
+    int transient_noise_colored_tones_per_dec = 4;
 
     // Measurements
     std::vector<MeasureSpec> measures;
     std::vector<InitialConditionSpec> initial_conditions;
     std::vector<InitialConditionSpec> nodesets;
     bool save_all = true;
+    bool save_none = false;
     std::vector<SaveSpec> saves;
 
     // Hierarchical / Periodic Small-Signal Flags
@@ -231,6 +266,17 @@ public:
         return settings_;
     }
 
+    std::shared_ptr<OSDISharedModelState> findOsdiModelState(const std::string& modelCardName) const {
+        auto it = osdi_model_states_.find(normalizeKey(modelCardName));
+        return it == osdi_model_states_.end() ? nullptr : it->second;
+    }
+
+    void storeOsdiModelState(
+        const std::string& modelCardName,
+        std::shared_ptr<OSDISharedModelState> state) {
+        osdi_model_states_[normalizeKey(modelCardName)] = std::move(state);
+    }
+
     void addOsdiModel(const std::string& name, const std::string& path) {
         legacy_osdi_model_paths_[name] = path;
     }
@@ -251,6 +297,10 @@ public:
             if (modelName) {
                 osdi_descriptors_[modelName] = desc;
                 osdi_descriptors_[normalizeKey(modelName)] = desc;
+                if (i < metadata.size()) {
+                    osdi_metadata_.insert_or_assign(modelName, metadata[i]);
+                    osdi_metadata_.insert_or_assign(normalizeKey(modelName), metadata[i]);
+                }
                 if (!models.empty()) models += ",";
                 models += modelName;
             }
@@ -261,6 +311,10 @@ public:
         }
         model_status_.push_back(
             "OSDI_LOADED path=\"" + path + "\" models=" + (models.empty() ? "<none>" : models) +
+            " abi=" + std::to_string(loader->getVersionMajor()) + "." +
+            std::to_string(loader->getVersionMinor()) +
+            " natures=" + std::to_string(loader->getNatureCount()) +
+            " disciplines=" + std::to_string(loader->getDisciplineCount()) +
             " capabilities=" + (capabilities.empty() ? "<unknown>" : capabilities));
         osdi_loaders_.push_back(std::move(loader));
         return true;
@@ -296,6 +350,13 @@ public:
         it = osdi_descriptors_.find(normalizeKey(modelType));
         if (it != osdi_descriptors_.end()) return &it->second;
         return nullptr;
+    }
+
+    const OsdiDescriptorMetadata* findOsdiMetadata(const std::string& modelType) const {
+        auto it = osdi_metadata_.find(modelType);
+        if (it != osdi_metadata_.end()) return &it->second;
+        it = osdi_metadata_.find(normalizeKey(modelType));
+        return it != osdi_metadata_.end() ? &it->second : nullptr;
     }
 
     bool tryAutoLoadOsdiForModelType(
@@ -362,6 +423,8 @@ private:
     std::unordered_map<std::string, std::string> legacy_osdi_model_paths_;
     std::unordered_map<std::string, ModelCard> model_cards_;
     std::unordered_map<std::string, OsdiDescriptor> osdi_descriptors_;
+    std::unordered_map<std::string, OsdiDescriptorMetadata> osdi_metadata_;
+    std::unordered_map<std::string, std::shared_ptr<OSDISharedModelState>> osdi_model_states_;
     std::vector<std::string> model_status_;
     std::vector<std::string> warnings_;
     std::vector<std::string> errors_;

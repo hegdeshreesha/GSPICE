@@ -29,7 +29,7 @@ only the public baseline commit.
 | Statistical analysis | One-source Gaussian/uniform MC, optional LHS; simple corners/spec yield | Parameter/model/instance sweeps and current MC/LHS framework | Sampling and uncertainty-quantification workflows |
 | Output/API | ASCII RAW, CSV, CLI; no stable library API | ASCII/binary RAW, Python tools, linkable simulator library | Multiple output formats, C/Python/Matlab and coupling interfaces |
 | Demonstrated scale | Small regression decks; no credible large-scale claim | Published 10k-transistor and multi-million-device multiplier scaling data | Designed and validated for circuits with millions of devices and MPI |
-| Test/release maturity | 65 configured CTests on the audit host; native/OSDI DAE derivative-conservation audits, minimum-step starvation coverage, and two cross-simulator transient oracles | Broad system-test/demo tree and multi-OS CI | Large regression process; master is published after regression passes |
+| Test/release maturity | Configured CTests on the audit host; native/OSDI DAE derivative-conservation audits, minimum-step starvation coverage, analytic transient validation, and optional VACASK transient comparison | Broad system-test/demo tree and multi-OS CI | Large regression process; master is published after regression passes |
 | License | Apache-2.0 | AGPL-3.0 | GPL-3.0 |
 
 ## Where GSPICE is currently better suited
@@ -61,10 +61,11 @@ documentation, and validated large-circuit use.
 
 ## Reproducible transient baselines
 
-Run `python tools/validate_transient.py --gspice <gspice> --xyce <Xyce>
---vacask <vacask> --source .` from the repository root. On the Windows audit
-host, GSPICE 1.3 academic-beta was compared with Xyce 7.10 and the official
-VACASK 0.3.4-rc1 binary:
+Run `python tools/validate_transient.py --gspice <gspice> --vacask <vacask>
+--source .` from the repository root. The current harness does not run Xyce or
+ngspice reference jobs. On the Windows audit host, historical GSPICE 1.3
+academic-beta results were compared with Xyce 7.10 and the official VACASK
+0.3.4-rc1 binary:
 
 | Deck | Reference | Maximum absolute difference | RMS difference |
 |---|---:|---:|---:|

@@ -2,15 +2,19 @@
 #define GSPICE_OSDI_DEVICE_HPP
 
 #include "device.hpp"
+#include "circuit_topology.hpp"
 #include "osdi.h"
 #include "osdi_metadata.hpp"
+#include "osdi_model_state.hpp"
 #include "utils.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -35,15 +39,36 @@ public:
         bool useLimitingRhs = false,
         bool useTranJacobian = false,
         bool bindFullModelParams = false,
-        bool useSpiceRhs = false)
+        bool useSpiceRhs = false,
+        const OsdiDescriptorMetadata* loadedMetadata = nullptr,
+        std::shared_ptr<OSDISharedModelState> sharedModel = nullptr,
+        double simulationGmin = 1e-12,
+        double simulationMinResistance = 1e-12,
+        double nominalTemperatureC = 27.0,
+        double geometryScale = 1.0,
+        double relativeTolerance = 1e-3,
+        double voltageTolerance = 1e-6,
+        double absoluteTolerance = 1e-12,
+        double chargeTolerance = 1e-14,
+        double fluxTolerance = 1e-12)
         : Device(name),
           desc_(desc),
-          metadata_(desc),
+          metadata_(loadedMetadata ? *loadedMetadata : OsdiDescriptorMetadata(desc)),
           nodes_(nodes),
+          terminal_nodes_(nodes),
           use_limiting_rhs_(useLimitingRhs),
           use_tran_jacobian_(useTranJacobian),
           bind_full_model_params_override_(bindFullModelParams),
           use_spice_rhs_(useSpiceRhs),
+          simulation_gmin_(simulationGmin),
+          simulation_minr_(simulationMinResistance),
+          nominal_temperature_c_(nominalTemperatureC),
+          geometry_scale_(geometryScale),
+          relative_tolerance_(relativeTolerance),
+          voltage_tolerance_(voltageTolerance),
+          absolute_tolerance_(absoluteTolerance),
+          charge_tolerance_(chargeTolerance),
+          flux_tolerance_(fluxTolerance),
           temperature_k_(temperatureC + 273.15) {
         if (desc_.legacy_evaluate) {
             instance_data_ = desc_.legacy_create_instance ? desc_.legacy_create_instance(nullptr) : nullptr;
@@ -51,14 +76,37 @@ public:
         }
         validateRealOsdiDescriptor();
         bind_full_model_params_ = shouldBindFullModelParams(modelParams);
-        model_storage_.resize(wordsFor(desc_.model_size));
         instance_storage_.resize(wordsFor(desc_.instance_size));
-        model_data_ = model_storage_.empty() ? nullptr : model_storage_.data();
         instance_data_ = instance_storage_.empty() ? nullptr : instance_storage_.data();
 
-        applyParams(model_data_, modelParams, false);
-        setupModel();
-        applyParams(instance_data_, instanceParams, true);
+        const char* descriptorName = desc_.name ? desc_.name : desc_.model_name;
+        if (sharedModel) {
+            if (!sharedModel->initialized ||
+                sharedModel->model_size != desc_.model_size ||
+                sharedModel->descriptor_name != std::string(descriptorName ? descriptorName : "") ||
+                sharedModel->simulation_gmin != simulation_gmin_ ||
+                sharedModel->simulation_minr != simulation_minr_ ||
+                sharedModel->nominal_temperature_c != nominal_temperature_c_ ||
+                sharedModel->geometry_scale != geometry_scale_) {
+                throw std::runtime_error("OSDI shared model state does not match the descriptor");
+            }
+            shared_model_ = std::move(sharedModel);
+        } else {
+            shared_model_ = std::make_shared<OSDISharedModelState>();
+            shared_model_->storage.resize(wordsFor(desc_.model_size));
+            shared_model_->descriptor_name = descriptorName ? descriptorName : "";
+            shared_model_->model_size = desc_.model_size;
+            shared_model_->simulation_gmin = simulation_gmin_;
+            shared_model_->simulation_minr = simulation_minr_;
+            shared_model_->nominal_temperature_c = nominal_temperature_c_;
+            shared_model_->geometry_scale = geometry_scale_;
+            model_data_ = shared_model_->data();
+            applyParams(model_data_, modelParams, false, shared_model_->string_params);
+            setupModel();
+            shared_model_->initialized = true;
+        }
+        model_data_ = shared_model_->data();
+        applyParams(instance_data_, instanceParams, true, instance_string_params_);
         setupInstance();
         initializeStateIndexTable();
         buildNodeMapping();
@@ -70,16 +118,122 @@ public:
         read_only_snapshot_.resize(transientStateBytes());
     }
 
-    // Allocate only the uncollapsed internal OSDI unknowns after ordinary
-    // circuit nodes are known. This is the same MNA namespace used by branch
-    // currents, so hidden compact-model unknowns do not leak into waveform
-    // output and collapsed nodes never leave unused global rows behind.
+    // Reserve one global unknown for every internal descriptor node. Collapsed
+    // aliases are anchored while inactive. Keeping the reservation stable lets
+    // setup_instance change an internal collapse pattern without changing the
+    // matrix dimension or invalidating every other device's unknown indices.
     int bindInternalUnknowns(const std::function<int()>& allocateUnknown) {
         if (desc_.legacy_evaluate || internal_unknowns_bound_) return 0;
-        if (nodes_.size() < desc_.num_terminals) {
+        if (terminal_nodes_.size() < desc_.num_terminals) {
             throw std::logic_error("OSDI terminals are not bound");
         }
+        reserved_internal_unknowns_.assign(desc_.num_nodes, -2);
+        int allocated = 0;
+        for (uint32_t node = desc_.num_terminals; node < desc_.num_nodes; ++node) {
+            reserved_internal_unknowns_[node] = allocateUnknown();
+            ++allocated;
+        }
+        internal_unknowns_bound_ = true;
+        applyCollapseTopology();
+        resetTopologyDependentState();
+        return allocated;
+    }
+
+    // Re-run setup_instance after an environment or parameter update. Internal
+    // collapse changes reuse the unknown reservations above. External-terminal
+    // changes are published through collectNodeCollapses() for circuit-wide
+    // equation re-elaboration at the surrounding analysis boundary.
+    bool refreshInstanceSetupAndTopology() {
+        if (desc_.legacy_evaluate) return false;
+        const auto before = collapsePattern();
+        setupInstance();
+        initializeStateIndexTable();
+        const auto after = collapsePattern();
+        if (before == after) {
+            invalidateDaeCache();
+            return false;
+        }
+        if (internal_unknowns_bound_) {
+            applyCollapseTopology();
+            resetTopologyDependentState();
+        } else {
+            buildNodeMapping();
+            invalidateDaeCache();
+        }
+        ++topology_revision_;
+        return true;
+    }
+
+    std::uint64_t topologyRevision() const {
+        return topology_revision_;
+    }
+
+    void collectNodeCollapses(std::vector<NodeCollapse>& collapses) const override {
+        if (desc_.legacy_evaluate || desc_.num_terminals == 0 ||
+            desc_.num_collapsible == 0 || !desc_.collapsible ||
+            desc_.collapsed_offset == UINT32_MAX || !instance_data_) {
+            return;
+        }
+        std::vector<uint32_t> alias(desc_.num_nodes);
+        for (uint32_t node = 0; node < desc_.num_nodes; ++node) alias[node] = node;
+        const auto* active = reinterpret_cast<const bool*>(
+            reinterpret_cast<const unsigned char*>(instance_data_) + desc_.collapsed_offset);
+        for (uint32_t i = 0; i < desc_.num_collapsible; ++i) {
+            if (!active[i]) continue;
+            const uint32_t from = desc_.collapsible[i].node_1;
+            const uint32_t to = desc_.collapsible[i].node_2;
+            if (from < alias.size()) alias[from] = to;
+        }
+        const auto resolve = [&](uint32_t start) {
+            uint32_t current = start;
+            for (uint32_t guard = 0; guard <= desc_.num_nodes; ++guard) {
+                if (current == UINT32_MAX || current >= alias.size()) return UINT32_MAX;
+                if (alias[current] == current) return current;
+                current = alias[current];
+            }
+            throw std::runtime_error("OSDI collapsible-node cycle detected");
+        };
+        std::unordered_map<uint32_t, std::vector<int>> terminalGroups;
+        for (uint32_t terminal = 0;
+             terminal < desc_.num_terminals && terminal < terminal_nodes_.size();
+             ++terminal) {
+            terminalGroups[resolve(terminal)].push_back(terminal_nodes_[terminal]);
+        }
+        for (const auto& [root, terminals] : terminalGroups) {
+            const bool grounded = root == UINT32_MAX ||
+                std::find(terminals.begin(), terminals.end(), -1) != terminals.end();
+            int representative = -1;
+            for (int terminal : terminals) {
+                if (terminal < 0) continue;
+                if (grounded) {
+                    collapses.push_back({terminal, -1});
+                } else if (representative < 0) {
+                    representative = terminal;
+                } else if (terminal != representative) {
+                    collapses.push_back({representative, terminal});
+                }
+            }
+        }
+    }
+
+    bool reconfigureInstanceTemperature(double temperatureC) {
+        const double updated = temperatureC + 273.15;
+        if (!std::isfinite(updated) || updated <= 0.0) {
+            throw std::invalid_argument("OSDI instance temperature must be above absolute zero");
+        }
+        if (updated == temperature_k_) return false;
+        temperature_k_ = updated;
+        return refreshInstanceSetupAndTopology();
+    }
+
+private:
+    void applyCollapseTopology() {
         nodes_.resize(desc_.num_nodes, -2);
+        for (uint32_t terminal = 0;
+             terminal < desc_.num_terminals && terminal < terminal_nodes_.size();
+             ++terminal) {
+            nodes_[terminal] = terminal_nodes_[terminal];
+        }
         std::vector<uint32_t> alias(desc_.num_nodes, UINT32_MAX);
         for (uint32_t i = 0; i < desc_.num_nodes; ++i) alias[i] = i;
         if (desc_.num_collapsible && desc_.collapsible && desc_.collapsed_offset != UINT32_MAX) {
@@ -107,13 +261,13 @@ public:
         for (uint32_t terminal = 0; terminal < desc_.num_terminals; ++terminal) {
             const uint32_t root = resolve(terminal);
             if (root == UINT32_MAX) continue;
-            if (nodes_[terminal] < 0) {
-                rootUnknown[root] = -1;
-            } else if (rootUnknown.find(root) == rootUnknown.end()) {
-                rootUnknown[root] = nodes_[terminal];
-            }
+            const int terminalUnknown = nodes_[terminal] < 0 ? -1 : nodes_[terminal];
+            const auto found = rootUnknown.find(root);
+            // Circuit-wide external aliases are projected after assembly. Use
+            // one representative locally so this OSDI instance also sees the
+            // collapsed topology before the global projection is applied.
+            if (found == rootUnknown.end()) rootUnknown[root] = terminalUnknown;
         }
-        int allocated = 0;
         for (uint32_t node = 0; node < desc_.num_nodes; ++node) {
             const uint32_t root = resolve(node);
             if (root == UINT32_MAX) {
@@ -122,23 +276,33 @@ public:
             }
             auto found = rootUnknown.find(root);
             if (found == rootUnknown.end()) {
-                const int unknown = allocateUnknown();
+                if (root < desc_.num_terminals ||
+                    root >= reserved_internal_unknowns_.size() ||
+                    reserved_internal_unknowns_[root] < 0) {
+                    throw std::runtime_error(
+                        "OSDI instance '" + name_ +
+                        "' requested an invalid internal collapse root");
+                }
+                const int unknown = reserved_internal_unknowns_[root];
                 rootUnknown[root] = unknown;
                 nodes_[node] = unknown;
-                ++allocated;
             } else {
                 nodes_[node] = found->second;
             }
         }
-        internal_unknowns_bound_ = true;
         buildNodeMapping();
+    }
+
+    void resetTopologyDependentState() {
         prev_react_.assign(local_node_count_, 0.0);
         prev2_react_.assign(local_node_count_, 0.0);
         prev_react_derivative_.assign(local_node_count_, 0.0);
+        prev_react_derivative_valid_ = false;
         read_only_snapshot_.resize(transientStateBytes());
         invalidateDaeCache();
-        return allocated;
     }
+
+public:
 
     bool evaluateDae(
         const VectorReal& x,
@@ -205,15 +369,28 @@ public:
         if (requestLimiting) flags = limitingEvalFlags(flags);
 
         std::vector<double> solve = localSolveFromGlobal(x);
-        std::vector<double> scratchState;
+        scratch_state_.clear();
         double* nextState = next_state_.empty() ? nullptr : next_state_.data();
         if (request.readOnlyState && desc_.num_states != 0) {
-            scratchState.assign(desc_.num_states, 0.0);
-            nextState = scratchState.data();
+            scratch_state_.assign(desc_.num_states, 0.0);
+            nextState = scratch_state_.data();
         }
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        const char* analysisName = "op";
+        const char* analysisType = "static";
+        if (request.analysis == DaeAnalysis::Transient) {
+            analysisName = "tran";
+            analysisType = "tran";
+        } else if (request.analysis == DaeAnalysis::SmallSignal) {
+            analysisName = "ac";
+            analysisType = "ac";
+        }
+        OsdiSimParas paras = simulationParameters(
+            request.simulationGmin,
+            request.newtonIteration,
+            requestLimiting && !limiting_initialized_,
+            request.sourceScaleFactor,
+            analysisName,
+            analysisType);
         OsdiSimInfo info{
             paras,
             request.time,
@@ -224,89 +401,104 @@ public:
         };
         resetBoundStepRequest();
         const uint32_t result = desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
-        if (!request.readOnlyState) noteLimitingEval();
+        if (!request.readOnlyState && requestLimiting) noteLimitingEval();
         if ((result & EVAL_RET_FLAG_FATAL) != 0) {
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
         }
         evaluation.limitingApplied = requestLimiting && (result & EVAL_RET_FLAG_LIM) != 0;
+        evaluation.finishRequested = (result & EVAL_RET_FLAG_FINISH) != 0;
+        evaluation.stopRequested = (result & EVAL_RET_FLAG_STOP) != 0;
         evaluation.maximumTimeStep = transientBoundStep();
 
-        std::vector<double> staticResidual(local_node_count_, 0.0);
-        std::vector<double> dynamicResidual(local_node_count_, 0.0);
+        scratch_static_residual_.assign(local_node_count_, 0.0);
+        scratch_dynamic_residual_.assign(local_node_count_, 0.0);
         if (request.staticResidual && desc_.load_residual_resist) {
-            desc_.load_residual_resist(instance_data_, model_data_, staticResidual.data());
+            desc_.load_residual_resist(instance_data_, model_data_, scratch_static_residual_.data());
         }
         if (request.dynamicResidual && desc_.load_residual_react) {
-            desc_.load_residual_react(instance_data_, model_data_, dynamicResidual.data());
+            desc_.load_residual_react(instance_data_, model_data_, scratch_dynamic_residual_.data());
         }
         if (evaluation.limitingApplied && request.staticResidual && desc_.load_limit_rhs_resist) {
-            std::vector<double> correction(local_node_count_, 0.0);
-            desc_.load_limit_rhs_resist(instance_data_, model_data_, correction.data());
-            for (size_t i = 0; i < staticResidual.size(); ++i) staticResidual[i] -= correction[i];
+            scratch_limit_correction_.assign(local_node_count_, 0.0);
+            desc_.load_limit_rhs_resist(instance_data_, model_data_, scratch_limit_correction_.data());
+            for (size_t i = 0; i < scratch_static_residual_.size(); ++i) {
+                scratch_static_residual_[i] -= scratch_limit_correction_[i];
+            }
         }
         if (evaluation.limitingApplied && request.dynamicResidual && desc_.load_limit_rhs_react) {
-            std::vector<double> correction(local_node_count_, 0.0);
-            desc_.load_limit_rhs_react(instance_data_, model_data_, correction.data());
-            for (size_t i = 0; i < dynamicResidual.size(); ++i) dynamicResidual[i] -= correction[i];
+            scratch_limit_correction_.assign(local_node_count_, 0.0);
+            desc_.load_limit_rhs_react(instance_data_, model_data_, scratch_limit_correction_.data());
+            for (size_t i = 0; i < scratch_dynamic_residual_.size(); ++i) {
+                scratch_dynamic_residual_[i] -= scratch_limit_correction_[i];
+            }
         }
         double staticGroundResidual = 0.0;
         double dynamicGroundResidual = 0.0;
-        bool hasGroundTerminal = false;
-        for (uint32_t terminal = 0;
-             terminal < desc_.num_terminals && terminal < node_mapping_.size();
-             ++terminal) {
-            hasGroundTerminal = hasGroundTerminal || node_mapping_[terminal] == 0;
+        if (request.staticResidual) {
+            evaluation.staticResidual.reserve(local_node_count_ + inactive_global_nodes_.size() + 1);
+        }
+        if (request.dynamicResidual) {
+            evaluation.dynamicResidual.reserve(local_node_count_ + 1);
         }
         for (uint32_t local = 1; local < local_node_count_; ++local) {
             const int equation = globalNodeForLocal(local);
             if (equation < 0) continue;
+            const bool flowEquation = localIsFlow(local);
             if (request.staticResidual) {
-                evaluation.staticResidual.push_back({equation, staticResidual[local]});
-                staticGroundResidual -= staticResidual[local];
+                evaluation.staticResidual.push_back({equation, scratch_static_residual_[local]});
+                if (!flowEquation) staticGroundResidual -= scratch_static_residual_[local];
             }
             if (request.dynamicResidual) {
-                evaluation.dynamicResidual.push_back({equation, dynamicResidual[local], 0});
-                dynamicGroundResidual -= dynamicResidual[local];
+                const int conservationGroup = flowEquation ? -1 : 0;
+                evaluation.dynamicResidual.push_back(
+                    {equation, scratch_dynamic_residual_[local], conservationGroup});
+                if (!flowEquation) dynamicGroundResidual -= scratch_dynamic_residual_[local];
             }
         }
         // OSDI reserves local node zero for ground, but residual loaders do not
-        // need to materialize its discarded MNA row. Reconstruct that row for
-        // conservation/derivative audits; normal stamping ignores equation -1.
-        if (request.staticResidual && hasGroundTerminal) {
+        // materialize its discarded MNA row. Reconstruct it even when ground
+        // is only used by an internal branch and is not an explicit terminal.
+        // Normal MNA stamping ignores equation -1.
+        if (request.staticResidual) {
             evaluation.staticResidual.push_back({-1, staticGroundResidual});
         }
-        if (request.dynamicResidual && hasGroundTerminal) {
+        if (request.dynamicResidual) {
             evaluation.dynamicResidual.push_back({-1, dynamicGroundResidual, 0});
         }
 
-        std::vector<double> staticJacobian(
+        scratch_static_jacobian_.assign(
             std::max<uint32_t>(desc_.num_resistive_jacobian_entries, 1), 0.0);
-        std::vector<double> dynamicJacobian(
+        scratch_dynamic_jacobian_.assign(
             std::max<uint32_t>(desc_.num_reactive_jacobian_entries, 1), 0.0);
         bool haveStaticJacobian = false;
         bool haveDynamicJacobian = false;
         if (request.staticJacobian && desc_.write_jacobian_array_resist) {
-            desc_.write_jacobian_array_resist(instance_data_, model_data_, staticJacobian.data());
+            desc_.write_jacobian_array_resist(instance_data_, model_data_, scratch_static_jacobian_.data());
             haveStaticJacobian = true;
         } else if (request.staticJacobian && desc_.load_jacobian_resist &&
                    desc_.jacobian_ptr_resist_offset != UINT32_MAX) {
-            populateJacobianPointers(staticJacobian);
+            populateJacobianPointers(scratch_static_jacobian_);
             desc_.load_jacobian_resist(instance_data_, model_data_);
             haveStaticJacobian = true;
         }
         if (request.dynamicJacobian && desc_.write_jacobian_array_react) {
-            desc_.write_jacobian_array_react(instance_data_, model_data_, dynamicJacobian.data());
+            desc_.write_jacobian_array_react(instance_data_, model_data_, scratch_dynamic_jacobian_.data());
             haveDynamicJacobian = true;
         } else if (request.dynamicJacobian && desc_.load_jacobian_react) {
-            populateReactiveJacobianPointers(dynamicJacobian);
+            populateReactiveJacobianPointers(scratch_dynamic_jacobian_);
             desc_.load_jacobian_react(instance_data_, model_data_, 1.0);
             haveDynamicJacobian = true;
         }
 
         size_t staticIndex = 0;
         size_t dynamicIndex = 0;
-        std::unordered_map<int, double> staticGroundJacobian;
-        std::unordered_map<int, double> dynamicGroundJacobian;
+        if (request.staticJacobian) {
+            evaluation.staticJacobian.reserve(
+                desc_.num_jacobian_entries + inactive_global_nodes_.size());
+        }
+        if (request.dynamicJacobian) {
+            evaluation.dynamicJacobian.reserve(desc_.num_jacobian_entries);
+        }
         for (uint32_t e = 0; e < desc_.num_jacobian_entries; ++e) {
             const OsdiJacobianEntry& entry = desc_.jacobian_entries[e];
             const bool hasStatic = (entry.flags & JACOBIAN_ENTRY_RESIST) != 0;
@@ -314,14 +506,14 @@ public:
             double staticValue = 0.0;
             double dynamicValue = 0.0;
             if (hasStatic) {
-                if (haveStaticJacobian && staticIndex < staticJacobian.size()) {
-                    staticValue = staticJacobian[staticIndex];
+                if (haveStaticJacobian && staticIndex < scratch_static_jacobian_.size()) {
+                    staticValue = scratch_static_jacobian_[staticIndex];
                 }
                 ++staticIndex;
             }
             if (hasDynamic) {
-                if (haveDynamicJacobian && dynamicIndex < dynamicJacobian.size()) {
-                    dynamicValue = dynamicJacobian[dynamicIndex];
+                if (haveDynamicJacobian && dynamicIndex < scratch_dynamic_jacobian_.size()) {
+                    dynamicValue = scratch_dynamic_jacobian_[dynamicIndex];
                 }
                 ++dynamicIndex;
             }
@@ -332,23 +524,18 @@ public:
             const int equation = globalNodeForLocal(rowLocal);
             const int unknown = globalNodeForLocal(columnLocal);
             if (rowLocal == 0 || equation < 0 || unknown < 0) continue;
+            const bool flowEquation = localIsFlow(rowLocal);
             if (request.staticJacobian && hasStatic && staticValue != 0.0) {
                 evaluation.staticJacobian.push_back({equation, unknown, staticValue});
-                staticGroundJacobian[unknown] -= staticValue;
+                if (!flowEquation) evaluation.staticJacobian.push_back({-1, unknown, -staticValue});
             }
             if (request.dynamicJacobian && hasDynamic && dynamicValue != 0.0) {
-                evaluation.dynamicJacobian.push_back({equation, unknown, dynamicValue, 0});
-                dynamicGroundJacobian[unknown] -= dynamicValue;
-            }
-        }
-        if (request.staticJacobian && hasGroundTerminal) {
-            for (const auto& entry : staticGroundJacobian) {
-                evaluation.staticJacobian.push_back({-1, entry.first, entry.second});
-            }
-        }
-        if (request.dynamicJacobian && hasGroundTerminal) {
-            for (const auto& entry : dynamicGroundJacobian) {
-                evaluation.dynamicJacobian.push_back({-1, entry.first, entry.second, 0});
+                const int conservationGroup = flowEquation ? -1 : 0;
+                evaluation.dynamicJacobian.push_back(
+                    {equation, unknown, dynamicValue, conservationGroup});
+                if (!flowEquation) {
+                    evaluation.dynamicJacobian.push_back({-1, unknown, -dynamicValue, 0});
+                }
             }
         }
         // Collapsed descriptor nodes may already have been allocated as hidden
@@ -369,7 +556,67 @@ public:
         return !desc_.legacy_evaluate && desc_.eval && !use_spice_rhs_;
     }
 
+    bool daeAuditUnknown(int unknown) const override {
+        return !globalIsFlow(unknown);
+    }
+
+    void annotateDaeUnknowns(std::vector<DaeUnknownKind>& kinds) const override {
+        for (uint32_t i = 0; i < node_mapping_.size() && i < nodes_.size(); ++i) {
+            const int global = nodes_[i];
+            if (global < 0 || global >= static_cast<int>(kinds.size()) || !desc_.nodes) continue;
+            const DaeUnknownKind candidate = descriptorNodeIsFlow(i)
+                ? DaeUnknownKind::Flow
+                : DaeUnknownKind::Potential;
+            DaeUnknownKind& current = kinds[static_cast<std::size_t>(global)];
+            if (current == DaeUnknownKind::Unspecified || current == candidate) {
+                current = candidate;
+            } else if (candidate == DaeUnknownKind::Potential) {
+                // A collapsed alias shared with an electrical terminal remains
+                // a potential unknown even if an auxiliary flow descriptor
+                // points at the same global index.
+                current = DaeUnknownKind::Potential;
+            }
+        }
+    }
+
+    void annotateDaeTolerances(
+        std::vector<double>& unknownAbsolute,
+        std::vector<double>& residualAbsolute) const override {
+        for (uint32_t i = 0; i < node_mapping_.size() &&
+             i < nodes_.size() && i < metadata_.nodes.size(); ++i) {
+            const int global = nodes_[i];
+            if (global < 0 || global >= static_cast<int>(unknownAbsolute.size()) ||
+                global >= static_cast<int>(residualAbsolute.size())) {
+                continue;
+            }
+            const OsdiNodeInfo& node = metadata_.nodes[i];
+            if (std::isfinite(node.unknown_abstol) && node.unknown_abstol > 0.0) {
+                unknownAbsolute[static_cast<std::size_t>(global)] = std::min(
+                    unknownAbsolute[static_cast<std::size_t>(global)],
+                    node.unknown_abstol);
+            }
+            if (std::isfinite(node.residual_abstol) && node.residual_abstol > 0.0) {
+                residualAbsolute[static_cast<std::size_t>(global)] = std::min(
+                    residualAbsolute[static_cast<std::size_t>(global)],
+                    node.residual_abstol);
+            }
+        }
+    }
+
     bool prefersDampedAutoTransient() const override { return true; }
+
+    bool canCacheTransientStamp() const override {
+        return !metadata_.has_bound_step && !metadata_.uses_abstime;
+    }
+
+    void collectTransientFootprint(std::vector<int>& unknowns) const override {
+        unknowns.reserve(unknowns.size() + nodes_.size());
+        for (int node : nodes_) {
+            if (node >= 0 && std::find(unknowns.begin(), unknowns.end(), node) == unknowns.end()) {
+                unknowns.push_back(node);
+            }
+        }
+    }
 
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         if (desc_.legacy_evaluate) {
@@ -401,9 +648,7 @@ public:
             solve[local] = nodes_[i] >= 0 ? x[nodes_[i]] : 0.0;
         }
 
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimParas paras = simulationParameters(simulation_gmin_);
         OsdiSimInfo info{
             paras,
             currentTime,
@@ -526,9 +771,7 @@ public:
         if (!desc_.eval) return;
 
         std::vector<double> solve = localSolveFromGlobal(x_dc);
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimParas paras = simulationParameters(simulation_gmin_);
         OsdiSimInfo info{
             paras,
             0.0,
@@ -592,9 +835,7 @@ public:
     void collectNoiseSources(double omega, const VectorReal& x_dc, std::vector<NoiseSource>& sources) const override {
         if (desc_.legacy_evaluate || !desc_.load_noise || desc_.num_noise_src == 0 || !desc_.noise_sources) return;
         std::vector<double> solve = localSolveFromGlobal(x_dc);
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimParas paras = simulationParameters(simulation_gmin_);
         std::vector<double> prevState = prev_state_;
         std::vector<double> scratchState(desc_.num_states, 0.0);
         OsdiSimInfo info{
@@ -610,15 +851,31 @@ public:
             throw std::runtime_error("OSDI device '" + name_ + "' aborted with $fatal");
         }
         std::vector<double> densities(desc_.num_noise_src, 0.0);
+        std::vector<double> powers(desc_.num_noise_src, 0.0);
+        std::vector<double> exponents(desc_.num_noise_src, 0.0);
         const double freq = std::max(omega / (2.0 * 3.14159265358979323846), 0.0);
         desc_.load_noise(instance_data_, model_data_, freq, densities.data());
+        if (desc_.load_noise_params) {
+            desc_.load_noise_params(
+                instance_data_, model_data_, powers.data(), exponents.data());
+        }
         for (uint32_t i = 0; i < desc_.num_noise_src; ++i) {
             if (densities[i] <= 0.0) continue;
             const int nodePos = globalNodeForDescriptorNode(desc_.noise_sources[i].nodes.node_1);
             const int nodeNeg = globalNodeForDescriptorNode(desc_.noise_sources[i].nodes.node_2);
             if (nodePos < 0 && nodeNeg < 0) continue;
             const char* noiseName = desc_.noise_sources[i].name ? desc_.noise_sources[i].name : "noise";
-            sources.push_back({name_ + "." + noiseName, nodePos, nodeNeg, densities[i]});
+            const uint32_t noiseType = desc_.noise_source_type
+                ? desc_.noise_source_type[i]
+                : UINT32_MAX;
+            sources.push_back({
+                name_ + "." + noiseName,
+                nodePos,
+                nodeNeg,
+                densities[i],
+                noiseType,
+                powers[i],
+                exponents[i]});
         }
     }
 
@@ -636,39 +893,67 @@ public:
             prev_state_ = next_state_;
         }
         if (!desc_.legacy_evaluate && desc_.load_residual_react && ctx.timeStep > 0.0) {
-            std::vector<double> reactNow(local_node_count_, 0.0);
-            if (loadReactiveResidualAt(x, currentTime, reactNow)) {
-                std::vector<double> deriv(local_node_count_, 0.0);
+            accept_react_now_.assign(local_node_count_, 0.0);
+            if (loadReactiveResidualAt(x, currentTime, accept_react_now_)) {
+                accept_react_derivative_.assign(local_node_count_, 0.0);
                 const bool useTrap =
                     ctx.method == TransientIntegrationMethod::Trapezoidal &&
                     prev_react_derivative_valid_ &&
-                    prev_react_.size() == reactNow.size();
+                    prev_react_.size() == accept_react_now_.size();
                 const bool useSecond =
                     ctx.hasSecondHistory &&
-                    prev_react_.size() == reactNow.size() &&
-                    prev2_react_.size() == reactNow.size();
+                    prev_react_.size() == accept_react_now_.size() &&
+                    prev2_react_.size() == accept_react_now_.size();
                 if (useTrap) {
-                    for (size_t i = 0; i < reactNow.size(); ++i) {
-                        deriv[i] = ctx.a0 * reactNow[i] + ctx.a1 * prev_react_[i] - prev_react_derivative_[i];
+                    for (size_t i = 0; i < accept_react_now_.size(); ++i) {
+                        accept_react_derivative_[i] =
+                            ctx.a0 * accept_react_now_[i] +
+                            ctx.a1 * prev_react_[i] -
+                            prev_react_derivative_[i];
                     }
                 } else if (useSecond) {
-                    for (size_t i = 0; i < reactNow.size(); ++i) {
-                        deriv[i] = ctx.a0 * reactNow[i] + ctx.a1 * prev_react_[i] + ctx.a2 * prev2_react_[i];
+                    for (size_t i = 0; i < accept_react_now_.size(); ++i) {
+                        accept_react_derivative_[i] =
+                            ctx.a0 * accept_react_now_[i] +
+                            ctx.a1 * prev_react_[i] +
+                            ctx.a2 * prev2_react_[i];
                     }
                 } else {
                     const double alpha = 1.0 / ctx.timeStep;
-                    for (size_t i = 0; i < reactNow.size(); ++i) {
-                        const double prev = prev_react_.size() == reactNow.size() ? prev_react_[i] : reactNow[i];
-                        deriv[i] = alpha * (reactNow[i] - prev);
+                    for (size_t i = 0; i < accept_react_now_.size(); ++i) {
+                        const double prev = prev_react_.size() == accept_react_now_.size()
+                            ? prev_react_[i]
+                            : accept_react_now_[i];
+                        accept_react_derivative_[i] = alpha * (accept_react_now_[i] - prev);
                     }
                 }
                 prev2_react_ = prev_react_;
-                prev_react_ = reactNow;
-                prev_react_derivative_ = deriv;
+                prev_react_.swap(accept_react_now_);
+                prev_react_derivative_.swap(accept_react_derivative_);
                 prev_react_derivative_valid_ = true;
             }
         }
         invalidateDaeCache();
+    }
+
+    bool acceptedDaeDynamicResidual(DaeHistory& residual) const override {
+        residual.clear();
+        if (desc_.legacy_evaluate || !desc_.load_residual_react ||
+            prev_react_.size() != local_node_count_) {
+            return false;
+        }
+        residual.reserve(local_node_count_ + 1);
+        double dynamicGroundResidual = 0.0;
+        for (uint32_t local = 1; local < local_node_count_; ++local) {
+            const int equation = globalNodeForLocal(local);
+            if (equation < 0) continue;
+            const bool flowEquation = localIsFlow(local);
+            const int conservationGroup = flowEquation ? -1 : 0;
+            residual.push_back({equation, prev_react_[local], conservationGroup});
+            if (!flowEquation) dynamicGroundResidual -= prev_react_[local];
+        }
+        residual.push_back({-1, dynamicGroundResidual, 0});
+        return true;
     }
 
     void limitTransientNewton(const VectorReal& previous, VectorReal& candidate) const override {
@@ -711,8 +996,7 @@ public:
     }
 
     std::size_t transientStateBytes() const override {
-        return model_storage_.size() * sizeof(std::max_align_t) +
-            instance_storage_.size() * sizeof(std::max_align_t) +
+        return instance_storage_.size() * sizeof(std::max_align_t) +
             (prev_state_.size() + next_state_.size() + prev_react_.size() +
              prev2_react_.size() + prev_react_derivative_.size()) * sizeof(double) +
             2 * sizeof(std::uint8_t);
@@ -725,7 +1009,6 @@ public:
             if (bytes != 0) std::memcpy(destination + offset, source, bytes);
             offset += bytes;
         };
-        write(model_storage_.data(), model_storage_.size() * sizeof(std::max_align_t));
         write(instance_storage_.data(), instance_storage_.size() * sizeof(std::max_align_t));
         write(prev_state_.data(), prev_state_.size() * sizeof(double));
         write(next_state_.data(), next_state_.size() * sizeof(double));
@@ -745,7 +1028,6 @@ public:
             if (bytes != 0) std::memcpy(destination, source + offset, bytes);
             offset += bytes;
         };
-        read(model_storage_.data(), model_storage_.size() * sizeof(std::max_align_t));
         read(instance_storage_.data(), instance_storage_.size() * sizeof(std::max_align_t));
         read(prev_state_.data(), prev_state_.size() * sizeof(double));
         read(next_state_.data(), next_state_.size() * sizeof(double));
@@ -763,6 +1045,10 @@ public:
 
     const OsdiDescriptorMetadata& metadata() const {
         return metadata_;
+    }
+
+    std::shared_ptr<OSDISharedModelState> sharedModelState() const {
+        return shared_model_;
     }
 
     std::vector<std::string> getOpvarNames() const {
@@ -796,6 +1082,63 @@ public:
         return false;
     }
 
+    void collectOperatingPointVariables(
+        const VectorReal& x,
+        std::vector<OperatingPointVariable>& variables) override {
+        if (desc_.legacy_evaluate || !desc_.eval || !desc_.access ||
+            metadata_.opvar_ids.empty()) {
+            return;
+        }
+        std::vector<double> solve = localSolveFromGlobal(x);
+        std::vector<double> scratchState(desc_.num_states, 0.0);
+        OsdiSimParas paras = simulationParameters(
+            simulation_gmin_, 0, false, 1.0, "op", "static");
+        OsdiSimInfo info{
+            paras,
+            0.0,
+            solve.data(),
+            prev_state_.empty() ? nullptr : prev_state_.data(),
+            scratchState.empty() ? nullptr : scratchState.data(),
+            CALC_OP | CALC_RESIST_RESIDUAL | ANALYSIS_DC | ANALYSIS_STATIC};
+        const uint32_t result =
+            desc_.eval(osdiHandle(), instance_data_, model_data_, &info);
+        if ((result & EVAL_RET_FLAG_FATAL) != 0) {
+            throw std::runtime_error(
+                "OSDI device '" + name_ +
+                "' aborted while evaluating operating-point variables");
+        }
+
+        for (uint32_t id : metadata_.opvar_ids) {
+            if (id >= metadata_.parameters.size()) continue;
+            const OsdiParameterInfo& parameter = metadata_.parameters[id];
+            void* raw = desc_.access(
+                instance_data_, model_data_, id,
+                ACCESS_FLAG_READ | ACCESS_FLAG_INSTANCE);
+            if (!raw) continue;
+            OperatingPointVariable variable;
+            variable.name = name_ + "." + parameter.canonical_name;
+            variable.units = parameter.units;
+            const std::size_t length = std::max<std::size_t>(parameter.length, 1);
+            if (parameter.type == OsdiValueType::Real) {
+                const auto* values = reinterpret_cast<const double*>(raw);
+                variable.numericValues.assign(values, values + length);
+            } else if (parameter.type == OsdiValueType::Integer) {
+                const auto* values = reinterpret_cast<const int32_t*>(raw);
+                variable.numericValues.reserve(length);
+                for (std::size_t i = 0; i < length; ++i) {
+                    variable.numericValues.push_back(
+                        static_cast<double>(values[i]));
+                }
+            } else {
+                const char* const* value =
+                    reinterpret_cast<const char* const*>(raw);
+                if (value && *value) variable.stringValue = *value;
+            }
+            variables.push_back(std::move(variable));
+        }
+        invalidateDaeCache();
+    }
+
     double boundStep() const {
         if (!instance_data_ || desc_.bound_step_offset == UINT32_MAX) return 0.0;
         const auto* raw = reinterpret_cast<const double*>(
@@ -812,19 +1155,31 @@ private:
     OsdiDescriptor desc_{};
     OsdiDescriptorMetadata metadata_;
     std::vector<int> nodes_;
-    std::vector<std::max_align_t> model_storage_;
+    std::vector<int> terminal_nodes_;
+    std::vector<int> reserved_internal_unknowns_;
+    std::shared_ptr<OSDISharedModelState> shared_model_;
     std::vector<std::max_align_t> instance_storage_;
     void* model_data_ = nullptr;
     void* instance_data_ = nullptr;
     std::vector<uint32_t> node_mapping_;
     std::vector<int> inactive_global_nodes_;
     size_t local_node_count_ = 0;
-    std::vector<std::unique_ptr<char[]>> string_params_;
+    std::vector<std::unique_ptr<char[]>> instance_string_params_;
     std::vector<double> prev_state_;
     std::vector<double> next_state_;
     std::vector<double> prev_react_;
     std::vector<double> prev2_react_;
     std::vector<double> prev_react_derivative_;
+    std::vector<double> scratch_state_;
+    std::vector<double> scratch_static_residual_;
+    std::vector<double> scratch_dynamic_residual_;
+    std::vector<double> scratch_limit_correction_;
+    std::vector<double> scratch_static_jacobian_;
+    std::vector<double> scratch_dynamic_jacobian_;
+    std::vector<double> accept_react_now_;
+    std::vector<double> accept_react_derivative_;
+    std::vector<double> scratch_reactive_solve_;
+    std::vector<double> scratch_reactive_state_;
     std::vector<std::byte> read_only_snapshot_;
     bool prev_react_derivative_valid_ = false;
     bool bind_full_model_params_ = false;
@@ -834,7 +1189,44 @@ private:
     bool use_spice_rhs_ = false;
     bool limiting_initialized_ = false;
     bool internal_unknowns_bound_ = false;
+    std::uint64_t topology_revision_ = 0;
+    double simulation_gmin_ = 1e-12;
+    double simulation_minr_ = 1e-12;
+    double nominal_temperature_c_ = 27.0;
+    double geometry_scale_ = 1.0;
+    double relative_tolerance_ = 1e-3;
+    double voltage_tolerance_ = 1e-6;
+    double absolute_tolerance_ = 1e-12;
+    double charge_tolerance_ = 1e-14;
+    double flux_tolerance_ = 1e-12;
     double temperature_k_ = 300.15;
+    mutable std::array<char*, 16> simparam_names_{
+        const_cast<char*>("iniLim"),
+        const_cast<char*>("gmin"),
+        const_cast<char*>("gdev"),
+        const_cast<char*>("tnom"),
+        const_cast<char*>("minr"),
+        const_cast<char*>("scale"),
+        const_cast<char*>("iteration"),
+        const_cast<char*>("simulatorVersion"),
+        const_cast<char*>("simulatorSubversion"),
+        const_cast<char*>("sourceScaleFactor"),
+        const_cast<char*>("reltol"),
+        const_cast<char*>("vntol"),
+        const_cast<char*>("abstol"),
+        const_cast<char*>("chgtol"),
+        const_cast<char*>("fluxtol"),
+        nullptr};
+    mutable std::array<double, 15> simparam_values_{};
+    mutable std::array<char*, 4> simparam_string_names_{
+        const_cast<char*>("analysis_name"),
+        const_cast<char*>("analysis_type"),
+        const_cast<char*>("cwd"),
+        nullptr};
+    mutable std::array<char*, 4> simparam_string_values_{nullptr, nullptr, nullptr, nullptr};
+    mutable std::string simparam_analysis_name_ = "setup";
+    mutable std::string simparam_analysis_type_ = "static";
+    mutable std::string simparam_cwd_ = std::filesystem::current_path().string();
     bool dae_cache_valid_ = false;
     DaeRequest cached_dae_request_{};
     DaeEvaluation cached_dae_evaluation_{};
@@ -911,21 +1303,44 @@ private:
     }
 
     void setupModel() {
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimParas paras = simulationParameters(
+            simulation_gmin_, 0, true, 1.0, "setup_model", "static");
         OsdiInitInfo res{0, 0, nullptr};
         desc_.setup_model(osdiHandle(), model_data_, &paras, &res);
         checkInitResult(res, "model");
     }
 
     void setupInstance() {
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        if (instance_data_ && desc_.num_collapsible != 0 &&
+            desc_.collapsed_offset != UINT32_MAX) {
+            auto* collapsed = reinterpret_cast<bool*>(
+                reinterpret_cast<unsigned char*>(instance_data_) +
+                desc_.collapsed_offset);
+            std::fill(
+                collapsed,
+                collapsed + desc_.num_collapsible,
+                false);
+        }
+        OsdiSimParas paras = simulationParameters(
+            simulation_gmin_, 0, true, 1.0, "setup_instance", "static");
         OsdiInitInfo res{0, 0, nullptr};
         desc_.setup_instance(osdiHandle(), instance_data_, model_data_, temperature_k_, desc_.num_terminals, &paras, &res);
         checkInitResult(res, "instance");
+    }
+
+    std::vector<bool> collapsePattern() const {
+        std::vector<bool> pattern(desc_.num_collapsible, false);
+        if (!instance_data_ || desc_.num_collapsible == 0 ||
+            desc_.collapsed_offset == UINT32_MAX) {
+            return pattern;
+        }
+        const auto* collapsed = reinterpret_cast<const bool*>(
+            reinterpret_cast<const unsigned char*>(instance_data_) +
+            desc_.collapsed_offset);
+        for (uint32_t i = 0; i < desc_.num_collapsible; ++i) {
+            pattern[i] = collapsed[i];
+        }
+        return pattern;
     }
 
     void initializeStateIndexTable() {
@@ -964,11 +1379,40 @@ private:
             throw std::runtime_error("OSDI " + stage + " setup aborted with $fatal");
         }
         if (res.num_errors != 0) {
-            throw std::runtime_error("OSDI " + stage + " setup reported " + std::to_string(res.num_errors) + " initialization error(s)");
+            std::string message =
+                "OSDI " + stage + " setup reported " +
+                std::to_string(res.num_errors) + " initialization error(s)";
+            if (res.errors) {
+                for (uint32_t i = 0; i < res.num_errors; ++i) {
+                    const OsdiInitError& error = res.errors[i];
+                    message += i == 0 ? ": " : ", ";
+                    if (error.code == INIT_ERR_OUT_OF_BOUNDS &&
+                        desc_.param_opvar &&
+                        error.payload.parameter_id <
+                            desc_.num_params + desc_.num_opvars) {
+                        const OsdiParamOpvar& parameter =
+                            desc_.param_opvar[error.payload.parameter_id];
+                        const char* name =
+                            parameter.name && parameter.name[0]
+                            ? parameter.name[0]
+                            : "<unnamed>";
+                        message += "parameter '" + std::string(name) +
+                            "' is out of bounds";
+                    } else {
+                        message += "error code " +
+                            std::to_string(error.code);
+                    }
+                }
+            }
+            throw std::runtime_error(message);
         }
     }
 
-    void applyParams(void* data, const ParamMap& params, bool instanceParams) {
+    void applyParams(
+        void* data,
+        const ParamMap& params,
+        bool instanceParams,
+        std::vector<std::unique_ptr<char[]>>& stringParams) {
         if (!data || !desc_.access || !desc_.param_opvar) return;
         for (uint32_t id = 0; id < desc_.num_params; ++id) {
             const OsdiParamOpvar& param = desc_.param_opvar[id];
@@ -1005,7 +1449,7 @@ private:
                     auto text = std::make_unique<char[]>(found->second.size() + 1);
                     std::memcpy(text.get(), found->second.c_str(), found->second.size() + 1);
                     *reinterpret_cast<char**>(raw) = text.get();
-                    string_params_.push_back(std::move(text));
+                    stringParams.push_back(std::move(text));
                 }
             } catch (const std::exception& ex) {
                 const char* parameterName =
@@ -1093,6 +1537,22 @@ private:
                 inactive_global_nodes_.push_back(nodes_[i]);
             }
         }
+        // Reservations for currently collapsed internal nodes no longer
+        // appear in nodes_. Anchor them explicitly until a later setup refresh
+        // activates them.
+        for (uint32_t i = desc_.num_terminals;
+             i < reserved_internal_unknowns_.size();
+             ++i) {
+            const int reserved = reserved_internal_unknowns_[i];
+            if (reserved < 0) continue;
+            if (std::find(nodes_.begin(), nodes_.end(), reserved) == nodes_.end() &&
+                std::find(
+                    inactive_global_nodes_.begin(),
+                    inactive_global_nodes_.end(),
+                    reserved) == inactive_global_nodes_.end()) {
+                inactive_global_nodes_.push_back(reserved);
+            }
+        }
     }
 
     std::vector<double> daeBypassInputs(const VectorReal& x) const {
@@ -1121,12 +1581,16 @@ private:
             lhs.staticResidual == rhs.staticResidual && lhs.dynamicResidual == rhs.dynamicResidual &&
             lhs.staticJacobian == rhs.staticJacobian && lhs.dynamicJacobian == rhs.dynamicJacobian &&
             lhs.enableLimiting == rhs.enableLimiting && lhs.nodeset == rhs.nodeset &&
-            lhs.evaluationEpoch == rhs.evaluationEpoch;
+            lhs.simulationGmin == rhs.simulationGmin &&
+            lhs.sourceScaleFactor == rhs.sourceScaleFactor;
     }
 
     bool canBypassDae(const VectorReal& x, const DaeRequest& request) const {
         if (!request.allowBypass || request.highPrecision || request.readOnlyState ||
+            metadata_.has_bound_step || metadata_.uses_abstime ||
             !dae_cache_valid_ || cached_dae_evaluation_.limitingApplied ||
+            cached_dae_evaluation_.finishRequested ||
+            cached_dae_evaluation_.stopRequested ||
             !sameDaeRequest(request, cached_dae_request_)) {
             return false;
         }
@@ -1146,7 +1610,9 @@ private:
         const DaeRequest& request,
         const DaeEvaluation& evaluation) {
         if (!request.allowBypass || request.highPrecision || request.readOnlyState ||
-            evaluation.limitingApplied) {
+            evaluation.limitingApplied ||
+            evaluation.finishRequested ||
+            evaluation.stopRequested) {
             return;
         }
         cached_dae_request_ = request;
@@ -1181,6 +1647,73 @@ private:
         if (descriptorNode >= node_mapping_.size()) return -1;
         const uint32_t local = node_mapping_[descriptorNode];
         return globalNodeForLocal(local);
+    }
+
+    OsdiSimParas simulationParameters(
+        double requestedGmin,
+        int iteration = 0,
+        bool initializeLimiting = false,
+        double sourceScaleFactor = 1.0,
+        const char* analysisName = "op",
+        const char* analysisType = "static") const {
+        simparam_values_[0] = initializeLimiting ? 1.0 : 0.0;
+        simparam_values_[1] =
+            std::isfinite(requestedGmin) && requestedGmin >= 0.0
+            ? requestedGmin
+            : simulation_gmin_;
+        simparam_values_[2] = 0.0;
+        simparam_values_[3] = nominal_temperature_c_;
+        simparam_values_[4] = simulation_minr_;
+        simparam_values_[5] = geometry_scale_;
+        simparam_values_[6] = static_cast<double>(std::max(iteration, 0));
+        simparam_values_[7] = 0.0;
+        simparam_values_[8] = 1.0;
+        simparam_values_[9] = std::clamp(sourceScaleFactor, 0.0, 1.0);
+        simparam_values_[10] = relative_tolerance_;
+        simparam_values_[11] = voltage_tolerance_;
+        simparam_values_[12] = absolute_tolerance_;
+        simparam_values_[13] = charge_tolerance_;
+        simparam_values_[14] = flux_tolerance_;
+        simparam_analysis_name_ = analysisName ? analysisName : "";
+        simparam_analysis_type_ = analysisType ? analysisType : "";
+        simparam_string_values_[0] = simparam_analysis_name_.data();
+        simparam_string_values_[1] = simparam_analysis_type_.data();
+        simparam_string_values_[2] = simparam_cwd_.data();
+        return OsdiSimParas{
+            simparam_names_.data(),
+            simparam_values_.data(),
+            simparam_string_names_.data(),
+            simparam_string_values_.data()};
+    }
+
+    bool localIsFlow(uint32_t local) const {
+        bool foundFlow = false;
+        for (uint32_t i = 0; i < node_mapping_.size(); ++i) {
+            if (node_mapping_[i] != local || !desc_.nodes) continue;
+            if (!descriptorNodeIsFlow(i)) return false;
+            foundFlow = true;
+        }
+        return foundFlow;
+    }
+
+    bool globalIsFlow(int global) const {
+        bool foundFlow = false;
+        for (uint32_t i = 0; i < node_mapping_.size() && i < nodes_.size(); ++i) {
+            if (nodes_[i] != global || !desc_.nodes) continue;
+            if (!descriptorNodeIsFlow(i)) return false;
+            foundFlow = true;
+        }
+        return foundFlow;
+    }
+
+    bool descriptorNodeIsFlow(uint32_t descriptorNode) const {
+        if (descriptorNode >= desc_.num_nodes || !desc_.nodes) return false;
+        if (desc_.unknown_nature) {
+            const OsdiNatureRef ref = desc_.unknown_nature[descriptorNode];
+            if (ref.ref_type == NATREF_DISCIPLINE_FLOW) return true;
+            if (ref.ref_type == NATREF_DISCIPLINE_POTENTIAL) return false;
+        }
+        return desc_.nodes[descriptorNode].is_flow;
     }
 
     void populateJacobianPointers(std::vector<double>& jacobian) {
@@ -1222,12 +1755,17 @@ private:
 
     std::vector<double> localSolveFromGlobal(const VectorReal& x) const {
         std::vector<double> solve(local_node_count_, 0.0);
+        fillLocalSolveFromGlobal(x, solve);
+        return solve;
+    }
+
+    void fillLocalSolveFromGlobal(const VectorReal& x, std::vector<double>& solve) const {
+        solve.assign(local_node_count_, 0.0);
         for (size_t i = 0; i < nodes_.size() && i < node_mapping_.size(); ++i) {
             const uint32_t local = node_mapping_[i];
             if (local == UINT32_MAX || local >= solve.size()) continue;
             solve[local] = nodes_[i] >= 0 ? x[nodes_[i]] : 0.0;
         }
-        return solve;
     }
 
     bool loadReactiveResidualAt(
@@ -1235,17 +1773,15 @@ private:
         double time,
         std::vector<double>& reactive) {
         if (!desc_.load_residual_react) return false;
-        std::vector<double> solve = localSolveFromGlobal(state);
-        std::vector<double> scratchState(desc_.num_states, 0.0);
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        fillLocalSolveFromGlobal(state, scratch_reactive_solve_);
+        scratch_reactive_state_.assign(desc_.num_states, 0.0);
+        OsdiSimParas paras = simulationParameters(simulation_gmin_);
         OsdiSimInfo info{
             paras,
             time,
-            solve.data(),
+            scratch_reactive_solve_.data(),
             prev_state_.empty() ? nullptr : prev_state_.data(),
-            scratchState.empty() ? nullptr : scratchState.data(),
+            scratch_reactive_state_.empty() ? nullptr : scratch_reactive_state_.data(),
             CALC_REACT_RESIDUAL | ANALYSIS_TRAN
         };
         resetBoundStepRequest();
@@ -1287,9 +1823,7 @@ private:
             loadReactiveResidualAt(xPrev2, prev2Time, reactPrev2);
         }
 
-        char* nullName = nullptr;
-        char* nullStrName = nullptr;
-        OsdiSimParas paras{&nullName, nullptr, &nullStrName, nullptr};
+        OsdiSimParas paras = simulationParameters(simulation_gmin_);
 
         OsdiSimInfo info{
             paras,

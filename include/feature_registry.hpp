@@ -53,6 +53,11 @@ public:
         json += "  \"name\": \"GSPICE\",\n";
         json += "  \"version\": \"0.1.0-beta\",\n";
         json += "  \"maturity\": \"academic-beta\",\n";
+#if defined(GSPICE_HAVE_SUITESPARSE_KLU) && GSPICE_HAVE_SUITESPARSE_KLU
+        json += "  \"sparse_backend\": \"SuiteSparse-KLU\",\n";
+#else
+        json += "  \"sparse_backend\": \"internal-sparse\",\n";
+#endif
         json += "  \"features\": {\n";
         bool first = true;
         for (const auto& kv : features_) {
@@ -64,9 +69,9 @@ public:
         json += "\n  },\n";
         json += "  \"analyses\": {\n";
         json += "    \"op\": \"tested\", \"dc\": \"tested\", \"tran\": \"tested\", \"ac\": \"tested\",\n";
-        json += "    \"hb\": \"experimental\", \"pss\": \"unsupported\"\n";
+        json += "    \"noise\": \"tested\", \"stb\": \"prototype\", \"pss\": \"prototype\", \"pac\": \"prototype\", \"psspac\": \"prototype\", \"pssstb\": \"prototype\", \"pnoise\": \"prototype\", \"hb\": \"experimental\"\n";
         json += "  },\n";
-        json += "  \"experimental\": [\"hb\", \"fastspice\", \"multirate\", \"ticer\", \"binary_raw\", \"c_api\"],\n";
+        json += "  \"experimental\": [\"stb\", \"pss\", \"pac\", \"psspac\", \"pssstb\", \"pnoise\", \"hb\", \"fastspice\", \"multirate\", \"ticer\", \"binary_raw\", \"c_api\"],\n";
         json += "  \"outputs\": [\"spice-ascii-raw\", \"csv\"]\n";
         json += "}\n";
         return json;
@@ -89,7 +94,12 @@ private:
         registerFeature("python_zero_copy", FeatureMaturity::Tested, true, "Zero-copy NumPy array buffer exporter");
         registerFeature("provenance_stamping", FeatureMaturity::Tested, true, "Reproducibility provenance JSON metadata");
         registerFeature("hb", FeatureMaturity::Wired, false, "Harmonic balance (experimental)");
-        registerFeature("pss", FeatureMaturity::Prototype, false, "Periodic steady state (unavailable)");
+        registerFeature("stb", FeatureMaturity::Prototype, true, "Return-ratio stability analysis");
+        registerFeature("pss", FeatureMaturity::Prototype, true, "Driven and autonomous variational-Newton shooting periodic steady state");
+        registerFeature("pac", FeatureMaturity::Prototype, true, "Small-signal envelope AC");
+        registerFeature("psspac", FeatureMaturity::Prototype, true, "PSS-orbit LPTV-coupled sideband AC");
+        registerFeature("pssstb", FeatureMaturity::Prototype, true, "PSS-orbit LPTV-coupled stability analysis");
+        registerFeature("pnoise", FeatureMaturity::Prototype, true, "PSS-orbit LPTV-coupled sideband periodic noise");
         registerFeature("fastspice", FeatureMaturity::Prototype, false, "FastSPICE partitioning (experimental)");
         registerFeature("multirate", FeatureMaturity::Prototype, false, "Multirate transient (experimental)");
         registerFeature("ticer", FeatureMaturity::Prototype, false, "TICER reduction (experimental)");

@@ -78,13 +78,12 @@ does not yet vary arbitrary model or instance parameters.
 
 ## Transient reference validation
 
-The public harness compares a linear RC transient with an analytic solution,
-Xyce, and VACASK, plus a PSP103.4 inverter with VACASK:
+The public harness compares a linear RC transient with an analytic solution
+and optional VACASK output, plus a PSP103.4 inverter when VACASK is supplied:
 
 ```powershell
 python tools/validate_transient.py `
   --gspice build/Release/gspice.exe `
-  --xyce "C:/Program Files/XyceNF_7.10/bin/Xyce.exe" `
   --vacask "C:/path/to/vacask.exe" `
   --source .
 ```
@@ -98,11 +97,15 @@ than crawling indefinitely. `MAXORD` supports orders 1 through 5 for explicit
 `METHOD=AUTO` uses backward-Euler startup and restarts at waveform
 breakpoints, then selects trapezoidal integration for smooth native devices,
 temporarily changes to Gear2/BDF2 when ringing is detected, or stays damped
-when a compact model requests it. `LTE_MODE=PREDICTOR` is the default and uses
-a periodic step-doubling audit (`LTE_AUDIT_INTERVAL=16` by default);
-`LTE_MODE=STEPDOUBLING` selects the validation oracle for every eligible step.
-`TRAN_ORDER_ADAPTIVE`, `TRAP_RINGING`, `NR_BYPASS`, `NODESET_ITERS`, and
-`NODESET_G` expose the associated controls. OSDI hidden internal-node expansion
+when a compact model requests it. `LTE_MODE=PREDICTOR` is the default;
+periodic step-doubling audit is off by default for Low/Medium/High accuracy
+and can be enabled with `LTE_AUDIT_INTERVAL=N`. Very High keeps a stricter
+periodic audit. `NEWLTE=LOCAL|GLOBAL|HISTORY|SIGNAL_HISTORY` controls the LTE
+reference scale, with history-based scaling used by the normal accuracy
+presets. `LTE_MODE=STEPDOUBLING` selects the validation oracle for every
+eligible step. `TRAN_ORDER_ADAPTIVE`, `TRAP_RINGING`, `BREAKPOINT_GROWTH`,
+`NR_BYPASS`, `NODESET_ITERS`, and `NODESET_G` expose the associated controls.
+OSDI hidden internal-node expansion
 and limiting-RHS application are available as opt-in qualification paths via
 `OSDI_INTERNAL_NODES=1` and `OSDI_LIMITING_RHS=1`.
 `DAE_AUDIT=1` independently finite-differences migrated device `F` and `Q`

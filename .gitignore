@@ -19,6 +19,25 @@ bin/
 *.out
 *.csv
 
+# Local scratch decks and generated notes
+/scratch*.sp
+/auto_adaptive_deck.sp
+/user*.sp
+/test_user*.sp
+/test_uic*.sp
+/ring_osc*.sp
+/lumen_*.sp
+/ng*_test.sp
+/m*_test.sp
+/dc_test*.sp
+/case*.sp
+/edge_test.sp
+/trap_test.sp
+/sol_*.sp
+/two_stage_corrected.sp
+/*.pdf
+tools/__pycache__/
+
 # OS files
 .DS_Store
 Thumbs.db

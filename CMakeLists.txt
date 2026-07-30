@@ -109,7 +109,6 @@ add_test(NAME unit_dae_state COMMAND gspice_dae_state_test)
 
 find_program(GSPICE_POWERSHELL NAMES pwsh powershell)
 find_program(GSPICE_PYTHON NAMES python3 python)
-find_program(GSPICE_XYCE NAMES Xyce xyce)
 find_program(GSPICE_VACASK NAMES vacask)
 if(NOT GSPICE_POWERSHELL)
     message(WARNING "PowerShell was not found; file/error regression helpers will be skipped")
@@ -211,7 +210,11 @@ add_gspice_regex_test(smoke_solver_singleton tests/decks/solver_singleton.sp "si
 if(GSPICE_HAVE_SUITESPARSE_KLU)
     add_gspice_regex_test(smoke_solver_klu tests/decks/solver_klu.sp "ext_klu_calls=[1-9]")
 endif()
-add_gspice_regex_test(smoke_tran_maxstep tests/decks/tran_maxstep.sp "max internal step=2\\.000000000e-11")
+add_gspice_regex_test(smoke_tran_maxstep tests/decks/tran_maxstep.sp "max internal step=2\\.000000000e-11.*adaptive=on")
+add_gspice_regex_test(smoke_tran_maxstep_applied tests/decks/tran_maxstep.sp "Transient summary:.*max_step=2\\.000000000e-11")
+add_gspice_regex_test(smoke_tran_maxstep_auto tests/decks/tran_maxstep_auto.sp "max internal step=5\\.000000000e-09.*adaptive=on")
+add_gspice_regex_test(smoke_tran_stamp_cache_default tests/decks/tran_maxstep_auto.sp "stamp_cache=on")
+add_gspice_regex_test(smoke_tran_accuracy_high_preset tests/decks/tran_accuracy_high_preset.sp "lte_reference=HISTORY.*lte_audit_interval=0.*trtol=3\\.500000000e\\+00")
 add_gspice_regex_test(smoke_tran_method_options tests/decks/tran_method_options.sp "method=Gear2/BDF2")
 add_gspice_regex_test(smoke_tran_bdf5_options tests/decks/tran_bdf5_options.sp "method=Variable-step BDF.*max_order_used=5")
 add_gspice_regex_test(smoke_tran_adams5_options tests/decks/tran_adams5_options.sp "method=Variable-step Adams-Moulton.*max_order_used=5")
@@ -230,13 +233,35 @@ set_tests_properties(smoke_ihp_lv_mos_wrapper PROPERTIES
     ENVIRONMENT "GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1"
 )
 add_gspice_smoke_test(smoke_osdi_builtin tests/decks/osdi_builtin.sp)
+add_gspice_regex_test(smoke_osdi_psp_multirate tests/decks/osdi_psp_multirate.sp "Newton summary:.*bypassed_devices=[1-9]")
 add_gspice_regex_test(smoke_dc_sweep_model tests/decks/dc_sweep_model.sp "Starting DC Sweep Analysis")
 add_gspice_regex_test(smoke_dc_nested tests/decks/dc_nested.sp "sweep\\(V1\\).*sweep\\(V2\\)")
+add_gspice_regex_test(smoke_ac_lin tests/decks/ac_rc.sp "AC summary: points=5 sweep=LIN")
+add_gspice_regex_test(smoke_ac_values_phase tests/decks/ac_values_phase.sp "AC summary: points=3 sweep=VALUES")
+add_gspice_regex_test(smoke_sp_oneport tests/decks/sp_oneport_matched.sp "SP summary: points=1 ports=1 method=multiport-y-to-s")
+add_gspice_regex_test(smoke_sp_twoport tests/decks/sp_twoport_resistor.sp "SP summary: points=[1-9].*ports=2 method=multiport-y-to-s")
 add_gspice_regex_test(smoke_controlled_sources tests/decks/controlled_sources.sp "Node 1=1\\.000000V \\[out\\].*Node 2=2\\.000000V \\[buf\\]")
 add_gspice_smoke_test(smoke_current_controlled_sources tests/decks/current_controlled_sources.sp)
 add_gspice_regex_test(smoke_tf_divider tests/decks/tf_divider.sp "magnitude=4\\.99999999[0-9]e-01")
 add_gspice_smoke_test(smoke_bjt_npn tests/decks/bjt_npn.sp)
 add_gspice_regex_test(smoke_noise_resistor tests/decks/noise_resistor.sp "Starting Noise Analysis")
+add_gspice_regex_test(smoke_noise_integrated tests/decks/noise_resistor.sp "Integrated output noise: [1-9].* Vrms")
+add_gspice_regex_test(smoke_noise_input_referred tests/decks/noise_resistor.sp "Noise summary: points=2 output=V\\(out\\) input=V1")
+add_gspice_regex_test(smoke_transient_noise tests/decks/transient_noise.sp "Transient noise summary: candidate_steps=[1-9].*injected_sources=[1-9]")
+add_gspice_regex_test(smoke_transient_noise_sde tests/decks/transient_noise_sde.sp "Transient noise summary: candidate_steps=[1-9].*injected_sources=[1-9].*mode=SDE")
+add_gspice_regex_test(smoke_stb_return_ratio tests/decks/stb_rc_feedback.sp "STB summary: points=[1-9].*method=vacask-twoport")
+add_gspice_regex_test(smoke_pss_linearized tests/decks/pss_linear.sp "PSS summary:.*shooting_iterations=[1-9].*residual=")
+add_gspice_regex_test(smoke_pss_shooting_residual tests/decks/pss_newton_rc.sp "PSS iteration [1-9]+: residual=.*PSS summary:.*shooting_iterations=[1-9]")
+add_gspice_regex_test(smoke_pss_variational_newton tests/decks/pss_newton_long_rc.sp "PSS Newton correction:.*PSS summary:.*newton_iterations=[1-9].*monodromy_columns=[1-9].*variational_steps=[1-9]")
+add_gspice_regex_test(smoke_pss_oscillator_option tests/decks/pss_oscillator_option.sp "Autonomous PSS phase condition:.*PSS summary: oscillator=yes autonomous=yes.*direct_period_columns=[1-9].*phase_unknown=[0-9]")
+add_gspice_regex_test(smoke_pss_tstab_adaptive tests/decks/pss_tstab_adaptive.sp "PSS summary:.*tstab_seconds=[1-9].*adaptive_orbit=yes")
+add_gspice_regex_test(smoke_pnoise_small_signal tests/decks/pnoise_resistor.sp "PNOISE summary: points=[1-9].*method=shifted-sideband-periodic sidebands=1")
+add_gspice_regex_test(smoke_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp "PNOISE summary:.*phase_noise=yes.*jitter=yes.*jitter_rms_s=")
+add_gspice_error_test(error_psspac_sidebands tests/decks/psspac_linear.sp "analysis .PSSPAC is parsed for compatibility")
+add_gspice_error_test(error_pssstb_twoport tests/decks/pssstb_rc_feedback.sp "analysis .PSSSTB is parsed for compatibility")
+add_gspice_regex_test(smoke_pnoise_sidebands tests/decks/pnoise_sidebands.sp "PNOISE summary: points=[1-9].*method=pss-lptv-coupled sidebands=3.*lptv_samples=[1-9].*lptv_terms=[1-9]")
+add_gspice_error_test(error_psspac_diode_lptv tests/decks/psspac_diode_lptv.sp "analysis .PSSPAC is parsed for compatibility")
+add_gspice_regex_test(smoke_pnoise_diode_lptv tests/decks/pnoise_diode_lptv.sp "PNOISE summary: points=[1-9].*method=pss-lptv-coupled sidebands=3.*lptv_samples=[1-9].*lptv_terms=[1-9]")
 add_gspice_regex_test(smoke_measure_tran tests/decks/measure_tran.sp "MEASURE vfinal = 6\\.[0-9]+e-01")
 add_gspice_regex_test(smoke_step_op tests/decks/step_op.sp "Starting STEP Analysis")
 add_gspice_regex_test(smoke_sens_source tests/decks/sens_source.sp "Sensitivity: dV\\(out\\)/dV1")
@@ -249,53 +274,52 @@ add_gspice_regex_test(smoke_corners_spec tests/decks/corners_spec.sp "corner\\(l
 add_gspice_regex_test(smoke_mc_spec tests/decks/mc_spec.sp "Production summary: spec=vout")
 add_gspice_raw_expect_test(regression_rc_step tests/decks/regression_rc_step.sp "V(out)" 0.630 0.03)
 add_gspice_raw_header_expect_test(regression_save_voltage_selection tests/decks/save_voltage_selection.sp 2 "V(out)" "V(in)")
+add_gspice_raw_header_expect_test(regression_save_none_options tests/decks/save_none_options.sp 1 "time" "V(in)")
+add_gspice_raw_header_expect_test(regression_save_selected_options tests/decks/save_selected_options.sp 2 "V(out)" "V(in)")
 add_gspice_csv_expect_test(regression_csv_output tests/decks/regression_rc_step.sp)
 add_gspice_raw_expect_test(regression_lumen_ihp_inverter tests/decks/lumen_ihp_inverter_short.sp "V(net2)" 0.0 0.2)
 set_tests_properties(regression_lumen_ihp_inverter PROPERTIES
     ENVIRONMENT "GSPICE_OSDI_DIR=${CMAKE_CURRENT_SOURCE_DIR}/osdi"
 )
-if(GSPICE_PYTHON AND GSPICE_XYCE)
+if(GSPICE_PYTHON AND GSPICE_VACASK)
     add_test(
-        NAME reference_transient_xyce
+        NAME reference_transient_vacask
         COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_transient.py
             --gspice $<TARGET_FILE:gspice>
-            --xyce ${GSPICE_XYCE}
+            --vacask ${GSPICE_VACASK}
             --source ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    set_tests_properties(reference_transient_xyce PROPERTIES TIMEOUT 180)
-endif()
-if(GSPICE_PYTHON AND GSPICE_VACASK)
-    if(GSPICE_XYCE)
-        add_test(
-            NAME reference_transient_vacask
-            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_transient.py
-                --gspice $<TARGET_FILE:gspice>
-                --xyce ${GSPICE_XYCE}
-                --vacask ${GSPICE_VACASK}
-                --source ${CMAKE_CURRENT_SOURCE_DIR}
-        )
-    else()
-        add_test(
-            NAME reference_transient_vacask
-            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_transient.py
-                --gspice $<TARGET_FILE:gspice>
-                --vacask ${GSPICE_VACASK}
-                --source ${CMAKE_CURRENT_SOURCE_DIR}
-        )
-    endif()
     set_tests_properties(reference_transient_vacask PROPERTIES TIMEOUT 180)
+endif()
+if(GSPICE_PYTHON)
+    add_test(
+        NAME validation_noise_rc_ktc
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_noise.py
+            --gspice $<TARGET_FILE:gspice>
+            --source ${CMAKE_CURRENT_SOURCE_DIR}
+            --case rc
+    )
+    set_tests_properties(validation_noise_rc_ktc PROPERTIES TIMEOUT 180)
+
+    add_test(
+        NAME validation_transient_noise_seed
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_noise.py
+            --gspice $<TARGET_FILE:gspice>
+            --source ${CMAKE_CURRENT_SOURCE_DIR}
+            --case seed
+    )
+    set_tests_properties(validation_transient_noise_seed PROPERTIES TIMEOUT 180)
 endif()
 add_gspice_error_test(error_missing_psp_osdi tests/decks/osdi_missing_psp.sp "OSDI model type 'psp103va' is not loaded")
 add_gspice_error_test(error_unsupported_element tests/decks/error_unsupported_element.sp "unsupported element")
 add_gspice_error_test(error_ihp_primitive_fallback tests/decks/error_ihp_primitive_fallback.sp "Refusing primitive MOS fallback")
 add_gspice_error_test(error_compact_mos_fallback tests/decks/error_compact_mos_fallback.sp "Refusing primitive Level-1 fallback")
-add_gspice_error_test(error_pss_unimplemented tests/decks/error_pss_unimplemented.sp "has no validated execution engine")
 add_gspice_error_test(error_trtol_min_step tests/decks/error_trtol_min_step.sp "Transient progress starved after 1024 LTE violations")
 
 add_test(NAME cli_version COMMAND gspice --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "GSPICE 1\\.3\\.0-academic-beta")
 add_test(NAME cli_capabilities COMMAND gspice --capabilities)
-set_tests_properties(cli_capabilities PROPERTIES PASS_REGULAR_EXPRESSION "\"pss\": \"unsupported\"")
+set_tests_properties(cli_capabilities PROPERTIES PASS_REGULAR_EXPRESSION "\"pss\": \"prototype\"")
 if(GSPICE_HAVE_SUITESPARSE_KLU)
     add_test(NAME cli_capabilities_klu COMMAND gspice --capabilities)
     set_tests_properties(cli_capabilities_klu PROPERTIES
@@ -305,14 +329,38 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/osdi/psp103.osdi")
     add_gspice_regex_test(smoke_osdi_model_status_loaded tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_LOADED")
+    add_gspice_regex_test(smoke_osdi_nature_tolerances tests/decks/osdi_internal_nodes.sp "nature_tolerances=[1-9]")
     add_gspice_regex_test(smoke_osdi_model_status_device tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_DEVICE")
+    add_gspice_regex_test(smoke_osdi_opvars tests/decks/osdi_opvars.sp "OSDI operating-point variables: [1-9][0-9]*")
+    add_gspice_regex_test(smoke_osdi_noise_types tests/decks/osdi_noise.sp "1\\.000000000e\\+00 \\|.* 4 2 1 0 1")
+    add_gspice_regex_test(smoke_osdi_transient_noise_colored tests/decks/osdi_psp_trannoise.sp "Transient noise summary:.*flicker=[1-9].*colored=[1-9]")
+    if(GSPICE_PYTHON)
+        add_test(
+            NAME validation_osdi_flicker_noise
+            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_noise.py
+                --gspice $<TARGET_FILE:gspice>
+                --source ${CMAKE_CURRENT_SOURCE_DIR}
+                --case osdi
+        )
+        set_tests_properties(validation_osdi_flicker_noise PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 180
+        )
+    endif()
     add_gspice_env_regex_test(smoke_osdi_limiting_rhs_option tests/decks/osdi_psp_inverter.sp "GSPICE_USE_OSDI_LIMITING_RHS=1" "OSDI advanced options: limiting_rhs=requested")
     add_gspice_regex_test(smoke_osdi_options_deck tests/decks/osdi_psp_options.sp "OSDI advanced options: limiting_rhs=requested.*full_model_params=off.*spice_rhs=requested")
+    add_gspice_regex_test(smoke_osdi_simparams_options tests/decks/osdi_psp_options.sp "gmin=7\\.000000000e-11 minr=3\\.000000000e-10")
+    add_gspice_regex_test(smoke_osdi_simparams_setup_order tests/decks/osdi_psp_options.sp "OSDI_DEVICE instance=NP.*simparam_gmin=7(\\.[0-9]+)?e-11.*simparam_minr=3(\\.[0-9]+)?e-10")
+    add_gspice_regex_test(smoke_osdi_simparams_environment tests/decks/osdi_psp_options.sp "OSDI_DEVICE instance=NP.*simparam_tnom=35.*simparam_scale=2")
     add_gspice_regex_test(smoke_osdi_internal_nodes tests/decks/osdi_internal_nodes.sp "internal_nodes=expanded internal_unknowns=[1-9]")
+    add_gspice_regex_test(smoke_osdi_unknown_natures tests/decks/osdi_internal_nodes.sp "DAE topology: potential_unknowns=4 flow_unknowns=[1-9][0-9]* unspecified_unknowns=0")
     add_gspice_regex_test(smoke_osdi_internal_solution tests/decks/osdi_internal_nodes.sp "Node 2=1\\.")
     add_gspice_regex_test(smoke_osdi_adaptive_homotopy tests/decks/osdi_internal_nodes.sp "adaptive continuation step\\(s\\)")
     add_gspice_regex_test(smoke_osdi_psp_pmos_pullup tests/decks/osdi_psp_pmos_pullup.sp "Node 2=1\\.")
     add_gspice_regex_test(smoke_osdi_psp_dae_audit tests/decks/osdi_psp_dae_audit.sp "DAE audit: checked=[1-9].*PASS")
+    add_gspice_regex_test(smoke_osdi_shared_model tests/decks/osdi_shared_model.sp "OSDI_DEVICE instance=N2.*model_state=shared")
+    add_gspice_regex_test(smoke_osdi_shared_model_dae tests/decks/osdi_shared_model.sp "DAE audit: checked=[1-9].*PASS")
+    add_gspice_regex_test(smoke_osdi_psp_loaded_gate_op tests/decks/osdi_psp_loaded_gate_op.sp "Node 2=2\\.")
     add_gspice_regex_test(smoke_osdi_psp_inverter tests/decks/osdi_psp_inverter.sp "output_points=21")
     add_gspice_regex_test(smoke_osdi_psp_inverter_loaded tests/decks/osdi_psp_inverter_loaded.sp "e-11 \\| 2\\.000000000e\\+00")
 endif()

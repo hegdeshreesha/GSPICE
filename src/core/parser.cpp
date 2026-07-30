@@ -625,6 +625,18 @@ bool hasOsdiDeviceInBody(const SubcktDef& def) {
     return false;
 }
 
+std::string osdiTerminalSummary(const gspice::OsdiDescriptorMetadata* metadata, uint32_t count) {
+    if (!metadata || metadata->nodes.empty() || count == 0) return "";
+    std::ostringstream out;
+    out << " terminals=";
+    const uint32_t limit = std::min<uint32_t>(count, static_cast<uint32_t>(metadata->nodes.size()));
+    for (uint32_t i = 0; i < limit; ++i) {
+        if (i != 0) out << ",";
+        out << metadata->nodes[i].name;
+    }
+    return out.str();
+}
+
 std::vector<PreLine> expandActiveOsdiWrapperBody(
     const SubcktDef& def,
     const std::string& subcktName,
@@ -1222,6 +1234,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.abstol = 1e-12;
             settings.tran_lte_reltol = 2e-2;
             settings.tran_lte_abstol = 10e-6;
+            settings.tran_trtol = 7.0;
+            settings.tran_lte_audit_interval = 0;
+            settings.tran_lte_reference = "HISTORY";
             settings.tran_max_iter = 40;
         } else if (preset == "MEDIUM") {
             settings.reltol = 1e-3;
@@ -1229,6 +1244,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.abstol = 1e-12;
             settings.tran_lte_reltol = 5e-3;
             settings.tran_lte_abstol = 1e-6;
+            settings.tran_trtol = 5.0;
+            settings.tran_lte_audit_interval = 0;
+            settings.tran_lte_reference = "HISTORY";
             settings.tran_max_iter = 60;
         } else if (preset == "HIGH") {
             settings.reltol = 3e-4;
@@ -1236,6 +1254,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.abstol = 100e-15;
             settings.tran_lte_reltol = 1e-3;
             settings.tran_lte_abstol = 300e-9;
+            settings.tran_trtol = 3.5;
+            settings.tran_lte_audit_interval = 0;
+            settings.tran_lte_reference = "HISTORY";
             settings.tran_max_iter = 80;
         } else if (preset == "VERYHIGH") {
             settings.reltol = 1e-4;
@@ -1245,6 +1266,8 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_lte_abstol = 100e-9;
             settings.chgtol = 1e-15;
             settings.tran_trtol = 1.0;
+            settings.tran_lte_audit_interval = 8;
+            settings.tran_lte_reference = "LOCAL";
             settings.tran_method = "TRAPGEAR";
             settings.tran_max_iter = 120;
         }
@@ -1279,12 +1302,32 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_adaptive = true;
         }
     };
+    auto applySaveMode = [&](std::string mode) {
+        mode = toUpperCopy(mode);
+        mode.erase(std::remove(mode.begin(), mode.end(), '_'), mode.end());
+        mode.erase(std::remove(mode.begin(), mode.end(), '-'), mode.end());
+        if (mode == "ALL" || mode == "ALLPUB" || mode == "PUBLIC") {
+            settings.save_all = true;
+            settings.save_none = false;
+            settings.saves.clear();
+        } else if (mode == "SELECTED" || mode == "SELECT" || mode == "NONEDEFAULT") {
+            settings.save_all = false;
+            settings.save_none = false;
+        } else if (mode == "NONE" || mode == "OFF" || mode == "NO") {
+            settings.save_all = false;
+            settings.save_none = true;
+            settings.saves.clear();
+        }
+    };
     if (key == "RELTOL" && hasNumeric && numeric > 0.0) {
         settings.reltol = numeric;
     }
     else if (key == "VNTOL" && hasNumeric && numeric > 0.0) settings.vntol = numeric;
     else if (key == "ABSTOL" && hasNumeric && numeric > 0.0) settings.abstol = numeric;
     else if (key == "GMIN" && hasNumeric && numeric >= 0.0) settings.gmin = numeric;
+    else if (key == "MINR" && hasNumeric && numeric >= 0.0) settings.minr = numeric;
+    else if (key == "TNOM" && hasNumeric) settings.nominal_temperature_c = numeric;
+    else if (key == "SCALE" && hasNumeric && numeric > 0.0) settings.geometry_scale = numeric;
     else if ((key == "THREADS" || key == "NUM_THREADS" || key == "NTHREADS" || key == "PARALLEL" || key == "CPUS") && hasNumeric && numeric > 0.0) {
         settings.num_threads = static_cast<int>(numeric);
     }
@@ -1293,13 +1336,89 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "TRTOL" && hasNumeric && numeric > 0.0) settings.tran_trtol = numeric;
     else if ((key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
     else if ((key == "TRABSTOL" || key == "TRAN_ABSTOL" || key == "LTE_ABSTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_abstol = numeric;
+    else if (key == "NEWLTE" || key == "LTE_REFERENCE" || key == "TRAN_LTE_REFERENCE") {
+        std::string mode = toUpperCopy(value);
+        mode.erase(std::remove(mode.begin(), mode.end(), '_'), mode.end());
+        mode.erase(std::remove(mode.begin(), mode.end(), '-'), mode.end());
+        if (mode == "0" || mode == "LOCAL" || mode == "NODE" || mode == "CURRENT") {
+            settings.tran_lte_reference = "LOCAL";
+        } else if (mode == "1" || mode == "GLOBAL" || mode == "GLOBALCURRENT") {
+            settings.tran_lte_reference = "GLOBAL";
+        } else if (mode == "2" || mode == "HISTORY" || mode == "GLOBALHISTORY" || mode == "ALLPAST") {
+            settings.tran_lte_reference = "HISTORY";
+        } else if (mode == "3" || mode == "SIGNALHISTORY" || mode == "NODEHISTORY" || mode == "PERSIGNAL") {
+            settings.tran_lte_reference = "SIGNAL_HISTORY";
+        }
+    }
+    else if ((key == "BREAKPOINT_GROWTH" || key == "TRAN_BREAKPOINT_GROWTH") && hasNumeric && numeric > 0.0) {
+        settings.tran_breakpoint_growth = std::clamp(numeric, 1.0, 20.0);
+    }
     else if (key == "CHGTOL" && hasNumeric && numeric > 0.0) settings.chgtol = numeric;
+    else if (key == "FLUXTOL" && hasNumeric && numeric > 0.0) settings.fluxtol = numeric;
     else if ((key == "MAXORD" || key == "MAXORDER") && hasNumeric) settings.tran_max_order = std::clamp(static_cast<int>(numeric), 1, 5);
-    else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP") && hasNumeric && numeric > 0.0) settings.t_max_step = numeric;
+    else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP")) {
+        std::string mode = toUpperCopy(value);
+        mode.erase(std::remove(mode.begin(), mode.end(), '_'), mode.end());
+        mode.erase(std::remove(mode.begin(), mode.end(), '-'), mode.end());
+        if (hasNumeric && numeric > 0.0) {
+            settings.t_max_step = numeric;
+            settings.ignore_tran_tmax = false;
+        } else if ((hasNumeric && numeric == 0.0) ||
+                   mode == "AUTO" || mode == "ADAPTIVE" || mode == "NONE" || mode == "OFF") {
+            settings.t_max_step = 0.0;
+            settings.ignore_tran_tmax = true;
+        }
+    }
     else if ((key == "MINSTEP" || key == "TMIN" || key == "TRAN_MINSTEP") && hasNumeric && numeric > 0.0) settings.t_min_step = numeric;
+    else if ((key == "IGNORE_TMAX" || key == "IGNORE_TRAN_TMAX" || key == "TRAN_IGNORE_TMAX")) {
+        settings.ignore_tran_tmax = value.empty() ? true : truthy(value);
+        if (settings.ignore_tran_tmax) settings.t_max_step = 0.0;
+    }
+    else if (key == "SAVE" || key == "SAVEMODE" || key == "SAVE_MODE") {
+        if (!value.empty()) applySaveMode(value);
+    }
+    else if (key == "SAVE_ALL" || key == "SAVEALL") {
+        if (value.empty() || truthy(value)) applySaveMode("ALL");
+        else applySaveMode("SELECTED");
+    }
+    else if (key == "SAVE_NONE" || key == "SAVENONE") {
+        if (value.empty() || truthy(value)) applySaveMode("NONE");
+        else applySaveMode("ALL");
+    }
     else if (key == "ADAPTIVE" || key == "TRAN_ADAPTIVE") settings.tran_adaptive = value.empty() ? true : truthy(value);
+    else if (key == "PSS_ADAPTIVE" || key == "PSSADAPTIVE") settings.pss_adaptive = value.empty() ? true : truthy(value);
+    else if (key == "TSTAB" || key == "PSS_TSTAB") {
+        if (hasNumeric && numeric >= 0.0) settings.pss_tstab = numeric;
+    }
+    else if (key == "TSTAB_PERIODS" || key == "PSS_TSTAB_PERIODS" || key == "PSS_RUNUP_PERIODS") {
+        if (hasNumeric && numeric >= 0.0) settings.pss_tstab_periods = static_cast<int>(numeric);
+    }
+    else if (key == "PSS_CONTINUATION" || key == "PSS_HOMOTOPY" || key == "PSS_HOMOTOPY_CONTINUATION") {
+        settings.pss_continuation = value.empty() ? true : truthy(value);
+    }
+    else if (key == "PSS_CONTINUATION_STEPS" || key == "PSS_HOMOTOPY_STEPS") {
+        if (hasNumeric && numeric >= 0.0) settings.pss_continuation_steps = static_cast<int>(numeric);
+    }
+    else if (key == "PSS_RELTOL" || key == "PSS_RESIDUAL_GOAL") {
+        if (hasNumeric && numeric > 0.0) settings.pss_residual_goal = numeric;
+    }
+    else if (key == "MAX_PSS_ITER" || key == "PSS_MAX_ITER" || key == "PSS_ITERS" || key == "PSS_ITERATIONS") {
+        if (hasNumeric && numeric > 0.0) settings.max_pss_iter = std::clamp(static_cast<int>(numeric), 1, 200);
+    }
+    else if (key == "PHASENOISE" || key == "PHASE_NOISE" || key == "PNOISE_PHASE_NOISE") {
+        settings.pnoise_phase_noise = value.empty() ? true : truthy(value);
+    }
+    else if (key == "JITTER" || key == "PNOISE_JITTER") {
+        settings.pnoise_jitter = value.empty() ? true : truthy(value);
+    }
+    else if (key == "CARRIER" || key == "CARRIER_HZ" || key == "PNOISE_CARRIER") {
+        if (hasNumeric && numeric > 0.0) settings.pnoise_carrier_hz = numeric;
+    }
     else if (key == "SAVE_ADAPTIVE" || key == "SAVE_ADAPTIVE_STEPS" || key == "SAVEADAPTIVE") {
         settings.save_adaptive_steps = value.empty() ? true : truthy(value);
+    }
+    else if ((key == "TRAN_PROGRESS_INTERVAL" || key == "PROGRESS_INTERVAL" || key == "PROGRESS") && hasNumeric) {
+        settings.tran_progress_interval = std::clamp(numeric, 0.0, 100.0);
     }
     else if (key == "TRAN_PREDICTOR" || key == "PREDICTOR") settings.tran_predictor = value.empty() ? true : truthy(value);
     else if (key == "TRAN_ORDER_ADAPTIVE" || key == "ORDER_ADAPTIVE" || key == "ADAPTIVE_ORDER") {
@@ -1318,6 +1437,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "LTE_AUDIT_INTERVAL" || key == "TRAN_LTE_AUDIT_INTERVAL") && hasNumeric) {
         settings.tran_lte_audit_interval = std::clamp(static_cast<int>(numeric), 0, 1000000);
+    }
+    else if ((key == "LTE_CHARGE_INTERVAL" || key == "TRAN_LTE_CHARGE_INTERVAL" || key == "CHARGE_LTE_INTERVAL") && hasNumeric) {
+        settings.tran_lte_charge_interval = std::clamp(static_cast<int>(numeric), 1, 1000000);
     }
     else if ((key == "SOLVER" || key == "LINEAR_SOLVER" || key == "SPARSE_SOLVER") && !value.empty()) {
         settings.solver_backend = toUpperCopy(value);
@@ -1380,11 +1502,17 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "OSDI_SPICE_RHS" || key == "OSDISPICERHS" || key == "OSDI_NATIVE_RHS") {
         settings.osdi_spice_rhs = value.empty() ? true : truthy(value);
     }
+    else if (key == "OSDI_OPVARS" || key == "OSDI_OUTPUT_OPVARS" || key == "OPVARS") {
+        settings.osdi_output_opvars = value.empty() ? true : truthy(value);
+    }
     else if (key == "FASTSPICE" || key == "FAST_SPICE" || key == "EVENT_DRIVEN") {
         settings.fastspice = value.empty() ? true : truthy(value);
     }
     else if (key == "MULTIRATE" || key == "MULTI_RATE" || key == "MULTI_TIMESTEP") {
         settings.multirate = value.empty() ? true : truthy(value);
+    }
+    else if (key == "TRAN_STAMP_CACHE" || key == "STAMP_CACHE" || key == "PARTITION_STAMP_CACHE") {
+        settings.transient_stamp_cache = value.empty() ? true : truthy(value);
     }
     else if (key == "PARALLEL_SOLVE" || key == "PARALLEL_BTF" || key == "PARALLEL_SOLVER") {
         settings.parallel_solve = value.empty() ? true : truthy(value);
@@ -1394,6 +1522,31 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "TICER_FMAX" || key == "TICERFMAX") && hasNumeric && numeric > 0.0) {
         settings.ticer_fmax = numeric;
+    }
+    else if (key == "TRAN_NOISE" || key == "TRANSIENT_NOISE" || key == "TNOISE") {
+        settings.transient_noise = value.empty() ? true : truthy(value);
+    }
+    else if ((key == "TRAN_NOISE_FMIN" || key == "TNOISE_FMIN") && hasNumeric && numeric >= 0.0) {
+        settings.transient_noise_fmin = numeric;
+    }
+    else if ((key == "TRAN_NOISE_FMAX" || key == "TNOISE_FMAX" || key == "NOISE_BW") && hasNumeric && numeric >= 0.0) {
+        settings.transient_noise_fmax = numeric;
+    }
+    else if ((key == "TRAN_NOISE_SCALE" || key == "TNOISE_SCALE") && hasNumeric && numeric >= 0.0) {
+        settings.transient_noise_scale = numeric;
+    }
+    else if ((key == "TRAN_NOISE_SEED" || key == "TNOISE_SEED" || key == "NOISE_SEED") && hasNumeric && numeric >= 0.0) {
+        settings.transient_noise_seed = static_cast<unsigned int>(numeric);
+    }
+    else if ((key == "TRAN_NOISE_OVERSAMPLE" || key == "TNOISE_OVERSAMPLE" || key == "OVERSAMPLE") && hasNumeric && numeric >= 1.0) {
+        settings.transient_noise_oversample = std::clamp(static_cast<int>(numeric), 1, 1000000);
+    }
+    else if ((key == "TRAN_NOISE_TONES_PER_DEC" || key == "TNOISE_TONES_PER_DEC" || key == "NOISE_TONES_PER_DEC") && hasNumeric && numeric >= 1.0) {
+        settings.transient_noise_colored_tones_per_dec = std::clamp(static_cast<int>(numeric), 1, 64);
+    }
+    else if (key == "TRAN_NOISE_MODE" || key == "TNOISE_MODE" || key == "NOISEMODE") {
+        const std::string mode = toUpperCopy(value);
+        if (mode == "ZOH" || mode == "SDE") settings.transient_noise_mode = mode;
     }
     else if ((key == "METHOD" || key == "TRAN_METHOD") && !value.empty()) {
         std::string method = toUpperCopy(value);
@@ -1408,12 +1561,16 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "ITL1" || key == "OP_MAX_ITER") && hasNumeric && numeric > 0.0) settings.op_max_iter = static_cast<int>(numeric);
     else if ((key == "ITL4" || key == "TRAN_MAX_ITER") && hasNumeric && numeric > 0.0) settings.tran_max_iter = static_cast<int>(numeric);
+    else if (key == "UIC" || key == "USE_UIC" || key == "USE_INITIAL_CONDITIONS") {
+        settings.use_uic = value.empty() ? true : truthy(value);
+    }
 }
 
 void parseSourceSpec(
     const std::string& sourceSpec,
     double& dcValue,
     double& acMagnitude,
+    double& acPhaseDeg,
     bool& dcSeen,
     gspice::VoltageSource::WaveformType& waveformType,
     gspice::VoltageSource::PulseParams& pulse,
@@ -1423,6 +1580,7 @@ void parseSourceSpec(
 
     dcValue = 0.0;
     acMagnitude = 1.0;
+    acPhaseDeg = 0.0;
     dcSeen = false;
     waveformType = gspice::VoltageSource::WaveformType::DC;
     pulse = gspice::VoltageSource::PulseParams{};
@@ -1451,6 +1609,13 @@ void parseSourceSpec(
         if (pUpper == "AC" && i + 1 < parts.size()) {
             double tmp = 0.0;
             if (tryParseSpiceValue(parts[i + 1], tmp)) acMagnitude = tmp;
+            if (i + 2 < parts.size()) {
+                double phase = 0.0;
+                if (tryParseSpiceValue(parts[i + 2], phase)) {
+                    acPhaseDeg = phase;
+                    ++i;
+                }
+            }
             ++i;
             continue;
         }
@@ -1617,6 +1782,28 @@ Netlist Parser::parse(const std::string& filePath) {
         netlist.addError(error);
     }
 
+    // OSDI setup_model/setup_instance execute when device lines are
+    // elaborated. Resolve global simulation-environment directives first so
+    // their $simparam and temperature values do not depend on whether an
+    // .OPTIONS or .TEMP line appears before or after the device instances.
+    {
+        SimulationSettings earlySettings = netlist.getSettings();
+        for (const auto& preLine : paramFreeLines) {
+            const auto tokens = tokenize(preLine.text);
+            if (tokens.empty()) continue;
+            const std::string command = toUpperCopy(tokens[0]);
+            if (command == ".OPTIONS" || command == ".OPTION" || command == ".OPT") {
+                for (std::size_t i = 1; i < tokens.size(); ++i) {
+                    applyOptionToken(earlySettings, tokens[i]);
+                }
+            } else if ((command == ".TEMP" || command == ".TEMPERATURE") &&
+                       tokens.size() >= 2) {
+                earlySettings.temperature_c = Utils::parseValue(tokens[1]);
+            }
+        }
+        netlist.setSettings(earlySettings);
+    }
+
     for (const auto& preLine : paramFreeLines) {
         std::string line = preLine.text;
         int lineNo = preLine.lineNo;
@@ -1720,6 +1907,7 @@ Netlist Parser::parse(const std::string& filePath) {
                     const std::string tokenUpper = toUpperCopy(tokens[i]);
                     if (tokenUpper == "ALL" || tokenUpper == "V(*)" || tokenUpper == "V(ALL)") {
                         settings.save_all = true;
+                        settings.save_none = false;
                         settings.saves.clear();
                         sawSave = true;
                         continue;
@@ -1740,6 +1928,7 @@ Netlist Parser::parse(const std::string& filePath) {
                         settings.save_all = false;
                         settings.saves.clear();
                     }
+                    settings.save_none = false;
                     settings.saves.push_back(save);
                     sawSave = true;
                 }
@@ -1907,16 +2096,19 @@ Netlist Parser::parse(const std::string& filePath) {
                 SimulationSettings settings = netlist.getSettings();
                 settings.output_specs.push_back(spec);
                 netlist.setSettings(settings);
-            } else if (cmd == ".TRAN") {
+            } else if (cmd == ".TRAN" || cmd == ".TRANNOISE" || cmd == ".TRNOISE" || cmd == ".TNOISE") {
                 if (tokens.size() < 3) {
-                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .TRAN line ignored: " + line);
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid " + cmd + " line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "TRAN";
+                if (cmd != ".TRAN") {
+                    settings.transient_noise = true;
+                }
                 settings.t_step = Utils::parseValue(tokens[1]);
                 settings.t_stop = Utils::parseValue(tokens[2]);
-                if (tokens.size() > 3) {
+                if (tokens.size() > 3 && tokens[3].find('=') == std::string::npos) {
                     std::string opt = tokens[3];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") {
@@ -1926,19 +2118,53 @@ Netlist Parser::parse(const std::string& filePath) {
                         settings.t_start = Utils::parseValue(tokens[3]);
                     }
                 }
-                if (tokens.size() > 4) {
+                if (tokens.size() > 4 && tokens[4].find('=') == std::string::npos) {
                     std::string opt = tokens[4];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") {
                         settings.use_uic = true;
-                    } else {
+                    } else if (!settings.ignore_tran_tmax) {
                         settings.t_max_step = Utils::parseValue(tokens[4]);
                     }
                 }
-                if (tokens.size() > 5) {
+                if (tokens.size() > 5 && tokens[5].find('=') == std::string::npos) {
                     std::string opt = tokens[5];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") settings.use_uic = true;
+                }
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    std::string optUpper = toUpperCopy(tokens[i]);
+                    if (optUpper == "UIC") {
+                        settings.use_uic = true;
+                    }
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    const std::string option = toUpperCopy(key);
+                    if (option == "UIC" || option == "USE_UIC" || option == "USE_INITIAL_CONDITIONS") {
+                        std::string enabled = toUpperCopy(value);
+                        settings.use_uic = value.empty() ||
+                            !(enabled == "0" || enabled == "NO" || enabled == "FALSE" || enabled == "OFF");
+                    } else if (option == "FMIN") {
+                        settings.transient_noise_fmin = Utils::parseValue(value);
+                    } else if (option == "FMAX" || option == "BW" || option == "BANDWIDTH") {
+                        settings.transient_noise_fmax = Utils::parseValue(value);
+                    } else if (option == "SEED" && !value.empty()) {
+                        settings.transient_noise_seed = static_cast<unsigned int>(std::stoul(value));
+                    } else if (option == "SCALE") {
+                        settings.transient_noise_scale = Utils::parseValue(value);
+                    } else if (option == "NOISEMODE" || option == "MODE") {
+                        const std::string mode = toUpperCopy(value);
+                        if (mode == "ZOH" || mode == "SDE") settings.transient_noise_mode = mode;
+                    } else if (option == "OVERSAMPLE" && !value.empty()) {
+                        settings.transient_noise_oversample = std::clamp(
+                            static_cast<int>(Utils::parseValue(value)), 1, 1000000);
+                    } else if ((option == "TONES_PER_DEC" || option == "NOISETONES") && !value.empty()) {
+                        settings.transient_noise_colored_tones_per_dec = std::clamp(
+                            static_cast<int>(Utils::parseValue(value)), 1, 64);
+                    } else if (option == "NOISE" || option == "TRAN_NOISE") {
+                        std::string enabled = toUpperCopy(value);
+                        settings.transient_noise = value.empty() ||
+                            !(enabled == "0" || enabled == "NO" || enabled == "FALSE" || enabled == "OFF");
+                    }
                 }
                 netlist.setSettings(settings);
             } else if (cmd == ".IC" || cmd == ".NODESET") {
@@ -2043,20 +2269,90 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "AC";
-                // tokens[1] is DEC/OCT/LIN
-                settings.points_per_dec = std::stoi(tokens[2]);
-                settings.f_start = Utils::parseValue(tokens[3]);
-                settings.f_stop = Utils::parseValue(tokens[4]);
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
+                const std::string sweepType = toUpperCopy(tokens[1]);
+                settings.frequency_sweep_type = sweepType;
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    if (tokens.size() < 3) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": .AC VALUES requires at least one frequency: " + line);
+                        continue;
+                    }
+                    for (size_t i = 2; i < tokens.size(); ++i) {
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                } else if (sweepType == "STEP") {
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": .AC STEP requires start stop step: " + line);
+                        continue;
+                    }
+                    settings.f_start = Utils::parseValue(tokens[2]);
+                    settings.f_stop = Utils::parseValue(tokens[3]);
+                    settings.frequency_step = Utils::parseValue(tokens[4]);
+                    settings.points_per_dec = 0;
+                    if (settings.frequency_step <= 0.0) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .AC STEP increment must be positive: " + line);
+                    }
+                } else {
+                    // tokens[1] is DEC/OCT/LIN
+                    settings.points_per_dec = std::stoi(tokens[2]);
+                    settings.f_start = Utils::parseValue(tokens[3]);
+                    settings.f_stop = Utils::parseValue(tokens[4]);
+                }
                 netlist.setSettings(settings);
             } else if (cmd == ".PSS" || cmd == ".HB") {
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = cmd.substr(1);
                 size_t i = 1;
                 while (i < tokens.size()) {
+                    const std::string upperToken = toUpperCopy(tokens[i]);
+                    const size_t eqPos = upperToken.find('=');
+                    if (eqPos != std::string::npos) {
+                        const std::string key = upperToken.substr(0, eqPos);
+                        const std::string value = upperToken.substr(eqPos + 1);
+                        if (key == "OSCILLATOR" || key == "OSC" || key == "AUTONOMOUS") {
+                            settings.pss_autonomous =
+                                !(value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
+                            ++i;
+                            continue;
+                        }
+                        if (key == "DRIVEN") {
+                            settings.pss_autonomous =
+                                (value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
+                            ++i;
+                            continue;
+                        }
+                        if (key == "TSTAB" || key == "PSS_TSTAB" ||
+                            key == "PSS_ADAPTIVE" || key == "PSSADAPTIVE" ||
+                            key == "PSS_CONTINUATION" || key == "PSS_HOMOTOPY" ||
+                            key == "PSS_CONTINUATION_STEPS" || key == "PSS_HOMOTOPY_STEPS" ||
+                            key == "PSS_RELTOL" || key == "PSS_RESIDUAL_GOAL" ||
+                            key == "TSTAB_PERIODS" || key == "PSS_TSTAB_PERIODS" ||
+                            key == "MAX_PSS_ITER" || key == "PSS_MAX_ITER" ||
+                            key == "PSS_ITERS" || key == "PSS_ITERATIONS") {
+                            applyOptionToken(settings, tokens[i]);
+                            ++i;
+                            continue;
+                        }
+                    }
+                    if (upperToken == "AUTONOMOUS" || upperToken == "OSC" || upperToken == "OSCILLATOR") {
+                        settings.pss_autonomous = true;
+                        ++i;
+                        continue;
+                    }
+                    if (upperToken == "DRIVEN") {
+                        settings.pss_autonomous = false;
+                        ++i;
+                        continue;
+                    }
                     bool is_int = !tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit);
                     if (is_int) {
                         settings.n_harms = std::stoi(tokens[i]);
-                        break;
+                        ++i;
+                        continue;
                     } else if (settings.f_fund.size() < 4) {
                         settings.f_fund.push_back(Utils::parseValue(tokens[i]));
                     } else {
@@ -2068,17 +2364,49 @@ Netlist Parser::parse(const std::string& filePath) {
                     netlist.addError("Line " + std::to_string(lineNo) + ": " + cmd + " requires at least 1 fundamental frequency.");
                 }
                 netlist.setSettings(settings);
-            }
- else if (cmd == ".SP") {
-                if (tokens.size() < 5) {
+            } else if (cmd == ".SP") {
+                if (tokens.size() < 3) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "SP";
-                settings.points_per_dec = std::stoi(tokens[2]);
-                settings.f_start = Utils::parseValue(tokens[3]);
-                settings.f_stop = Utils::parseValue(tokens[4]);
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
+                const std::string sweepType = toUpperCopy(tokens[1]);
+                settings.frequency_sweep_type = sweepType;
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    for (size_t i = 2; i < tokens.size(); ++i) {
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    if (settings.frequency_values.empty()) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP VALUES line ignored: " + line);
+                        continue;
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                } else if (sweepType == "STEP") {
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP STEP line ignored: " + line);
+                        continue;
+                    }
+                    settings.f_start = Utils::parseValue(tokens[2]);
+                    settings.f_stop = Utils::parseValue(tokens[3]);
+                    settings.frequency_step = Utils::parseValue(tokens[4]);
+                    settings.points_per_dec = 0;
+                    if (settings.frequency_step <= 0.0) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .SP STEP increment must be positive: " + line);
+                    }
+                } else {
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP sweep line ignored: " + line);
+                        continue;
+                    }
+                    settings.points_per_dec = std::stoi(tokens[2]);
+                    settings.f_start = Utils::parseValue(tokens[3]);
+                    settings.f_stop = Utils::parseValue(tokens[4]);
+                }
                 netlist.setSettings(settings);
             } else if (cmd == ".NOISE") {
                 if (tokens.size() < 6) {
@@ -2087,20 +2415,49 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "NOISE";
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
                 // tokens[1] is V(node)
                 std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
                 settings.out_node = netlist.getOrCreateNode(outNode);
+                settings.noise_input_source = tokens.size() > 2 ? tokens[2] : "";
                 size_t sweepIdx = 3;
                 std::string sweepType = toUpperCopy(tokens[sweepIdx]);
-                if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE VALUES line ignored: " + line);
+                        continue;
+                    }
+                    settings.frequency_sweep_type = sweepType;
+                    for (size_t i = sweepIdx + 1; i < tokens.size(); ++i) {
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                } else if (sweepType == "STEP") {
+                    if (tokens.size() < sweepIdx + 4) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE STEP line ignored: " + line);
+                        continue;
+                    }
+                    settings.frequency_sweep_type = "STEP";
+                    settings.f_start = Utils::parseValue(tokens[sweepIdx + 1]);
+                    settings.f_stop = Utils::parseValue(tokens[sweepIdx + 2]);
+                    settings.frequency_step = Utils::parseValue(tokens[sweepIdx + 3]);
+                    if (settings.frequency_step <= 0.0) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .NOISE STEP increment must be positive: " + line);
+                    }
+                } else if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
                     if (tokens.size() < 7) {
                         netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE sweep line ignored: " + line);
                         continue;
                     }
                     settings.points_per_dec = std::stoi(tokens[4]);
+                    settings.frequency_sweep_type = sweepType;
                     settings.f_start = Utils::parseValue(tokens[5]);
                     settings.f_stop = Utils::parseValue(tokens[6]);
                 } else {
+                    settings.frequency_sweep_type = "DEC";
                     settings.points_per_dec = std::stoi(tokens[3]);
                     settings.f_start = Utils::parseValue(tokens[4]);
                     settings.f_stop = Utils::parseValue(tokens[5]);
@@ -2193,9 +2550,31 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "STB";
-                settings.points_per_dec = std::stoi(tokens[2]);
-                settings.f_start = Utils::parseValue(tokens[3]);
-                settings.f_stop = Utils::parseValue(tokens[4]);
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
+                const std::string sweepType = toUpperCopy(tokens[1]);
+                settings.frequency_sweep_type = sweepType;
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    for (size_t i = 2; i < tokens.size(); ++i) {
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                } else if (sweepType == "STEP") {
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .STB STEP line ignored: " + line);
+                        continue;
+                    }
+                    settings.f_start = Utils::parseValue(tokens[2]);
+                    settings.f_stop = Utils::parseValue(tokens[3]);
+                    settings.frequency_step = Utils::parseValue(tokens[4]);
+                    settings.points_per_dec = 0;
+                } else {
+                    settings.points_per_dec = std::stoi(tokens[2]);
+                    settings.f_start = Utils::parseValue(tokens[3]);
+                    settings.f_stop = Utils::parseValue(tokens[4]);
+                }
                 netlist.setSettings(settings);
             } else if (cmd == ".PAC") {
                 if (tokens.size() < 5) {
@@ -2204,9 +2583,28 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "PAC";
-                settings.points_per_dec = std::stoi(tokens[2]);
-                settings.f_start = Utils::parseValue(tokens[3]);
-                settings.f_stop = Utils::parseValue(tokens[4]);
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
+                settings.f_fund.clear();
+                const std::string sweepType = toUpperCopy(tokens[1]);
+                settings.frequency_sweep_type = sweepType;
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    for (size_t i = 2; i < tokens.size(); ++i) {
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                } else if (sweepType == "STEP") {
+                    settings.f_start = Utils::parseValue(tokens[2]);
+                    settings.f_stop = Utils::parseValue(tokens[3]);
+                    settings.frequency_step = Utils::parseValue(tokens[4]);
+                    settings.points_per_dec = 0;
+                } else {
+                    settings.points_per_dec = std::stoi(tokens[2]);
+                    settings.f_start = Utils::parseValue(tokens[3]);
+                    settings.f_stop = Utils::parseValue(tokens[4]);
+                }
                 netlist.setSettings(settings);
             } else if (cmd == ".PNOISE") {
                 if (tokens.size() < 6) {
@@ -2215,11 +2613,42 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "PNOISE";
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
                 std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
                 settings.out_node = netlist.getOrCreateNode(outNode);
+                settings.noise_input_source = tokens.size() > 2 ? tokens[2] : "";
                 size_t sweepIdx = 3;
                 std::string sweepType = toUpperCopy(tokens[sweepIdx]);
-                if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
+                settings.frequency_sweep_type = sweepType;
+                size_t optionsStart = tokens.size();
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE VALUES line ignored: " + line);
+                        continue;
+                    }
+                    for (size_t i = sweepIdx + 1; i < tokens.size(); ++i) {
+                        if (tokens[i].find('=') != std::string::npos) {
+                            optionsStart = i;
+                            break;
+                        }
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                    if (optionsStart == tokens.size()) optionsStart = tokens.size();
+                } else if (sweepType == "STEP") {
+                    if (tokens.size() < sweepIdx + 4) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE STEP line ignored: " + line);
+                        continue;
+                    }
+                    settings.f_start = Utils::parseValue(tokens[sweepIdx + 1]);
+                    settings.f_stop = Utils::parseValue(tokens[sweepIdx + 2]);
+                    settings.frequency_step = Utils::parseValue(tokens[sweepIdx + 3]);
+                    settings.points_per_dec = 0;
+                    optionsStart = sweepIdx + 4;
+                } else if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
                     if (tokens.size() < 7) {
                         netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE sweep line ignored: " + line);
                         continue;
@@ -2227,14 +2656,73 @@ Netlist Parser::parse(const std::string& filePath) {
                     settings.points_per_dec = std::stoi(tokens[4]);
                     settings.f_start = Utils::parseValue(tokens[5]);
                     settings.f_stop = Utils::parseValue(tokens[6]);
+                    optionsStart = 7;
                 } else {
                     settings.points_per_dec = std::stoi(tokens[3]);
                     settings.f_start = Utils::parseValue(tokens[4]);
                     settings.f_stop = Utils::parseValue(tokens[5]);
+                    optionsStart = 6;
+                }
+                for (size_t i = optionsStart; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    const std::string option = toUpperCopy(key);
+                    if ((option == "FUND" || option == "FUNDAMENTAL" || option == "F0") && !value.empty()) {
+                        settings.f_fund.clear();
+                        settings.f_fund.push_back(Utils::parseValue(value));
+                    } else if ((option == "SIDEBANDS" || option == "SIDEBAND" || option == "MAXSIDEBAND") && !value.empty()) {
+                        settings.n_harms = std::max(0, std::stoi(value));
+                    } else {
+                        applyOptionToken(settings, tokens[i]);
+                    }
+                }
+                netlist.setSettings(settings);
+            } else if (cmd == ".PSSPAC" || cmd == ".PSSSTB") {
+                if (tokens.size() < 6) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid " + cmd + " line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = cmd.substr(1);
+                settings.frequency_values.clear();
+                settings.frequency_step = 0.0;
+                settings.f_fund.clear();
+                settings.f_fund.push_back(Utils::parseValue(tokens[1]));
+                const std::string sweepType = toUpperCopy(tokens[2]);
+                settings.frequency_sweep_type = sweepType;
+                size_t optionsStart = tokens.size();
+                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                    for (size_t i = 3; i < tokens.size(); ++i) {
+                        if (tokens[i].find('=') != std::string::npos) {
+                            optionsStart = i;
+                            break;
+                        }
+                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.f_start = settings.frequency_values.front();
+                    settings.f_stop = settings.frequency_values.back();
+                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
+                } else if (sweepType == "STEP") {
+                    settings.f_start = Utils::parseValue(tokens[3]);
+                    settings.f_stop = Utils::parseValue(tokens[4]);
+                    settings.frequency_step = Utils::parseValue(tokens[5]);
+                    settings.points_per_dec = 0;
+                    optionsStart = 6;
+                } else {
+                    settings.points_per_dec = std::stoi(tokens[3]);
+                    settings.f_start = Utils::parseValue(tokens[4]);
+                    settings.f_stop = Utils::parseValue(tokens[5]);
+                    optionsStart = 6;
+                }
+                for (size_t i = optionsStart; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    const std::string option = toUpperCopy(key);
+                    if ((option == "SIDEBANDS" || option == "SIDEBAND" || option == "MAXSIDEBAND") && !value.empty()) {
+                        settings.n_harms = std::max(0, std::stoi(value));
+                    }
                 }
                 netlist.setSettings(settings);
             } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" || 
-                       cmd == ".PSSSP" || cmd == ".PSSSTB") {
+                       cmd == ".PSSSP") {
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = cmd.substr(1);
                 
@@ -2450,13 +2938,32 @@ Netlist Parser::parse(const std::string& filePath) {
             try {
                 const auto& settings = netlist.getSettings();
                 auto instanceParams = parseParameterTokens(tokens, 6);
-                netlist.addDevice(std::make_unique<OSDIDevice>(
+                const OsdiDescriptorMetadata* loadedMetadata =
+                    netlist.findOsdiMetadata(model->type);
+                auto sharedModel = netlist.findOsdiModelState(tokens[5]);
+                const bool modelStateWasShared = static_cast<bool>(sharedModel);
+                auto osdiDevice = std::make_unique<OSDIDevice>(
                     tokens[0], *desc, nodes, model->params, instanceParams,
                     settings.temperature_c,
                     settings.osdi_limiting_rhs,
                     settings.osdi_tran_jacobian,
                     settings.osdi_bind_full_model_params,
-                    settings.osdi_spice_rhs));
+                    settings.osdi_spice_rhs,
+                    loadedMetadata,
+                    sharedModel,
+                    settings.gmin,
+                    settings.minr,
+                    settings.nominal_temperature_c,
+                    settings.geometry_scale,
+                    settings.reltol,
+                    settings.vntol,
+                    settings.abstol,
+                    settings.chgtol,
+                    settings.fluxtol);
+                if (!modelStateWasShared) {
+                    netlist.storeOsdiModelState(tokens[5], osdiDevice->sharedModelState());
+                }
+                netlist.addDevice(std::move(osdiDevice));
                 const char* descName = desc->name ? desc->name : desc->model_name;
                 netlist.addModelStatus(
                     "OSDI_DEVICE instance=" + tokens[0] +
@@ -2464,6 +2971,12 @@ Netlist Parser::parse(const std::string& filePath) {
                     " type=" + model->type +
                     " descriptor=" + std::string(descName ? descName : "<unnamed>") +
                     " osdi_nodes=" + std::to_string(desc->num_nodes) +
+                    osdiTerminalSummary(loadedMetadata, desc->num_terminals) +
+                    " model_state=" + std::string(modelStateWasShared ? "shared" : "created") +
+                    " simparam_gmin=" + formatNumericValue(settings.gmin) +
+                    " simparam_minr=" + formatNumericValue(settings.minr) +
+                    " simparam_tnom=" + formatNumericValue(settings.nominal_temperature_c) +
+                    " simparam_scale=" + formatNumericValue(settings.geometry_scale) +
                     " internal_mode=" + std::string(settings.osdi_internal_nodes ? "bound-hidden" : "collapsed-only"));
             } catch (const std::exception& ex) {
                 netlist.addError(
@@ -2544,13 +3057,14 @@ Netlist Parser::parse(const std::string& filePath) {
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
+            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -2559,6 +3073,7 @@ Netlist Parser::parse(const std::string& filePath) {
 
             auto vsrc = std::make_unique<VoltageSource>(tokens[0], n1, n2, dcValue, -1);
             vsrc->setAcMagnitude(acMagnitude);
+            vsrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) vsrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) vsrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) vsrc->setPwl(pwlT, pwlV);
@@ -2574,13 +3089,14 @@ Netlist Parser::parse(const std::string& filePath) {
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
+            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -2588,6 +3104,7 @@ Netlist Parser::parse(const std::string& filePath) {
             }
             auto isrc = std::make_unique<CurrentSource>(tokens[0], n1, n2, dcValue);
             isrc->setAcMagnitude(acMagnitude);
+            isrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) isrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) isrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) isrc->setPwl(pwlT, pwlV);
