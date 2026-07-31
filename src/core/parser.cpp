@@ -2332,7 +2332,8 @@ Netlist Parser::parse(const std::string& filePath) {
                             key == "PSS_RELTOL" || key == "PSS_RESIDUAL_GOAL" ||
                             key == "TSTAB_PERIODS" || key == "PSS_TSTAB_PERIODS" ||
                             key == "MAX_PSS_ITER" || key == "PSS_MAX_ITER" ||
-                            key == "PSS_ITERS" || key == "PSS_ITERATIONS") {
+                            key == "PSS_ITERS" || key == "PSS_ITERATIONS" ||
+                            key == "UIC" || key == "USE_UIC" || key == "USE_INITIAL_CONDITIONS") {
                             applyOptionToken(settings, tokens[i]);
                             ++i;
                             continue;
@@ -2345,6 +2346,11 @@ Netlist Parser::parse(const std::string& filePath) {
                     }
                     if (upperToken == "DRIVEN") {
                         settings.pss_autonomous = false;
+                        ++i;
+                        continue;
+                    }
+                    if (upperToken == "UIC" || upperToken == "USE_UIC" || upperToken == "USE_INITIAL_CONDITIONS") {
+                        settings.use_uic = true;
                         ++i;
                         continue;
                     }
