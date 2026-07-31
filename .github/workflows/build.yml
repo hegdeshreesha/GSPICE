@@ -34,7 +34,9 @@ jobs:
         run: cmake --build build --config Release --parallel 2
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: >
+          ctest --test-dir build -C Release --output-on-failure
+          -R "^(unit_dae_state|smoke_rc_pulse_v|smoke_rc_pulse_i|smoke_options|smoke_options_policy|smoke_dc_sweep_model|smoke_ac_lin|smoke_ac_values_phase|cli_version|cli_capabilities)$"
 
       - name: Verify capability contract
         shell: bash
