@@ -78,9 +78,8 @@ int choose_active_threads(int requested_threads, int num_devs, int matrix_size) 
 }
 
 bool parallel_stamp_enabled(int num_devs, int matrix_size) {
-    (void)matrix_size;
     if (omp_get_max_threads() <= 1) return false;
-    return num_devs >= 2;
+    return num_devs >= 256 && matrix_size >= 256;
 }
 
 double default_transient_max_step(const SimulationSettings& settings, double output_step) {
@@ -2350,9 +2349,23 @@ void run_simulation(
     } else if (settings.type == "MC" && !settings.mc_source.empty()) {
         set_source_dc_value(devices, settings.mc_source, settings.mc_mean);
     }
-
     if (!settings.use_uic) {
         x_dc = solve_dc_with_recovery(x_dc, "Calculating DC Operating Point...", true);
+    } else {
+        for (const auto& dev : devices) {
+            if (auto* vsrc = dynamic_cast<VoltageSource*>(dev.get())) {
+                const int p = vsrc->getNodePos();
+                const int n = vsrc->getNodeNeg();
+                const double val = vsrc->evaluateAt(0.0);
+                if (p >= 0 && p < num_nodes) {
+                    const double n_val = (n >= 0 && n < num_nodes) ? x_dc[n] : 0.0;
+                    x_dc[p] = n_val + val;
+                }
+                if (n >= 0 && n < num_nodes && (p < 0 || p >= num_nodes)) {
+                    x_dc[n] = -val;
+                }
+            }
+        }
     }
     run_dae_audits(devices, x_dc, settings);
 

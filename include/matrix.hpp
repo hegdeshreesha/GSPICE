@@ -50,8 +50,13 @@ public:
     void add(int index, T value) {
         if (index >= 0 && index < (int)data_.size()) {
             if (omp_in_parallel()) {
-                thread_data_[omp_get_thread_num()][index] += value;
-                has_thread_data_.store(true, std::memory_order_relaxed);
+                const int tid = omp_get_thread_num();
+                if (tid >= 0 && static_cast<std::size_t>(tid) < thread_data_.size() && index < static_cast<int>(thread_data_[tid].size())) {
+                    thread_data_[tid][index] += value;
+                    has_thread_data_.store(true, std::memory_order_relaxed);
+                } else {
+                    data_[index] += value;
+                }
             } else {
                 data_[index] += value;
             }

@@ -54,8 +54,13 @@ public:
                 return;
             }
             if (omp_in_parallel()) {
-                thread_triplets_[static_cast<size_t>(omp_get_thread_num())].push_back({row, col, value});
-                has_thread_data_.store(true, std::memory_order_relaxed);
+                const std::size_t tid = static_cast<std::size_t>(omp_get_thread_num());
+                if (tid < thread_triplets_.size()) {
+                    thread_triplets_[tid].push_back({row, col, value});
+                    has_thread_data_.store(true, std::memory_order_relaxed);
+                } else {
+                    triplets_.push_back({row, col, value});
+                }
             } else {
                 triplets_.push_back({row, col, value});
             }
