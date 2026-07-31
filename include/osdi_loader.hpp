@@ -4,7 +4,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
@@ -50,17 +54,17 @@ public:
             return;
         }
 
-        hModule_ = LoadLibraryA(libraryPath.c_str());
+        hModule_ = openLibrary(libraryPath);
         if (!hModule_) {
-            error_ = "Failed to load OSDI library: " + libraryPath + " (Windows error " + std::to_string(GetLastError()) + ")";
+            error_ = "Failed to load OSDI library: " + libraryPath + " (" + lastLoaderError() + ")";
             std::cerr << error_ << std::endl;
             return;
         }
 
         auto* major_ptr = reinterpret_cast<uint32_t*>(
-            GetProcAddress(hModule_, "OSDI_VERSION_MAJOR"));
+            getSymbol(hModule_, "OSDI_VERSION_MAJOR"));
         auto* minor_ptr = reinterpret_cast<uint32_t*>(
-            GetProcAddress(hModule_, "OSDI_VERSION_MINOR"));
+            getSymbol(hModule_, "OSDI_VERSION_MINOR"));
         if (!major_ptr || !minor_ptr ||
             (*major_ptr == 0u && *minor_ptr < OSDI_VERSION_MINOR_CURR)) {
             error_ = "Unsupported OSDI interface version in " + libraryPath +
@@ -72,17 +76,17 @@ public:
         version_minor_ = *minor_ptr;
 
         auto* nature_count = reinterpret_cast<uint32_t*>(
-            GetProcAddress(hModule_, "OSDI_NATURES_LEN"));
+            getSymbol(hModule_, "OSDI_NATURES_LEN"));
         auto* discipline_count = reinterpret_cast<uint32_t*>(
-            GetProcAddress(hModule_, "OSDI_DISCIPLINES_LEN"));
+            getSymbol(hModule_, "OSDI_DISCIPLINES_LEN"));
         auto* attribute_count = reinterpret_cast<uint32_t*>(
-            GetProcAddress(hModule_, "OSDI_ATTRIBUTES_LEN"));
+            getSymbol(hModule_, "OSDI_ATTRIBUTES_LEN"));
         const auto* natures = reinterpret_cast<const OsdiNature*>(
-            GetProcAddress(hModule_, "OSDI_NATURES"));
+            getSymbol(hModule_, "OSDI_NATURES"));
         const auto* disciplines = reinterpret_cast<const OsdiDiscipline*>(
-            GetProcAddress(hModule_, "OSDI_DISCIPLINES"));
+            getSymbol(hModule_, "OSDI_DISCIPLINES"));
         const auto* attributes = reinterpret_cast<const OsdiAttribute*>(
-            GetProcAddress(hModule_, "OSDI_ATTRIBUTES"));
+            getSymbol(hModule_, "OSDI_ATTRIBUTES"));
         nature_count_ = nature_count ? *nature_count : 0u;
         discipline_count_ = discipline_count ? *discipline_count : 0u;
         attribute_count_ = attribute_count ? *attribute_count : 0u;
@@ -90,14 +94,14 @@ public:
         // OSDI exports a writable function-pointer slot used by generated
         // $display/$warning/$error code.
         if (auto** logger = reinterpret_cast<void**>(
-                GetProcAddress(hModule_, "osdi_log"))) {
+                getSymbol(hModule_, "osdi_log"))) {
             *logger = reinterpret_cast<void*>(&osdiLogMessage);
         }
 
         // Standard OSDI exports
-        auto* num_desc_ptr = reinterpret_cast<uint32_t*>(GetProcAddress(hModule_, "OSDI_NUM_DESCRIPTORS"));
-        auto* descriptor_size_ptr = reinterpret_cast<uint32_t*>(GetProcAddress(hModule_, "OSDI_DESCRIPTOR_SIZE"));
-        auto* descriptors_base = reinterpret_cast<const char*>(GetProcAddress(hModule_, "OSDI_DESCRIPTORS"));
+        auto* num_desc_ptr = reinterpret_cast<uint32_t*>(getSymbol(hModule_, "OSDI_NUM_DESCRIPTORS"));
+        auto* descriptor_size_ptr = reinterpret_cast<uint32_t*>(getSymbol(hModule_, "OSDI_DESCRIPTOR_SIZE"));
+        auto* descriptors_base = reinterpret_cast<const char*>(getSymbol(hModule_, "OSDI_DESCRIPTORS"));
 
         if (num_desc_ptr && descriptor_size_ptr && descriptors_base) {
             uint32_t num = *num_desc_ptr;
@@ -132,7 +136,7 @@ public:
     }
 
     ~OSDILoader() {
-        if (hModule_) FreeLibrary(hModule_);
+        if (hModule_) closeLibrary(hModule_);
     }
 
     const std::vector<OsdiDescriptor>& getAvailableModels() const {
@@ -153,7 +157,38 @@ public:
     uint32_t getAttributeCount() const { return attribute_count_; }
 
 private:
-    HMODULE hModule_ = nullptr;
+#ifdef _WIN32
+    using LibraryHandle = HMODULE;
+    static LibraryHandle openLibrary(const std::string& path) {
+        return LoadLibraryA(path.c_str());
+    }
+    static void* getSymbol(LibraryHandle handle, const char* name) {
+        return reinterpret_cast<void*>(GetProcAddress(handle, name));
+    }
+    static void closeLibrary(LibraryHandle handle) {
+        FreeLibrary(handle);
+    }
+    static std::string lastLoaderError() {
+        return "Windows error " + std::to_string(GetLastError());
+    }
+#else
+    using LibraryHandle = void*;
+    static LibraryHandle openLibrary(const std::string& path) {
+        return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    static void* getSymbol(LibraryHandle handle, const char* name) {
+        return dlsym(handle, name);
+    }
+    static void closeLibrary(LibraryHandle handle) {
+        dlclose(handle);
+    }
+    static std::string lastLoaderError() {
+        const char* err = dlerror();
+        return err ? std::string(err) : std::string("dynamic loader error");
+    }
+#endif
+
+    LibraryHandle hModule_ = nullptr;
     bool loaded_ = false;
     std::string library_path_;
     std::string error_;

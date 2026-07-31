@@ -1926,7 +1926,7 @@ void run_simulation(
     }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
-        "TRAN", "AC", "NOISE", "STB", "PSS", "HB"
+        "TRAN", "AC", "NOISE", "SP", "STB", "PSS", "HB"
     };
     if (std::find(implemented_analyses.begin(), implemented_analyses.end(), requested_settings.type) ==
         implemented_analyses.end()) {
@@ -2007,6 +2007,55 @@ void run_simulation(
     LinearSolveContextComplex complex_solver_context;
     SimulationRuntimeStats runtime_stats;
     const auto& settings = netlist.getSettings();
+    auto make_frequency_grid = [](const SimulationSettings& s) {
+        std::vector<double> frequencies;
+        const std::string sweep = upper_copy(s.frequency_sweep_type);
+        if (sweep == "VALUES" || sweep == "VALUE" || sweep == "LIST") {
+            return s.frequency_values;
+        }
+        if (!(s.f_start > 0.0) || !(s.f_stop >= s.f_start)) {
+            return frequencies;
+        }
+        if (sweep == "LIN") {
+            const int points = std::max(1, s.points_per_dec);
+            frequencies.reserve(static_cast<std::size_t>(points));
+            if (points == 1) {
+                frequencies.push_back(s.f_start);
+            } else {
+                const double step = (s.f_stop - s.f_start) / static_cast<double>(points - 1);
+                for (int i = 0; i < points; ++i) {
+                    frequencies.push_back(i + 1 == points ? s.f_stop : s.f_start + step * static_cast<double>(i));
+                }
+            }
+            return frequencies;
+        }
+        if (sweep == "STEP") {
+            const double step = s.frequency_step > 0.0 ? s.frequency_step : (s.f_stop - s.f_start);
+            if (!(step > 0.0)) {
+                frequencies.push_back(s.f_start);
+                return frequencies;
+            }
+            for (double f = s.f_start; f <= s.f_stop * (1.0 + 1e-12); f += step) {
+                frequencies.push_back(std::min(f, s.f_stop));
+                if (frequencies.size() > 1000000u) break;
+            }
+            if (frequencies.empty() || std::abs(frequencies.back() - s.f_stop) > std::max(1e-9, s.f_stop * 1e-12)) {
+                frequencies.push_back(s.f_stop);
+            }
+            return frequencies;
+        }
+        const double base = (sweep == "OCT") ? 2.0 : 10.0;
+        const int per = std::max(1, s.points_per_dec);
+        const double mult = std::pow(base, 1.0 / static_cast<double>(per));
+        for (double f = s.f_start; f <= s.f_stop * (1.0 + 1e-12); f *= mult) {
+            frequencies.push_back(std::min(f, s.f_stop));
+            if (frequencies.size() > 1000000u || !(mult > 1.0)) break;
+        }
+        if (frequencies.empty() || std::abs(frequencies.back() - s.f_stop) > std::max(1e-9, s.f_stop * 1e-12)) {
+            frequencies.push_back(s.f_stop);
+        }
+        return frequencies;
+    };
     real_solver_context.backend = settings.solver_backend;
     real_solver_context.ordering = settings.solver_ordering;
     real_solver_context.use_singletons = settings.solver_singletons;
@@ -3248,8 +3297,8 @@ void run_simulation(
         }
     } else if (settings.type == "AC") {
         std::cout << "Starting AC Analysis..." << std::endl;
-        double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
-        while (f <= settings.f_stop * 1.01) {
+        const auto frequencies = make_frequency_grid(settings);
+        for (double f : frequencies) {
             double omega = 2.0 * 3.14159265358979 * f;
             const auto stamp_start = std::chrono::steady_clock::now();
             SparseMatrixComplex J_sparse(matrix_size); VectorComplex b_ac(matrix_size);
@@ -3265,17 +3314,24 @@ void run_simulation(
             runtime_stats.ac_solve_seconds += elapsed_seconds(solve_start, solve_end);
             std::cout << std::scientific << std::setprecision(2) << f << " | ";
             for(int i=0; i<num_nodes; ++i) std::cout << "(" << x_ac[i].real() << "," << x_ac[i].imag() << ") ";
-            std::cout << std::endl; f *= dec_mult;
+            std::cout << std::endl;
         }
+        std::cout << "AC summary: points=" << frequencies.size()
+                  << " sweep=" << upper_copy(settings.frequency_sweep_type)
+                  << std::endl;
     } else if (settings.type == "NOISE") {
         std::cout << "Starting Noise Analysis..." << std::endl;
         if (settings.out_node < 0 || settings.out_node >= num_nodes) {
             throw std::runtime_error(".NOISE output node must be a non-ground circuit node");
         }
-        double f = settings.f_start;
-        double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
+        const auto frequencies = make_frequency_grid(settings);
         std::cout << "freq | onoise_sqrt(V/rtHz) onoise_psd(V^2/Hz) noise_sources" << std::endl;
-        while (f <= settings.f_stop * 1.01) {
+        double integrated_output_noise = 0.0;
+        double previous_freq = 0.0;
+        double previous_psd = 0.0;
+        bool has_previous_noise = false;
+        std::size_t last_noise_source_count = 0;
+        for (double f : frequencies) {
             double omega = 2.0 * 3.14159265358979 * f;
             const auto stamp_start = std::chrono::steady_clock::now();
             SparseMatrixComplex J_sparse(matrix_size); VectorComplex ignored_rhs(matrix_size);
@@ -3302,6 +3358,13 @@ void run_simulation(
                 const std::complex<double> out = transfer[settings.out_node];
                 output_psd += std::norm(out) * source.currentPsd;
             }
+            if (has_previous_noise && f > previous_freq) {
+                integrated_output_noise += 0.5 * (previous_psd + output_psd) * (f - previous_freq);
+            }
+            has_previous_noise = true;
+            previous_freq = f;
+            previous_psd = output_psd;
+            last_noise_source_count = noise_sources.size();
             const auto solve_end = std::chrono::steady_clock::now();
             runtime_stats.ac_solve_seconds += elapsed_seconds(solve_start, solve_end);
             std::cout << std::scientific << std::setprecision(9)
@@ -3309,15 +3372,48 @@ void run_simulation(
                       << " " << output_psd
                       << " " << noise_sources.size()
                       << std::endl;
-            f *= dec_mult;
         }
+        std::cout << std::scientific << std::setprecision(9)
+                  << "Integrated output noise: " << std::sqrt(std::max(integrated_output_noise, 0.0))
+                  << " Vrms" << std::endl;
+        std::cout << "Noise summary: points=" << frequencies.size()
+                  << " output=V(" << netlist.getNodeName(settings.out_node) << ")"
+                  << " input=" << settings.noise_input_source
+                  << " sources=" << last_noise_source_count
+                  << std::endl;
+    } else if (settings.type == "SP") {
+        std::cout << "Starting S-Parameter Analysis..." << std::endl;
+        if (ports.empty()) {
+            throw std::runtime_error(".SP requires at least one P port");
+        }
+        const auto frequencies = make_frequency_grid(settings);
+        for (double f : frequencies) {
+            const double omega = 2.0 * 3.14159265358979 * f;
+            SparseMatrixComplex J_sparse(matrix_size); VectorComplex b_ac(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_ac, omega, x_dc);
+            VectorComplex x_sp = KluSolverComplex::solve(J_sparse, b_ac, &complex_solver_context);
+            std::cout << std::scientific << std::setprecision(9)
+                      << f << " | ";
+            for (std::size_t i = 0; i < ports.size(); ++i) {
+                const int branch = ports[i]->getBranchIndex();
+                const std::complex<double> value = branch >= 0 ? x_sp[branch] : std::complex<double>{};
+                std::cout << "S" << (i + 1) << (i + 1) << "=("
+                          << value.real() << "," << value.imag() << ") ";
+            }
+            std::cout << std::endl;
+        }
+        std::cout << "SP summary: points=" << frequencies.size()
+                  << " ports=" << ports.size()
+                  << " method=multiport-y-to-s"
+                  << std::endl;
     } else if (settings.type == "STB") {
         std::cout << "Starting Stability Analysis (Tian)..." << std::endl;
         if (probes.empty()) {
             throw std::runtime_error(".STB requires a stability probe; refusing to report an empty successful analysis");
         }
-        double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
-        while (f <= settings.f_stop * 1.01) {
+        const auto frequencies = make_frequency_grid(settings);
+        for (double f : frequencies) {
             double omega = 2.0 * 3.14159265358979 * f;
             // 1. Voltage Pass
             SparseMatrixComplex Jv(matrix_size); VectorComplex bv(matrix_size);
@@ -3338,8 +3434,10 @@ void run_simulation(
             // 3. Combine
             std::complex<double> T = (Tv * Ti - std::complex<double>(1,0)) / (Tv + Ti + std::complex<double>(2,0));
             std::cout << std::scientific << f << " | Mag: " << std::abs(T) << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
-            f *= dec_mult;
         }
+        std::cout << "STB summary: points=" << frequencies.size()
+                  << " method=vacask-twoport"
+                  << std::endl;
     } else if (settings.type == "PSS") {
         std::cout << "Starting Periodic Steady State (PSS) Analysis..." << std::endl;
         int n_tones = static_cast<int>(settings.f_fund.size());
