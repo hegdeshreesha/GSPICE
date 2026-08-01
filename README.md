@@ -36,6 +36,21 @@ Prerequisites are CMake 3.10+, a C++17 compiler, and OpenMP. SuiteSparse/KLU is
 optional for development builds and required by the Windows vcpkg release
 preset.
 
+On Windows, run CMake from **x64 Native Tools Command Prompt for Visual Studio**.
+Plain PowerShell does not normally have `nmake.exe` or `cl.exe` on `PATH`.
+
+To open that environment from PowerShell:
+
+```powershell
+$vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+cmd /k "`"$vs\Common7\Tools\VsDevCmd.bat`" -arch=x64"
+```
+
+If CMake says it is using `NMake Makefiles` and then cannot find `nmake`, the
+terminal does not have the Visual Studio build tools on `PATH`. Open the x64
+Native Tools prompt, or run `VsDevCmd.bat` before CMake. Delete the old `build`
+directory before switching generators because CMake caches the generator there.
+
 ```powershell
 cmake -S . -B build
 cmake --build build --config Release
