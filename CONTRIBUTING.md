@@ -8,7 +8,7 @@ priority over feature count.
 GSPICE may learn requirements and numerical behavior from public simulators,
 standards, and academic literature, but contributions must be independently
 implemented. Do not copy source code, pseudocode, comments, tests, internal
-names, or file organization from VACASK, Xyce, ngspice, or other projects whose
+names, or file organization from other simulator projects whose
 license is incompatible with GSPICE. See
 [`docs/DAE_ARCHITECTURE.md`](docs/DAE_ARCHITECTURE.md) for the design and review
 rules used by the charge-model migration.
@@ -16,7 +16,7 @@ rules used by the charge-model migration.
 1. Create a focused branch and keep unrelated changes separate.
 2. Add a regression test for every behavior change. Numerical features should
    include tolerance-based reference values, ideally from an independently
-   implemented analytic result or a documented Xyce/ngspice comparison.
+implemented analytic result or a documented independent comparison.
 3. Never silently ignore an active device, source, directive, or failed solve.
 4. Mark unvalidated analyses/models experimental in code, documentation, and
    `--capabilities`.

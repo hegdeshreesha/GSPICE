@@ -10,7 +10,7 @@
 //   transient execution time.
 //
 // Binary RAW Engine:
-//   1. Writes standard SPICE3 / Spectre compatible IEEE-754 binary double
+//   1. Writes standard SPICE-style IEEE-754 binary double
 //      precision format.
 //   2. Uses double-buffered asynchronous background disk flushing to prevent
 //      simulation thread blocking on disk I/O.

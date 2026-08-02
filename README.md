@@ -3,7 +3,7 @@
 GSPICE is Lumen's experimental C++17 SPICE-like simulator for teaching,
 research, reproducible small-circuit experiments, and native integration with
 Lumen Circuit Studio. Version 1.3 is an **academic beta**. It is not a
-replacement for Xyce, ngspice, VACASK, or a commercial signoff simulator.
+replacement for a mature or commercial signoff simulator.
 
 ## What works
 
@@ -93,13 +93,11 @@ does not yet vary arbitrary model or instance parameters.
 
 ## Transient reference validation
 
-The public harness compares a linear RC transient with an analytic solution
-and optional VACASK output, plus a PSP103.4 inverter when VACASK is supplied:
+The public harness compares a linear RC transient with an analytic solution:
 
 ```powershell
 python tools/validate_transient.py `
   --gspice build/Release/gspice.exe `
-  --vacask "C:/path/to/vacask.exe" `
   --source .
 ```
 
@@ -129,7 +127,6 @@ Jacobians after the operating point and checks terminal-charge conservation;
 
 ## Release status
 
-- [Comparison with VACASK and Xyce](docs/COMPARISON_VACASK_XYCE.md)
 - [DAE and charge architecture](docs/DAE_ARCHITECTURE.md)
 - [Complete known limitations](docs/LIMITATIONS.md)
 - [Academic beta release checklist](docs/ACADEMIC_RELEASE_CHECKLIST.md)

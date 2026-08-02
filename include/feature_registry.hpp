@@ -11,7 +11,7 @@ enum class FeatureMaturity {
     Prototype,    // Code outline or option exists without full integration
     Wired,        // Parsed and connected, but lacks full numerical test verification
     Tested,       // Numerical verification test exists and passes
-    Validated     // Cross-simulator validated against ngspice / VACASK benchmark
+    Validated     // Validated against an independent benchmark
 };
 
 inline std::string maturityToString(FeatureMaturity maturity) {

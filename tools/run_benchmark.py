@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated benchmark and validation script for GSPICE vs reference simulators (VACASK, Ngspice, Xyce).
+Automated benchmark and validation script for GSPICE vs independent references.
 Generates scalable OSDI PSP103.4 inverter chains, measures wall-clock speed, memory footprint,
 Newton iterations, and evaluates performance under FASTSPICE, MULTIRATE, and PARALLEL_SOLVE options.
 """

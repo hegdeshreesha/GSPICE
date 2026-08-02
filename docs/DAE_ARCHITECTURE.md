@@ -26,7 +26,7 @@ drifting into different physical charge models.
 
 ## Clean-room boundary
 
-VACASK, Xyce, ngspice, published numerical-analysis literature, compact-model
+published numerical-analysis literature, compact-model
 standards, and public simulator behavior may be used to identify requirements
 and compare numerical results. GSPICE implementation work follows these rules:
 

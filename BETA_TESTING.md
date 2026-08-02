@@ -2,7 +2,7 @@
 
 Date: 2026-07-20
 
-GSPICE is Lumen's native experimental SPICE-like simulator. This beta focuses on correctness, diagnostics, reproducibility, and comparison against Ngspice/Xyce. It is not yet a signoff replacement for Spectre, Ngspice, Xyce, or VACASK.
+GSPICE is Lumen's native experimental SPICE-like simulator. This beta focuses on correctness, diagnostics, reproducibility, and comparison against independent references. It is not yet a signoff replacement for mature or commercial simulators.
 
 The 1.3 academic beta also adds CSV output, Gaussian/uniform source Monte Carlo
 with optional Latin-hypercube sampling, and `--capabilities`. Unimplemented

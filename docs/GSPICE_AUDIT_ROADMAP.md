@@ -50,11 +50,11 @@ This document is the current engineering baseline for making GSPICE a serious si
 - Resistor, capacitor, inductor, diode, primitive MOS, BJT, and OSDI devices expose a common `F/Q` DAE contract. General variable-step BDF and implicit Adams-Moulton support orders 1 through 5, while charge participates in endpoint LTE checks. `TRTOL`, `CHGTOL`, and `MAXORD` have explicit transient meanings.
 - Audit mode independently finite-differences device `F/Q` Jacobians and checks terminal charge conservation with `.OPTIONS DAE_AUDIT=1`.
 - The nonlinear/linear stack now includes PN-junction transient limiting, row scaling, iterative refinement, and failure reports identifying the worst normalized unknown.
-- `tools/validate_transient.py` compares an RC deck against an analytic oracle, Xyce, and VACASK, and compares a PSP103.4 inverter against VACASK.
+- `tools/validate_transient.py` compares an RC deck against an analytic oracle.
 
 ## Current Critical Gaps
 
-- `.SUBCKT`, `.INCLUDE`, `.LIB`, `.IF`, and `.PARAM` support is stronger but still not Spectre-class. Numeric parameter expressions, simple conditionals, nested includes, library sections, and subcircuit instance overrides work; advanced language constructs, complex quoting/tokenization, discipline-aware constructs, and many model-library corner cases remain incomplete.
+- `.SUBCKT`, `.INCLUDE`, `.LIB`, `.IF`, and `.PARAM` support is stronger but still not signoff-class. Numeric parameter expressions, simple conditionals, nested includes, library sections, and subcircuit instance overrides work; advanced language constructs, complex quoting/tokenization, discipline-aware constructs, and many model-library corner cases remain incomplete.
 - PDK-grade MOS/BJT models must come through compiled compact models. The primitive MOS remains an improved but still simplified Level-1 style model, not BSIM/PSP/HICUM/EKV class modeling. The IHP SG13G2 primitive fallback is explicit opt-in compatibility only, not a production simulation path.
 - OSDI support now binds instance parameters and all recognized resolved model-card parameters, honors limiting during Newton convergence, offers guarded epoch-scoped device bypass, and can bind uncollapsed internal unknowns into hidden MNA slots. It participates in DC, transient, AC, and noise when the compiled model exposes the needed hooks. Internal-node expansion and limiting-RHS use remain opt-in pending broader OpenVAF/ngspice ABI, foundry-card, collapse-topology, charge-conservation, and golden-deck validation.
 - SuiteSparse/KLU is integrated for real and complex solves, and the internal path now has row scaling plus iterative refinement. GSPICE still needs condition diagnostics, iterative/preconditioned options, and larger stress tests.
@@ -64,7 +64,7 @@ This document is the current engineering baseline for making GSPICE a serious si
 - RF/PSS/HB/PAC/STB paths are mostly prototypes or simplified demonstrations, not production analysis engines.
 - Noise has first-pass output-referred resistor/diode/primitive-MOS support, but flicker noise, correlation, compact-model noise hooks, input-referred noise, integrated noise, and PNoise remain incomplete.
 - Transfer-function, sensitivity, pole/zero estimates, Monte Carlo, corners, production specs, behavioral sources, and transient measurements have first-pass implementations. Distortion, exact generalized-eigenvalue pole/zero extraction, analysis-wrapped `.STEP`, behavioral `.MEASURE` expressions, production process distributions, and reference-grade validation still need significant work.
-- Numeric regression has started with RAW vector checks, but GSPICE still needs broad golden-vector comparisons against ngspice/Xyce/Spectre-style references.
+- Numeric regression has started with RAW vector checks, but GSPICE still needs broad golden-vector comparisons against independent references.
 
 ## Reference Targets
 

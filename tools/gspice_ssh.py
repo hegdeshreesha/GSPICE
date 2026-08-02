@@ -122,7 +122,6 @@ def deploy_osdi_libraries(local_binary, host, scp_prefix, ssh_prefix, remote_dir
     """
     osdi_search_dirs = [
         r"C:\EDA\GSPICE\osdi",
-        r"C:\EDA\Tools\vacask_0.3.4.rc1\vacask_0.3.4.rc1_windows-x86_64\lib\mod",
     ]
     if local_binary:
         bin_dir = os.path.dirname(os.path.abspath(local_binary))

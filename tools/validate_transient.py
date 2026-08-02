@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Reproducible transient comparison against analytic and VACASK oracles."""
+"""Reproducible transient comparison against an analytic oracle."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import math
-import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -142,14 +140,10 @@ def locate_output(directory: Path, preferred: str, suffix: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gspice", required=True, type=Path)
-    parser.add_argument("--vacask", type=Path)
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--max-abs", type=float, default=2e-3)
-    parser.add_argument("--psp-max-abs", type=float, default=2e-2)
     args = parser.parse_args()
     args.gspice = args.gspice.resolve()
-    if args.vacask:
-        args.vacask = args.vacask.resolve()
     reference_dir = args.source.resolve() / "tests" / "reference"
 
     with tempfile.TemporaryDirectory(prefix="gspice_transient_reference_") as name:
@@ -162,30 +156,6 @@ def main() -> int:
         max_abs, rms, count = metrics(gspice, analytic_samples(gspice))
         print(f"analytic RC: max_abs={max_abs:.6e} rms={rms:.6e} samples={count}")
         failures = int(max_abs > args.max_abs)
-
-        if args.vacask:
-            shutil.copy2(reference_dir / "rc_step_vacask.sim", work / "rc_step_vacask.sim")
-            run([str(args.vacask), "rc_step_vacask.sim"], work, os.environ.copy())
-            vacask = read_ascii_raw(locate_output(work, "tran_ref.raw", ".raw"), "out")
-            max_abs, rms, count = metrics(gspice, vacask)
-            print(f"VACASK RC:   max_abs={max_abs:.6e} rms={rms:.6e} samples={count}")
-            failures += int(max_abs > args.max_abs)
-
-            shutil.copy2(reference_dir / "psp_inverter_vacask.sim", work / "psp_inverter_vacask.sim")
-            run([str(args.vacask), "psp_inverter_vacask.sim"], work, os.environ.copy())
-            vacask_psp = read_ascii_raw(locate_output(work, "psp_ref.raw", ".raw"), "out")
-            gspice_psp_csv = work / "gspice_psp.csv"
-            gspice_env = os.environ.copy()
-            gspice_env.setdefault("GSPICE_OSDI_DIR", str(args.source.resolve() / "osdi"))
-            run([str(args.gspice), "--threads", "1", "--format", "csv", "--output",
-                 str(gspice_psp_csv), str(reference_dir / "psp_inverter_gspice.sp")], work, gspice_env)
-            gspice_psp = read_csv_signal(gspice_psp_csv, "v(out)")
-            max_abs, rms, count = metrics(gspice_psp, vacask_psp)
-            print(f"VACASK PSP:  max_abs={max_abs:.6e} rms={rms:.6e} samples={count}")
-            failures += int(max_abs > args.psp_max_abs)
-        else:
-            print("VACASK RC:   SKIPPED (no executable supplied)")
-            print("VACASK PSP:  SKIPPED (no executable supplied)")
 
     return 1 if failures else 0
 

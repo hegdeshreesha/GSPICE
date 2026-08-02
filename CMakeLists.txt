@@ -115,7 +115,6 @@ add_test(NAME unit_dae_state COMMAND gspice_dae_state_test)
 
 find_program(GSPICE_POWERSHELL NAMES pwsh powershell)
 find_program(GSPICE_PYTHON NAMES python3 python)
-find_program(GSPICE_VACASK NAMES vacask)
 if(NOT GSPICE_POWERSHELL)
     message(WARNING "PowerShell was not found; file/error regression helpers will be skipped")
 endif()
@@ -294,16 +293,6 @@ add_gspice_raw_expect_test(regression_lumen_ihp_inverter tests/decks/lumen_ihp_i
 set_tests_properties(regression_lumen_ihp_inverter PROPERTIES
     ENVIRONMENT "GSPICE_OSDI_DIR=${CMAKE_CURRENT_SOURCE_DIR}/osdi"
 )
-if(GSPICE_PYTHON AND GSPICE_VACASK)
-    add_test(
-        NAME reference_transient_vacask
-        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_transient.py
-            --gspice $<TARGET_FILE:gspice>
-            --vacask ${GSPICE_VACASK}
-            --source ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    set_tests_properties(reference_transient_vacask PROPERTIES TIMEOUT 180)
-endif()
 if(GSPICE_PYTHON AND GSPICE_ENABLE_NOISE_VALIDATION)
     add_test(
         NAME validation_noise_rc_ktc

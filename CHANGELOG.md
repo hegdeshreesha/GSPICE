@@ -19,7 +19,7 @@
   order 5 with automatic startup order reduction.
 - Runtime finite-difference derivative and charge-conservation auditing with
   `.OPTIONS DAE_AUDIT=1`.
-- VACASK/Xyce comparison, authoritative limitations, release checklist,
+- Reference-comparison notes, authoritative limitations, release checklist,
   citation metadata, contribution/security policies, and Apache-2.0 license.
 - Windows and Ubuntu CI builds that run the complete regression suite before
   uploading executables.

@@ -9,19 +9,18 @@ path and its numerical solve completed. It is not a signoff guarantee.
 - Not qualified for tapeout, safety-critical design, foundry signoff, device
   characterization, or publication-quality claims without independent
   reference validation.
-- Validation is concentrated on small decks. Reproducible RC analytic/Xyce/
-  VACASK and PSP-inverter VACASK transient comparisons now exist, but coverage
+- Validation is concentrated on small decks. Reproducible RC analytic transient
+  comparison now exists, but coverage
   across operating regions, temperature, tolerances, stiff systems,
   pathological topologies, and large matrices is sparse.
 - No formal accuracy specification, backward-compatibility policy, or stable
   numerical reproducibility guarantee exists across compilers/platforms.
-- Experimental analyses and models must be cross-checked against Xyce,
-  ngspice, VACASK, or measured data.
+- Experimental analyses and models must be cross-checked against independent
+  references or measured data.
 
 ## Netlist and language
 
-- Implements a SPICE subset, not the complete SPICE3, Spectre, HSPICE,
-  ngspice, or Xyce language.
+- Implements a SPICE subset, not a complete production simulator language.
 - Subcircuits, includes, library sections, conditionals, continuation lines,
   and parameter expressions cover common cases but not all quoting, escaping,
   scoping, recursion, function, vector, string, table, or corner-library rules.
@@ -68,7 +67,7 @@ path and its numerical solve completed. It is not a signoff guarantee.
   `p-1`/`p`/`p+1` order selection; periodic step doubling supplies an
   independent oracle. `METHOD=AUTO` detects alternating weakly damped slopes
   and temporarily switches from trapezoidal to Gear2. These paths have unit,
-  smoke, analytic, Xyce, and VACASK checks, but still lack broad
+  smoke and analytic checks, but still lack broad
   convergence-order qualification on stiff nonlinear compact-model circuits,
   dense event scheduling, checkpoint/restart, and large-circuit validation.
 - AC is correct only for devices with complete, validated small-signal stamps.
@@ -130,8 +129,7 @@ path and its numerical solve completed. It is not a signoff guarantee.
 - Version 1.3 is an academic beta with a small contributor/test base.
 - CI covers Windows and Ubuntu builds/tests; hardware/compiler diversity is
   still narrow.
-- The configured suite contains 65 tests on the audit host with Xyce and
-  VACASK configured, but many remain smoke/regex tests
+- The configured suite contains smoke, parser, RAW, and analytic checks, but many remain smoke/regex tests
   rather than independent high-precision numeric oracles.
 - Fuzzing, sanitizers, static analysis, supply-chain attestations, signed
   artifacts, SBOMs, reproducible builds, and a vulnerability-response history

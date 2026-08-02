@@ -86,7 +86,7 @@ double default_transient_max_step(const SimulationSettings& settings, double out
     if (settings.t_max_step > 0.0) {
         return std::max(settings.t_max_step, 1e-18);
     }
-    // Spectre/HSPICE standard: max_step is an UPPER BOUND limit for adaptive timestepping.
+// SPICE convention: max_step is an UPPER BOUND limit for adaptive timestepping.
     // It allows step size to grow during quiescent flat regions while LTE shrinks step
     // size during active transitions/oscillations.
     const double base = (settings.t_stop > 0.0) ? (settings.t_stop / 50.0) : (output_step * 50.0);
@@ -1816,8 +1816,8 @@ std::string normalized_transient_method(
     if (method == "TRAP" || method == "TRAPEZOIDAL") return "Trapezoidal";
     if (method == "TRAPGEAR" || method == "TRAP_GEAR") {
         return autoUseTrapezoidal
-            ? "Spectre TrapGear Hybrid (Trapezoidal default)"
-            : "Spectre TrapGear Hybrid (Gear2 auto-damped)";
+            ? "TrapGear Hybrid (Trapezoidal default)"
+            : "TrapGear Hybrid (Gear2 auto-damped)";
     }
     if (method == "GEAR2") return "Gear2/BDF2";
     if (method == "GEAR" || method == "BDF") return "Variable-step BDF";
