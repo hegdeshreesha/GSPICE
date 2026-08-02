@@ -250,6 +250,14 @@ add_gspice_smoke_test(smoke_current_controlled_sources tests/decks/current_contr
 add_gspice_regex_test(smoke_tf_divider tests/decks/tf_divider.sp "magnitude=4\\.99999999[0-9]e-01")
 add_gspice_smoke_test(smoke_bjt_npn tests/decks/bjt_npn.sp)
 add_gspice_regex_test(smoke_noise_resistor tests/decks/noise_resistor.sp "Starting Noise Analysis")
+add_test(
+    NAME regression_pnoise_default_sweep
+    COMMAND gspice --threads 1 --output ${CMAKE_CURRENT_BINARY_DIR}/pnoise_default_sweep.raw
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/pnoise_default_sweep.sp
+)
+set_tests_properties(regression_pnoise_default_sweep PROPERTIES
+    PASS_REGULAR_EXPRESSION "PNOISE summary:.*offsets=251"
+)
 if(GSPICE_ENABLE_RF_NOISE_REGRESSION)
     add_gspice_regex_test(smoke_sp_oneport tests/decks/sp_oneport_matched.sp "SP summary: points=1 ports=1 method=multiport-y-to-s")
     add_gspice_regex_test(smoke_sp_twoport tests/decks/sp_twoport_resistor.sp "SP summary: points=[1-9].*ports=2 method=multiport-y-to-s")
@@ -264,13 +272,13 @@ if(GSPICE_ENABLE_RF_NOISE_REGRESSION)
     add_gspice_regex_test(smoke_pss_oscillator_option tests/decks/pss_oscillator_option.sp "Autonomous PSS phase condition:.*PSS summary: oscillator=yes autonomous=yes.*direct_period_columns=[1-9].*phase_unknown=[0-9]")
     add_gspice_regex_test(smoke_pss_use_initial_conditions tests/decks/pss_use_initial_conditions.sp "Initial conditions: applied 1 node voltage seed\\(s\\) with UIC\\.")
     add_gspice_regex_test(smoke_pss_tstab_adaptive tests/decks/pss_tstab_adaptive.sp "PSS summary:.*tstab_seconds=[1-9].*adaptive_orbit=yes")
-    add_gspice_error_test(error_pnoise_small_signal tests/decks/pnoise_resistor.sp "analysis .PNOISE is parsed for compatibility")
-    add_gspice_error_test(error_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp "analysis .PNOISE is parsed for compatibility")
+    add_gspice_error_test(error_pnoise_small_signal tests/decks/pnoise_resistor.sp ".PNOISE requires a preceding .PSS")
+    add_gspice_error_test(error_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp ".PNOISE requires a preceding .PSS")
     add_gspice_error_test(error_psspac_sidebands tests/decks/psspac_linear.sp "analysis .PSSPAC is parsed for compatibility")
     add_gspice_error_test(error_pssstb_twoport tests/decks/pssstb_rc_feedback.sp "analysis .PSSSTB is parsed for compatibility")
-    add_gspice_error_test(error_pnoise_sidebands tests/decks/pnoise_sidebands.sp "analysis .PNOISE is parsed for compatibility")
+    add_gspice_error_test(error_pnoise_sidebands tests/decks/pnoise_sidebands.sp ".PNOISE requires a preceding .PSS")
     add_gspice_error_test(error_psspac_diode_lptv tests/decks/psspac_diode_lptv.sp "analysis .PSSPAC is parsed for compatibility")
-    add_gspice_error_test(error_pnoise_diode_lptv tests/decks/pnoise_diode_lptv.sp "analysis .PNOISE is parsed for compatibility")
+    add_gspice_error_test(error_pnoise_diode_lptv tests/decks/pnoise_diode_lptv.sp ".PNOISE requires a preceding .PSS")
 endif()
 add_gspice_regex_test(smoke_measure_tran tests/decks/measure_tran.sp "MEASURE vfinal = 6\\.[0-9]+e-01")
 add_gspice_regex_test(smoke_step_op tests/decks/step_op.sp "Starting STEP Analysis")

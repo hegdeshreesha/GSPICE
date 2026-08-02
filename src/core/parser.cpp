@@ -2626,8 +2626,8 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 netlist.setSettings(settings);
             } else if (cmd == ".PNOISE") {
-                if (tokens.size() < 6) {
-                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE line ignored: " + line);
+                if (tokens.size() < 2) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .PNOISE requires an output node as V(node): " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
@@ -2650,12 +2650,27 @@ Netlist Parser::parse(const std::string& filePath) {
                     continue;
                 }
                 settings.pnoise_output_label = "V(" + outNode + ")";
-                settings.noise_input_source = tokens.size() > 2 ? tokens[2] : "";
-                size_t sweepIdx = 3;
-                std::string sweepType = toUpperCopy(tokens[sweepIdx]);
+                auto isPnoiseSweep = [](const std::string& token) {
+                    const std::string upper = toUpperCopy(token);
+                    return upper == "VALUES" || upper == "VALUE" || upper == "LIST" ||
+                           upper == "STEP" || upper == "DEC" || upper == "OCT" || upper == "LIN";
+                };
+                settings.noise_input_source = "none";
+                size_t sweepIdx = 2;
+                if (tokens.size() > 2 && !isPnoiseSweep(tokens[2]) && tokens[2].find('=') == std::string::npos) {
+                    settings.noise_input_source = tokens[2];
+                    sweepIdx = 3;
+                }
+                std::string sweepType = sweepIdx < tokens.size() ? toUpperCopy(tokens[sweepIdx]) : "DEC";
                 settings.frequency_sweep_type = sweepType;
                 size_t optionsStart = tokens.size();
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                if (sweepIdx >= tokens.size() || tokens[sweepIdx].find('=') != std::string::npos) {
+                    settings.frequency_sweep_type = "DEC";
+                    settings.points_per_dec = 50;
+                    settings.f_start = 1e3;
+                    settings.f_stop = 100e6;
+                    optionsStart = sweepIdx;
+                } else if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
                     if (tokens.size() < 5) {
                         netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE VALUES line ignored: " + line);
                         continue;
@@ -2682,19 +2697,16 @@ Netlist Parser::parse(const std::string& filePath) {
                     settings.points_per_dec = 0;
                     optionsStart = sweepIdx + 4;
                 } else if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
-                    if (tokens.size() < 7) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE sweep line ignored: " + line);
-                        continue;
-                    }
-                    settings.points_per_dec = std::stoi(tokens[4]);
-                    settings.f_start = Utils::parseValue(tokens[5]);
-                    settings.f_stop = Utils::parseValue(tokens[6]);
-                    optionsStart = 7;
+                    settings.points_per_dec = tokens.size() > sweepIdx + 1 ? std::stoi(tokens[sweepIdx + 1]) : 50;
+                    settings.f_start = tokens.size() > sweepIdx + 2 ? Utils::parseValue(tokens[sweepIdx + 2]) : 1e3;
+                    settings.f_stop = tokens.size() > sweepIdx + 3 ? Utils::parseValue(tokens[sweepIdx + 3]) : 100e6;
+                    optionsStart = std::min(tokens.size(), sweepIdx + 4);
                 } else {
-                    settings.points_per_dec = std::stoi(tokens[3]);
-                    settings.f_start = Utils::parseValue(tokens[4]);
-                    settings.f_stop = Utils::parseValue(tokens[5]);
-                    optionsStart = 6;
+                    settings.frequency_sweep_type = "DEC";
+                    settings.points_per_dec = tokens.size() > sweepIdx ? std::stoi(tokens[sweepIdx]) : 50;
+                    settings.f_start = tokens.size() > sweepIdx + 1 ? Utils::parseValue(tokens[sweepIdx + 1]) : 1e3;
+                    settings.f_stop = tokens.size() > sweepIdx + 2 ? Utils::parseValue(tokens[sweepIdx + 2]) : 100e6;
+                    optionsStart = std::min(tokens.size(), sweepIdx + 3);
                 }
                 for (size_t i = optionsStart; i < tokens.size(); ++i) {
                     auto [key, value] = splitParameterToken(tokens[i]);
