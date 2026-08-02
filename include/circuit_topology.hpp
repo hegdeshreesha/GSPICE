@@ -20,8 +20,7 @@ struct NodeCollapse {
 // Fixed-dimension circuit-wide node equivalence. Device stamps remain in their
 // original coordinates. At an elaboration boundary the assembled equations are
 // projected with P^T A P and P^T b; unused alias rows enforce x_alias=x_root.
-// This is algebraically equivalent to VACASK's compact unknown remapping while
-// keeping branch indices and transient vectors stable.
+// This keeps branch indices and transient vectors stable.
 class CircuitTopology {
 public:
     CircuitTopology() = default;

@@ -89,9 +89,9 @@ Some controls are still experimental and should be validated against Ngspice/Xyc
   explicitly unsupported in 1.3; HB and STB remain experimental.
 - Primitive MOS is only a debug/simple-device model, not a production compact model.
 
-## Better Than VACASK Direction
+## Reference Simulator Direction
 
-GSPICE aims to combine VACASK-inspired Verilog-A/OSDI rigor with:
+GSPICE aims to combine independently implemented Verilog-A/OSDI rigor with:
 
 - strict unsupported-feature diagnostics,
 - reference comparison against Ngspice/Xyce,

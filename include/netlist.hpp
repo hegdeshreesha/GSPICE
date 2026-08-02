@@ -181,7 +181,9 @@ struct SimulationSettings {
     double pss_residual_goal = 1.0;
     bool pnoise_phase_noise = false;
     bool pnoise_jitter = false;
+    bool run_pnoise_after_pss = false;
     double pnoise_carrier_hz = 0.0;
+    std::string pnoise_output_label;
 
     // Noise Parameters
     int out_node = -1;

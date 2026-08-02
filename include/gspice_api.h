@@ -2,7 +2,7 @@
 #define GSPICE_API_H
 
 // ---------------------------------------------------------------------------
-// GSPICE Public C/C++ Simulator Interface (Component 4 — Beating VACASK API).
+// GSPICE Public C/C++ Simulator Interface.
 //
 // Allows embedding GSPICE as a shared library (.dll / .so) inside external
 // electronic design automation (EDA) tools, PyOPUS, or Python frameworks.

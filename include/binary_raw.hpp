@@ -2,7 +2,7 @@
 #define GSPICE_BINARY_RAW_HPP
 
 // ---------------------------------------------------------------------------
-// Binary RAW File Writer (Component 4 — Beating VACASK in I/O Throughput).
+// Binary RAW File Writer.
 //
 // Background:
 //   Standard SPICE ASCII RAW output files consume massive disk space (e.g. 10 GB

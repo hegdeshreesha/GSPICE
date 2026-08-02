@@ -116,9 +116,12 @@ bool parseSaveToken(const std::string& token, gspice::SaveSpec& save) {
     }
     std::string cleaned = stripQuotes(trimCopy(token));
     if (cleaned.empty()) return false;
-    if (toUpperCopy(cleaned).rfind("I(", 0) == 0) {
+    if (toUpperCopy(cleaned).rfind("I(", 0) == 0 && cleaned.back() == ')') {
+        std::string source = trimCopy(cleaned.substr(2, cleaned.size() - 3));
+        if (source.empty()) return false;
         save.kind = "I";
-        save.node_pos = cleaned;
+        save.node_pos = source;
+        save.node_neg = "0";
         return true;
     }
     save.kind = "V";
@@ -1309,7 +1312,11 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
         if (mode == "ALL" || mode == "ALLPUB" || mode == "PUBLIC") {
             settings.save_all = true;
             settings.save_none = false;
-            settings.saves.clear();
+            settings.saves.erase(
+                std::remove_if(settings.saves.begin(), settings.saves.end(), [](const gspice::SaveSpec& save) {
+                    return toUpperCopy(save.kind) != "I";
+                }),
+                settings.saves.end());
         } else if (mode == "SELECTED" || mode == "SELECT" || mode == "NONEDEFAULT") {
             settings.save_all = false;
             settings.save_none = false;
@@ -1908,7 +1915,11 @@ Netlist Parser::parse(const std::string& filePath) {
                     if (tokenUpper == "ALL" || tokenUpper == "V(*)" || tokenUpper == "V(ALL)") {
                         settings.save_all = true;
                         settings.save_none = false;
-                        settings.saves.clear();
+                        settings.saves.erase(
+                            std::remove_if(settings.saves.begin(), settings.saves.end(), [](const gspice::SaveSpec& save) {
+                                return toUpperCopy(save.kind) != "I";
+                            }),
+                            settings.saves.end());
                         sawSave = true;
                         continue;
                     }
@@ -1918,13 +1929,7 @@ Netlist Parser::parse(const std::string& filePath) {
                                            " token ignored: " + tokens[i]);
                         continue;
                     }
-                    if (toUpperCopy(save.kind) == "I") {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": " + cmd +
-                                           " current save '" + tokens[i] +
-                                           "' is not written yet; voltage saves are supported now.");
-                        continue;
-                    }
-                    if (settings.save_all) {
+                    if (settings.save_all && toUpperCopy(save.kind) == "V") {
                         settings.save_all = false;
                         settings.saves.clear();
                     }
@@ -2423,9 +2428,17 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.type = "NOISE";
                 settings.frequency_values.clear();
                 settings.frequency_step = 0.0;
-                // tokens[1] is V(node)
-                std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
-                settings.out_node = netlist.getOrCreateNode(outNode);
+                std::string outNode;
+                std::string outRef;
+                if (!parseVoltageProbeToken(tokens[1], outNode, outRef) || !isGroundName(outRef)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .NOISE requires an output node as V(node): " + line);
+                    continue;
+                }
+                settings.out_node = netlist.findNode(outNode);
+                if (settings.out_node < 0) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .NOISE output node '" + outNode + "' does not exist in the circuit; choose a real node to plot noise.");
+                    continue;
+                }
                 settings.noise_input_source = tokens.size() > 2 ? tokens[2] : "";
                 size_t sweepIdx = 3;
                 std::string sweepType = toUpperCopy(tokens[sweepIdx]);
@@ -2618,11 +2631,25 @@ Netlist Parser::parse(const std::string& filePath) {
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
-                settings.type = "PNOISE";
+                if (settings.type == "PSS") {
+                    settings.run_pnoise_after_pss = true;
+                } else {
+                    settings.type = "PNOISE";
+                }
                 settings.frequency_values.clear();
                 settings.frequency_step = 0.0;
-                std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
-                settings.out_node = netlist.getOrCreateNode(outNode);
+                std::string outNode;
+                std::string outRef;
+                if (!parseVoltageProbeToken(tokens[1], outNode, outRef) || !isGroundName(outRef)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .PNOISE requires an output node as V(node): " + line);
+                    continue;
+                }
+                settings.out_node = netlist.findNode(outNode);
+                if (settings.out_node < 0) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .PNOISE output node '" + outNode + "' does not exist in the circuit; choose a real node to plot phase noise.");
+                    continue;
+                }
+                settings.pnoise_output_label = "V(" + outNode + ")";
                 settings.noise_input_source = tokens.size() > 2 ? tokens[2] : "";
                 size_t sweepIdx = 3;
                 std::string sweepType = toUpperCopy(tokens[sweepIdx]);

@@ -1,4 +1,4 @@
-* PSSSTB VACASK-style two-port smoke deck.
+* PSSSTB two-port smoke deck.
 V1 in 0 DC 1
 R1 in loop_in 1k
 WPROBE loop_in loop_out

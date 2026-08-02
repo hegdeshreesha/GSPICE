@@ -545,6 +545,47 @@ std::complex<double> complex_probe_value(const VectorComplex& x, int node_pos, i
     return complex_node_value(x, node_pos) - complex_node_value(x, node_neg);
 }
 
+struct NoiseTransferResult {
+    double output_psd = 0.0;
+    std::size_t source_count = 0;
+};
+
+NoiseTransferResult solve_output_noise_psd(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    int num_devs,
+    int matrix_size,
+    int num_nodes,
+    int out_node,
+    double omega,
+    const VectorReal& operating_point,
+    const SimulationSettings& settings,
+    LinearSolveContextComplex* complex_solver_context) {
+    SparseMatrixComplex J_sparse(matrix_size);
+    VectorComplex ignored_rhs(matrix_size);
+    stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+    const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
+    #pragma omp parallel for if(use_parallel_stamp)
+    for (int i = 0; i < num_devs; ++i) {
+        stamp_device_ac(*devices[i], J_sparse, ignored_rhs, omega, operating_point);
+    }
+
+    std::vector<NoiseSource> noise_sources;
+    for (const auto& dev : devices) {
+        dev->collectNoiseSources(omega, operating_point, noise_sources);
+    }
+
+    double output_psd = 0.0;
+    for (const auto& source : noise_sources) {
+        if (source.currentPsd <= 0.0) continue;
+        VectorComplex rhs(matrix_size);
+        rhs.add(source.nodePos, {-1.0, 0.0});
+        rhs.add(source.nodeNeg, {1.0, 0.0});
+        VectorComplex transfer = KluSolverComplex::solve(J_sparse, rhs, complex_solver_context);
+        output_psd += std::norm(transfer[out_node]) * source.currentPsd;
+    }
+    return {output_psd, noise_sources.size()};
+}
+
 std::string node_label(const Netlist& netlist, int node) {
     return node >= 0 ? netlist.getNodeName(node) : "0";
 }
@@ -1587,9 +1628,21 @@ void print_transient_point(double t, const VectorReal& x, int num_nodes) {
 
 struct SavedOutputSignal {
     std::string label;
+    std::string type = "voltage";
     int node_pos = -1;
     int node_neg = -1;
+    int branch_index = -1;
 };
+
+int find_branch_index_by_name(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    const std::string& device_name);
+
+std::string branch_save_name(std::string name) {
+    const size_t dot = name.find('.');
+    if (dot != std::string::npos) name.resize(dot);
+    return name;
+}
 
 std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int num_nodes) {
     const auto& settings = netlist.getSettings();
@@ -1598,17 +1651,25 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
         return signals;
     }
     if (settings.save_all) {
-        signals.reserve(static_cast<size_t>(num_nodes));
+        signals.reserve(static_cast<size_t>(num_nodes + settings.saves.size()));
         for (int i = 0; i < num_nodes; ++i) {
-            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1});
+            signals.push_back({"V(" + netlist.getNodeName(i) + ")", "voltage", i, -1});
         }
-        return signals;
-    }
-    if (settings.saves.empty()) {
+    } else if (settings.saves.empty()) {
         return signals;
     }
 
     for (const auto& save : settings.saves) {
+        if (upper_copy(save.kind) == "I") {
+            const std::string source_name = branch_save_name(save.node_pos);
+            const int branch = find_branch_index_by_name(netlist.getDevices(), source_name);
+            if (branch < 0) {
+                std::cout << "WARNING: save skipped unknown current in I(" << save.node_pos << ")" << std::endl;
+                continue;
+            }
+            signals.push_back({"I(" + save.node_pos + ")", "current", -1, -1, branch});
+            continue;
+        }
         if (upper_copy(save.kind) != "V") continue;
         const int pos = netlist.findNode(save.node_pos);
         const int neg = is_ground_name(save.node_neg) ? -1 : netlist.findNode(save.node_neg);
@@ -1621,10 +1682,10 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
         std::string label = "V(" + save.node_pos;
         if (!is_ground_name(save.node_neg)) label += "," + save.node_neg;
         label += ")";
-        signals.push_back({label, pos, neg});
+        signals.push_back({label, "voltage", pos, neg});
     }
     if (signals.empty()) {
-        std::cout << "WARNING: no valid .SAVE voltage signals were resolved; writing time only." << std::endl;
+        std::cout << "WARNING: no valid .SAVE signals were resolved; writing time only." << std::endl;
     }
     return signals;
 }
@@ -1655,7 +1716,7 @@ public:
             file_ << "Variables:\n";
             file_ << "0\ttime\ttime\n";
             for (size_t i = 0; i < signals_.size(); ++i) {
-                file_ << (i + 1) << "\t" << signals_[i].label << "\tvoltage\n";
+                file_ << (i + 1) << "\t" << signals_[i].label << "\t" << signals_[i].type << "\n";
             }
             file_ << "Values:\n";
         }
@@ -1675,7 +1736,11 @@ public:
         }
         file_ << std::scientific << std::setprecision(12) << t;
         for (const auto& signal : signals_) {
-            file_ << (csv_ ? "," : " ") << probe_value(x, signal.node_pos, signal.node_neg);
+            double value = probe_value(x, signal.node_pos, signal.node_neg);
+            if (signal.type == "current") {
+                value = x[signal.branch_index];
+            }
+            file_ << (csv_ ? "," : " ") << value;
         }
         file_ << "\n";
         ++point_count_;
@@ -1925,7 +1990,7 @@ void run_simulation(
     }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
-        "TRAN", "AC", "NOISE", "SP", "STB", "PSS", "HB"
+        "TRAN", "AC", "NOISE", "SP", "STB", "PSS", "HB", "PNOISE"
     };
     if (std::find(implemented_analyses.begin(), implemented_analyses.end(), requested_settings.type) ==
         implemented_analyses.end()) {
@@ -2063,6 +2128,9 @@ void run_simulation(
     complex_solver_context.ordering = settings.solver_ordering;
     complex_solver_context.use_singletons = settings.solver_singletons;
     complex_solver_context.scale_rows = settings.solver_row_scaling;
+    if (settings.type == "PNOISE") {
+        throw std::runtime_error(".PNOISE requires a preceding .PSS in the same deck so the periodic operating point is available.");
+    }
     std::cout << "Linear solver: backend=" << settings.solver_backend
               << " ordering=" << settings.solver_ordering
               << " singleton_filter=" << (settings.solver_singletons ? "on" : "off")
@@ -3347,43 +3415,25 @@ void run_simulation(
         for (double f : frequencies) {
             double omega = 2.0 * 3.14159265358979 * f;
             const auto stamp_start = std::chrono::steady_clock::now();
-            SparseMatrixComplex J_sparse(matrix_size); VectorComplex ignored_rhs(matrix_size);
-            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
-            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
-            #pragma omp parallel for if(use_parallel_stamp)
-            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, ignored_rhs, omega, x_dc);
-            const auto stamp_end = std::chrono::steady_clock::now();
-            runtime_stats.ac_stamp_seconds += elapsed_seconds(stamp_start, stamp_end);
-
-            std::vector<NoiseSource> noise_sources;
-            for (const auto& dev : devices) {
-                dev->collectNoiseSources(omega, x_dc, noise_sources);
-            }
-
-            double output_psd = 0.0;
             const auto solve_start = std::chrono::steady_clock::now();
-            for (const auto& source : noise_sources) {
-                if (source.currentPsd <= 0.0) continue;
-                VectorComplex rhs(matrix_size);
-                rhs.add(source.nodePos, {-1.0, 0.0});
-                rhs.add(source.nodeNeg, {1.0, 0.0});
-                VectorComplex transfer = KluSolverComplex::solve(J_sparse, rhs, &complex_solver_context);
-                const std::complex<double> out = transfer[settings.out_node];
-                output_psd += std::norm(out) * source.currentPsd;
-            }
+            const NoiseTransferResult noise = solve_output_noise_psd(
+                devices, num_devs, matrix_size, num_nodes, settings.out_node,
+                omega, x_dc, settings, &complex_solver_context);
+            const double output_psd = noise.output_psd;
             if (has_previous_noise && f > previous_freq) {
                 integrated_output_noise += 0.5 * (previous_psd + output_psd) * (f - previous_freq);
             }
             has_previous_noise = true;
             previous_freq = f;
             previous_psd = output_psd;
-            last_noise_source_count = noise_sources.size();
             const auto solve_end = std::chrono::steady_clock::now();
+            runtime_stats.ac_stamp_seconds += elapsed_seconds(stamp_start, solve_start);
             runtime_stats.ac_solve_seconds += elapsed_seconds(solve_start, solve_end);
+            last_noise_source_count = noise.source_count;
             std::cout << std::scientific << std::setprecision(9)
                       << f << " | " << std::sqrt(std::max(output_psd, 0.0))
                       << " " << output_psd
-                      << " " << noise_sources.size()
+                      << " " << noise.source_count
                       << std::endl;
         }
         std::cout << std::scientific << std::setprecision(9)
@@ -3449,7 +3499,7 @@ void run_simulation(
             std::cout << std::scientific << f << " | Mag: " << std::abs(T) << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
         }
         std::cout << "STB summary: points=" << frequencies.size()
-                  << " method=vacask-twoport"
+                  << " method=twoport-return-ratio"
                   << std::endl;
     } else if (settings.type == "PSS") {
         std::cout << "Starting Periodic Steady State (PSS) Analysis..." << std::endl;
@@ -3538,7 +3588,9 @@ void run_simulation(
             return result;
         };
 
-        auto integrate_pss_interval = [&](const VectorReal& start, double duration, double start_time, bool propagate_variational) {
+        auto integrate_pss_interval = [&](const VectorReal& start, double duration, double start_time,
+                                          bool propagate_variational, TransientOutput* output = nullptr,
+                                          std::vector<TranSample>* samples = nullptr) {
             PssOrbitResult orbit;
             orbit.end = start;
             orbit.endpoint_time_sensitivity = VectorReal(matrix_size);
@@ -3644,6 +3696,12 @@ void run_simulation(
                     orbit.direct_period_sensitivity = true;
                     x = full.x;
                     local_t = target_time;
+                    if (output) {
+                        output->write(local_t - start_time, x, num_nodes);
+                    }
+                    if (samples) {
+                        samples->push_back({local_t - start_time, x});
+                    }
                     accepted_order = full.integration_order;
                     if (pcEstimate.valid) {
                         proposed_growth = transient_growth_factor(err, accepted_order);
@@ -3888,6 +3946,104 @@ void run_simulation(
                   << " frequency=" << frequency_hz
                   << " phase_unknown=" << phase_index
                   << std::endl;
+        std::vector<TranSample> pss_orbit_samples;
+        {
+            TransientOutput pss_out(output_file, output_format, netlist, num_nodes);
+            if (pss_out.toFile()) {
+                std::cout << "Waveform output: " << output_file << std::endl;
+                pss_orbit_samples.push_back({0.0, pss_state});
+                pss_out.write(0.0, pss_state, num_nodes);
+                PssOrbitResult final_orbit = integrate_pss_interval(pss_state, period, 0.0, false, &pss_out, &pss_orbit_samples);
+                pss_out.finalize();
+                std::cout << "PSS orbit output: one settled period saved with "
+                          << pss_out.signals().size() << " signal(s)." << std::endl;
+                x_dc = final_orbit.end;
+            }
+        }
+        if (settings.run_pnoise_after_pss) {
+            if (settings.out_node < 0 || settings.out_node >= num_nodes) {
+                throw std::runtime_error(".PNOISE output node must be a non-ground circuit node");
+            }
+            const auto offsets = make_frequency_grid(settings);
+            if (offsets.empty()) {
+                throw std::runtime_error(".PNOISE requires a valid positive offset-frequency sweep.");
+            }
+            const double carrier_hz = settings.pnoise_carrier_hz > 0.0
+                ? settings.pnoise_carrier_hz
+                : (!settings.f_fund.empty() && settings.f_fund[0] > 0.0 ? settings.f_fund[0] : frequency_hz);
+            double max_output_slew = 0.0;
+            for (std::size_t i = 1; i < pss_orbit_samples.size(); ++i) {
+                const double dt = pss_orbit_samples[i].time - pss_orbit_samples[i - 1].time;
+                if (dt <= 0.0) continue;
+                const double dv = probe_value(pss_orbit_samples[i].x, settings.out_node, -1) -
+                                  probe_value(pss_orbit_samples[i - 1].x, settings.out_node, -1);
+                max_output_slew = std::max(max_output_slew, std::abs(dv / dt));
+            }
+            if (!(max_output_slew > 0.0) || !(carrier_hz > 0.0)) {
+                throw std::runtime_error(".PNOISE could not estimate carrier frequency and output slew from the converged PSS orbit.");
+            }
+            const std::string pnoise_path = output_file.empty()
+                ? std::string()
+                : (std::filesystem::path(output_file).parent_path() /
+                   (std::filesystem::path(output_file).stem().string() + "_pnoise.raw")).string();
+            if (!pnoise_path.empty()) {
+                std::ofstream pnoise(pnoise_path, std::ios::out | std::ios::trunc);
+                if (!pnoise.is_open()) {
+                    throw std::runtime_error("Could not open PNOISE output file: " + pnoise_path);
+                }
+                const std::string output_label = settings.pnoise_output_label.empty()
+                    ? voltage_probe_label(netlist, settings.out_node, -1)
+                    : settings.pnoise_output_label;
+                pnoise << "Title: GSPICE PNOISE output\n";
+                pnoise << "Plotname: Periodic Noise Analysis\n";
+                pnoise << "Flags: real\n";
+                pnoise << "No. Variables: 5\n";
+                pnoise << "No. Points: " << offsets.size() << "\n";
+                pnoise << "Variables:\n";
+                pnoise << "0\tfrequency\tfrequency\n";
+                pnoise << "1\tONOISE(" << output_label << ")\tnoise\n";
+                pnoise << "2\tSPHI(" << output_label << ")\tnoise\n";
+                pnoise << "3\tL(" << output_label << ")\tnoise\n";
+                pnoise << "4\tJRMS(" << output_label << ")\ttime\n";
+                pnoise << "Values:\n";
+                double integrated_time_jitter_psd = 0.0;
+                double previous_offset = 0.0;
+                double previous_time_jitter_psd = 0.0;
+                bool has_previous_offset = false;
+                std::size_t last_noise_source_count = 0;
+                for (double offset : offsets) {
+                    const double f = std::max(offset, 1e-30);
+                    const double omega = 2.0 * M_PI * f;
+                    const NoiseTransferResult noise = solve_output_noise_psd(
+                        devices, num_devs, matrix_size, num_nodes, settings.out_node,
+                        omega, pss_state, settings, &complex_solver_context);
+                    last_noise_source_count = noise.source_count;
+                    const double output_psd = std::max(noise.output_psd, 0.0);
+                    const double onoise = std::sqrt(output_psd);
+                    const double time_jitter_psd = output_psd / std::max(max_output_slew * max_output_slew, 1e-300);
+                    if (has_previous_offset && f > previous_offset) {
+                        integrated_time_jitter_psd += 0.5 * (previous_time_jitter_psd + time_jitter_psd) * (f - previous_offset);
+                    }
+                    has_previous_offset = true;
+                    previous_offset = f;
+                    previous_time_jitter_psd = time_jitter_psd;
+                    const double sphi = std::pow(2.0 * M_PI * carrier_hz, 2.0) * time_jitter_psd;
+                    const double phase_noise_db = 10.0 * std::log10(std::max(0.5 * sphi, 1e-300));
+                    const double jitter_rms = std::sqrt(std::max(integrated_time_jitter_psd, 0.0));
+                    pnoise << std::scientific << std::setprecision(12)
+                           << f << " " << onoise << " " << sphi << " "
+                           << phase_noise_db << " " << jitter_rms << "\n";
+                }
+                pnoise.close();
+                std::cout << "PNOISE output: " << pnoise_path << std::endl;
+                std::cout << "PNOISE summary: carrier=" << std::scientific << carrier_hz
+                          << " offsets=" << offsets.size()
+                          << " output=" << output_label
+                          << " slew=" << max_output_slew
+                          << " sources=" << last_noise_source_count
+                          << " model=small_signal_noise_to_pss_slew" << std::endl;
+            }
+        }
     } else if (settings.type == "HB") {
         std::cout << "Starting Harmonic Balance Analysis (Multi-Tone, FFT-accelerated)..." << std::endl;
         // ----------------------------------------------------------------
@@ -4293,7 +4449,11 @@ int main(int argc, char* argv[]) {
         if (save_mode_override == "ALL") {
             settings.save_all = true;
             settings.save_none = false;
-            settings.saves.clear();
+            settings.saves.erase(
+                std::remove_if(settings.saves.begin(), settings.saves.end(), [](const SaveSpec& save) {
+                    return upper_copy(save.kind) != "I";
+                }),
+                settings.saves.end());
         } else if (save_mode_override == "SELECTED") {
             settings.save_all = false;
             settings.save_none = false;
