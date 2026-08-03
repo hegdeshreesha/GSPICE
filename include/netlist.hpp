@@ -11,8 +11,7 @@
 #include <filesystem>
 #include <utility>
 #include "device.hpp"
-#include "osdi_loader.hpp"
-#include "osdi_model_state.hpp"
+#include "compact_model.hpp"
 
 namespace gspice {
 
@@ -154,12 +153,6 @@ struct SimulationSettings {
     double nodeset_conductance = 1e6;
     bool dae_audit = false;
     double dae_audit_tolerance = 2e-4;
-    bool osdi_limiting_rhs = true;
-    bool osdi_tran_jacobian = false;
-    bool osdi_bind_full_model_params = true;
-    bool osdi_internal_nodes = true;
-    bool osdi_spice_rhs = false;
-    bool osdi_output_opvars = false;
     bool fastspice = false;
     bool multirate = false;
     bool transient_stamp_cache = true;
@@ -268,60 +261,6 @@ public:
         return settings_;
     }
 
-    std::shared_ptr<OSDISharedModelState> findOsdiModelState(const std::string& modelCardName) const {
-        auto it = osdi_model_states_.find(normalizeKey(modelCardName));
-        return it == osdi_model_states_.end() ? nullptr : it->second;
-    }
-
-    void storeOsdiModelState(
-        const std::string& modelCardName,
-        std::shared_ptr<OSDISharedModelState> state) {
-        osdi_model_states_[normalizeKey(modelCardName)] = std::move(state);
-    }
-
-    void addOsdiModel(const std::string& name, const std::string& path) {
-        legacy_osdi_model_paths_[name] = path;
-    }
-
-    bool loadOsdiLibrary(const std::string& path, std::string& errorOut) {
-        auto loader = std::make_unique<OSDILoader>(path);
-        if (!loader->isLoaded()) {
-            errorOut = loader->getError();
-            return false;
-        }
-        std::string models;
-        std::string capabilities;
-        const auto& metadata = loader->getAvailableMetadata();
-        const auto& descriptors = loader->getAvailableModels();
-        for (size_t i = 0; i < descriptors.size(); ++i) {
-            const auto& desc = descriptors[i];
-            const char* modelName = desc.name ? desc.name : desc.model_name;
-            if (modelName) {
-                osdi_descriptors_[modelName] = desc;
-                osdi_descriptors_[normalizeKey(modelName)] = desc;
-                if (i < metadata.size()) {
-                    osdi_metadata_.insert_or_assign(modelName, metadata[i]);
-                    osdi_metadata_.insert_or_assign(normalizeKey(modelName), metadata[i]);
-                }
-                if (!models.empty()) models += ",";
-                models += modelName;
-            }
-            if (i < metadata.size()) {
-                if (!capabilities.empty()) capabilities += ";";
-                capabilities += metadata[i].summary();
-            }
-        }
-        model_status_.push_back(
-            "OSDI_LOADED path=\"" + path + "\" models=" + (models.empty() ? "<none>" : models) +
-            " abi=" + std::to_string(loader->getVersionMajor()) + "." +
-            std::to_string(loader->getVersionMinor()) +
-            " natures=" + std::to_string(loader->getNatureCount()) +
-            " disciplines=" + std::to_string(loader->getDisciplineCount()) +
-            " capabilities=" + (capabilities.empty() ? "<unknown>" : capabilities));
-        osdi_loaders_.push_back(std::move(loader));
-        return true;
-    }
-
     void addModelCard(const ModelCard& model) {
         model_cards_[model.name] = model;
         model_cards_[normalizeKey(model.name)] = model;
@@ -344,53 +283,6 @@ public:
         it = model_cards_.find(upper);
         if (it != model_cards_.end()) return &it->second;
         return nullptr;
-    }
-
-    const OsdiDescriptor* findOsdiDescriptor(const std::string& modelType) const {
-        auto it = osdi_descriptors_.find(modelType);
-        if (it != osdi_descriptors_.end()) return &it->second;
-        it = osdi_descriptors_.find(normalizeKey(modelType));
-        if (it != osdi_descriptors_.end()) return &it->second;
-        return nullptr;
-    }
-
-    const OsdiDescriptorMetadata* findOsdiMetadata(const std::string& modelType) const {
-        auto it = osdi_metadata_.find(modelType);
-        if (it != osdi_metadata_.end()) return &it->second;
-        it = osdi_metadata_.find(normalizeKey(modelType));
-        return it != osdi_metadata_.end() ? &it->second : nullptr;
-    }
-
-    bool tryAutoLoadOsdiForModelType(
-        const std::string& modelType,
-        const std::vector<std::filesystem::path>& searchRoots,
-        std::string& errorOut) {
-        if (findOsdiDescriptor(modelType)) return true;
-
-        std::vector<std::string> names = osdiCandidateNames(modelType);
-        std::vector<std::string> attempted;
-        for (const auto& root : searchRoots) {
-            if (root.empty()) continue;
-            for (const auto& name : names) {
-                std::filesystem::path candidate = root / name;
-                attempted.push_back(candidate.string());
-                if (!std::filesystem::exists(candidate)) continue;
-                std::string loadError;
-                if (loadOsdiLibrary(candidate.string(), loadError) && findOsdiDescriptor(modelType)) {
-                    return true;
-                }
-                if (!loadError.empty()) {
-                    errorOut = loadError;
-                    return false;
-                }
-            }
-        }
-        errorOut = "No OSDI library found for model type '" + modelType + "'. Tried: ";
-        for (size_t i = 0; i < attempted.size(); ++i) {
-            if (i) errorOut += "; ";
-            errorOut += attempted[i];
-        }
-        return false;
     }
 
     void addWarning(const std::string& message) {
@@ -419,14 +311,9 @@ public:
 
 private:
     std::vector<std::unique_ptr<Device>> devices_;
-    std::vector<std::unique_ptr<OSDILoader>> osdi_loaders_;
     std::unordered_map<std::string, int> node_map_;
     std::map<int, std::string> node_names_;
-    std::unordered_map<std::string, std::string> legacy_osdi_model_paths_;
     std::unordered_map<std::string, ModelCard> model_cards_;
-    std::unordered_map<std::string, OsdiDescriptor> osdi_descriptors_;
-    std::unordered_map<std::string, OsdiDescriptorMetadata> osdi_metadata_;
-    std::unordered_map<std::string, std::shared_ptr<OSDISharedModelState>> osdi_model_states_;
     std::vector<std::string> model_status_;
     std::vector<std::string> warnings_;
     std::vector<std::string> errors_;
@@ -439,35 +326,6 @@ private:
             return static_cast<char>(std::tolower(c));
         });
         return key;
-    }
-
-    static std::vector<std::string> osdiCandidateNames(const std::string& modelType) {
-        std::vector<std::string> names;
-        auto addName = [&names](const std::string& stem) {
-            if (stem.empty()) return;
-            const std::string osdi = stem + ".osdi";
-            if (std::find(names.begin(), names.end(), osdi) == names.end()) {
-                names.push_back(osdi);
-            }
-        };
-        const std::string lower = normalizeKey(modelType);
-        addName(modelType);
-        addName(lower);
-        std::string upper = modelType;
-        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
-            return static_cast<char>(std::toupper(c));
-        });
-        addName(upper);
-        if (lower == "psp103va") {
-            addName("psp103");
-            addName("PSP103");
-        } else if (lower == "pspnqs103va") {
-            addName("psp103_nqs");
-            addName("PSP103_NQS");
-        } else if (lower.size() > 2 && lower.substr(lower.size() - 2) == "va") {
-            addName(lower.substr(0, lower.size() - 2));
-        }
-        return names;
     }
 
 public:

@@ -37,10 +37,8 @@
 #include "devices/mosfet.hpp"
 #include "devices/probe.hpp"
 #include "devices/current_source.hpp"
-#include "devices/osdi_device.hpp"
 #include "devices/controlled_source.hpp"
 #include "devices/behavioral_source.hpp"
-#include "osdi_emulator.hpp"
 #include "solvers/klu_solver.hpp"
 #include "transient_state_store.hpp"
 #include "integration_formula.hpp"
@@ -1943,36 +1941,6 @@ bool configure_transfer_input_source(
 
 } // namespace
 
-void run_osdi_test() {
-    std::cout << "\n--- GSPICE Industrial Level-50 OSDI Test ---" << std::endl;
-    Netlist netlist;
-    int nVdd = netlist.getOrCreateNode("vdd");
-    int nGate = netlist.getOrCreateNode("gate");
-    int nDrain = netlist.getOrCreateNode("drain");
-    int nGnd = -1;
-    OsdiDescriptor va_model = OsdiEmulator::getDescriptor();
-    netlist.addDevice(std::make_unique<VoltageSource>("Vdd", nVdd, nGnd, 1.8, 3));
-    netlist.addDevice(std::make_unique<VoltageSource>("Vbias", nGate, nGnd, 0.8, 4));
-    netlist.addDevice(std::make_unique<Resistor>("Rd", nVdd, nDrain, 10000.0));
-    std::vector<int> mos_nodes = {nDrain, nGate, nGnd, nGnd};
-    netlist.addDevice(std::make_unique<OSDIDevice>("M1", va_model, mos_nodes));
-    int matrix_size = 5; VectorReal x(matrix_size); x[2] = 1.0;
-    const double tol = 1e-8;
-    LinearSolveContextReal solver_context;
-    for (int iter = 0; iter < 100; ++iter) {
-        SparseMatrixReal J(matrix_size); VectorReal b(matrix_size);
-        auto& devices = netlist.getDevices();
-        int num_devs = static_cast<int>(devices.size());
-        const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
-        #pragma omp parallel for if(use_parallel_stamp)
-        for (int i = 0; i < num_devs; ++i) stamp_device_dc(*devices[i], J, b, x);
-        VectorReal x_new = KluSolverReal::solve(J, b, &solver_context);
-        double max_change = std::abs(x_new[2] - x[2]); x = x_new;
-        if (max_change < tol) { std::cout << "  Converged in " << iter + 1 << " iterations." << std::endl; break; }
-    }
-    std::cout << "Results:\n  Vdd: " << x[0] << " V\n  Gate: " << x[1] << " V\n  Drain: " << x[2] << " V\n";
-}
-
 void run_simulation(
     Netlist& netlist,
     const std::string& output_file = "",
@@ -1999,7 +1967,6 @@ void run_simulation(
             " is parsed for compatibility but has no validated execution engine; refusing to return a substitute result");
     }
 
-    int osdiInternalUnknowns = 0;
     for (auto& dev : devices) {
         auto* vsrc = dynamic_cast<VoltageSource*>(dev.get());
         if (vsrc) vsrc->setBranchIndex(netlist.getNextBranchId(num_nodes));
@@ -2015,11 +1982,6 @@ void run_simulation(
         if (ccvs) ccvs->setBranchIndex(netlist.getNextBranchId(num_nodes));
         auto* bsrc = dynamic_cast<BehavioralSource*>(dev.get());
         if (bsrc && bsrc->isVoltageMode()) bsrc->setBranchIndex(netlist.getNextBranchId(num_nodes));
-        auto* osdi = dynamic_cast<OSDIDevice*>(dev.get());
-        if (osdi && requested_settings.osdi_internal_nodes) {
-            osdiInternalUnknowns += osdi->bindInternalUnknowns(
-                [&]() { return netlist.getNextBranchId(num_nodes); });
-        }
     }
     int matrix_size = num_nodes + netlist.getNumBranches();
     for (auto& dev : devices) {
@@ -2161,25 +2123,6 @@ void run_simulation(
                      "transient steps; values >= 1 are recommended."
                   << std::endl;
     }
-    const bool osdi_limiting_rhs =
-        settings.osdi_limiting_rhs || std::getenv("GSPICE_USE_OSDI_LIMITING_RHS") != nullptr;
-    const bool osdi_tran_jacobian =
-        settings.osdi_tran_jacobian || std::getenv("GSPICE_USE_OSDI_TRAN_JACOBIAN") != nullptr;
-    const bool osdi_full_model_params =
-        settings.osdi_bind_full_model_params || std::getenv("GSPICE_BIND_FULL_OSDI_MODEL_PARAMS") != nullptr;
-    const bool osdi_internal_nodes = settings.osdi_internal_nodes;
-    const bool osdi_spice_rhs = settings.osdi_spice_rhs;
-    if (osdi_limiting_rhs || osdi_tran_jacobian || osdi_full_model_params || osdi_internal_nodes || osdi_spice_rhs) {
-        std::cout << "OSDI advanced options:"
-                  << " limiting_rhs=" << (osdi_limiting_rhs ? "requested" : "off")
-                  << " tran_jacobian=" << (osdi_tran_jacobian ? "requested" : "off")
-                  << " full_model_params=" << (osdi_full_model_params ? "requested" : "off")
-                  << " internal_nodes=" << (osdi_internal_nodes ? "expanded" : "local")
-                  << " internal_unknowns=" << osdiInternalUnknowns
-                  << " spice_rhs=" << (osdi_spice_rhs ? "requested" : "off")
-                  << std::endl;
-    }
-
     VectorReal x_dc(matrix_size);
     for (const auto& ic : settings.initial_conditions) {
         if (ic.node >= 0 && ic.node < x_dc.getSize()) {
@@ -3093,7 +3036,7 @@ void run_simulation(
                     }
                 } else if (settings.tran_adaptive && can_reduce_step) {
                     ++tran_stats.step_doubling_audits;
-                    // The full-step evaluation may have modified OSDI model
+                    // The full-step evaluation may have modified device
                     // memory and candidate state. Start the half-step path from
                     // the exact accepted state at time t.
                     transient_state_arena.restore(baseline_device_states);
@@ -4050,7 +3993,7 @@ void run_simulation(
         // Pillar 3: Correct HB using IFFT → time-domain stamp → FFT → Newton.
         // The prior implementation stamped directly in the frequency domain,
         // which is only correct for linear devices. Nonlinear devices (diodes,
-        // MOSFETs, OSDI models) must be evaluated at each time-domain sample
+        // MOSFETs and other nonlinear devices must be evaluated at each time-domain sample
         // point and their contributions transformed back to frequency domain.
         //
         // The Fourier class now uses a radix-2 Cooley-Tukey FFT (O(N log N))
@@ -4273,7 +4216,6 @@ void print_usage() {
     std::cout << "  --ssh-key <file>         SSH private key path (optional)\n";
     std::cout << "  --remote-gspice <path>   Path to gspice binary on remote\n";
     std::cout << "  --capabilities           Print machine-readable capability maturity information\n";
-    std::cout << "  --self-test              Run the built-in OSDI smoke test\n";
     std::cout << "\nSSH mode (-–sim-env ssh) streams the netlist via SCP, runs gspice on the\n";
     std::cout << "remote machine, and downloads the .raw result back. Requires SSH access\n";
     std::cout << "and Python on this machine.\n";
@@ -4336,7 +4278,6 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         if (arg == "--capabilities") { print_capabilities(); return 0; }
-        if (arg == "--self-test") { run_osdi_test(); return 0; }
         if (arg == "-t" || arg == "--threads") {
             if (i + 1 >= argc) { std::cerr << "ERROR: " << arg << " requires a value\n"; return 64; }
             try { num_threads = std::stoi(argv[++i]); }

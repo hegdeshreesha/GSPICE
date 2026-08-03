@@ -42,14 +42,14 @@ path and its numerical solve completed. It is not a signoff guarantee.
 - JFET, MESFET, transmission-line families, magnetic coupling breadth,
   semiconductor switches, IBIS, TCAD devices, and many standard SPICE model
   levels are absent.
-- OSDI compatibility is experimental. Reactive residuals participate in
+- native compact-model compatibility is experimental. Reactive residuals participate in
   transient integration and charge-aware LTE checks. Recognized model
   parameters are resolved and bound strictly; limiting flags participate in
   convergence; epoch-scoped evaluation bypass and hidden uncollapsed internal
   unknowns are implemented. Limiting-RHS use and internal-node expansion remain
-  opt-in while broader OpenVAF ABI, foundry-card, collapse-topology, charge
+  opt-in while broader native compact-model ABI, foundry-card, collapse-topology, charge
   conservation, noise, and operating-point-variable validation is completed.
-- IHP/PSP flows depend on compatible external OSDI binaries and environment
+- IHP/PSP flows depend on compatible external native compact models and environment
   configuration; primitive fallback is intentionally refused by default.
 - No bundled, validated cross-platform compact-model package is released.
 
@@ -134,5 +134,5 @@ path and its numerical solve completed. It is not a signoff guarantee.
 - Fuzzing, sanitizers, static analysis, supply-chain attestations, signed
   artifacts, SBOMs, reproducible builds, and a vulnerability-response history
   are not established.
-- Apache-2.0 covers GSPICE code only. External OSDI models, PDKs, SuiteSparse,
+- Apache-2.0 covers GSPICE code only. External native compact models, PDKs, SuiteSparse,
   OpenMP runtimes, and redistributed dependencies retain their own licenses.

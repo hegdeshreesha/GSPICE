@@ -6,8 +6,6 @@ remain true as the implementation evolves:
 
 * RC thermal noise integrates to roughly kT/C.
 * Transient noise is deterministic for a fixed seed and changes with seed.
-* OSDI flicker noise has stronger low-frequency density than high-frequency
-  density, and transient colored-noise accounting exercises flicker sources.
 """
 
 from __future__ import annotations
@@ -15,9 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import re
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -125,54 +121,13 @@ def validate_transient_seed_behavior(gspice: Path, work: Path) -> None:
     print(f"Transient noise seeds: same_seed_max={same:.3e}, different_seed_max={diff:.3e}")
 
 
-def validate_osdi_flicker(gspice: Path, source: Path, work: Path) -> None:
-    osdi = source / "osdi" / "psp103.osdi"
-    if not osdi.exists():
-        print(f"SKIP: OSDI PSP model not found: {osdi}")
-        sys.exit(77)
-    deck = write(
-        work / "osdi_flicker_noise.sp",
-        f"""
-        * OSDI PSP flicker trend validation.
-        .PRE_OSDI "{osdi}"
-        .MODEL pch psp103va type=-1
-        VDD vdd 0 DC 2 AC 0
-        VG gate 0 DC 0
-        RLOAD out 0 100k
-        N1 out gate vdd vdd pch w=1u l=0.13u nf=1 mult=1
-        .NOISE V(out) VDD VALUES 1 10 100 1k
-        .END
-        """,
-    )
-    out = work / "osdi_flicker_noise.csv"
-    run([str(gspice), "--threads", "1", "--format", "csv", "-o", str(out), str(deck)], work)
-    rows = read_csv(out)
-    low = rows[0]["onoise_psd"]
-    high = rows[-1]["onoise_psd"]
-    flicker_count = rows[0]["flicker"]
-    if flicker_count < 1:
-        raise RuntimeError("OSDI flicker validation did not report flicker noise sources")
-    if not low > high:
-        raise RuntimeError(f"OSDI flicker trend failed: onoise_psd(1Hz)={low:.6e}, high={high:.6e}")
-
-    tran_deck = source / "tests" / "decks" / "osdi_psp_trannoise.sp"
-    completed = run([str(gspice), "--threads", "1", str(tran_deck)], source)
-    match = re.search(r"Transient noise summary:.*flicker=([1-9][0-9]*).*colored=([1-9][0-9]*)", completed.stdout)
-    if not match:
-        raise RuntimeError("OSDI transient colored-noise summary did not show flicker/colored sources")
-    print(
-        f"OSDI flicker trend: onoise_psd(1Hz)={low:.6e}, onoise_psd(1kHz)={high:.6e}, "
-        f"flicker_sources={int(flicker_count)}"
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gspice", required=True, type=Path)
     parser.add_argument("--source", default=Path.cwd(), type=Path)
     parser.add_argument(
         "--case",
-        choices=["all", "rc", "seed", "osdi"],
+        choices=["all", "rc", "seed"],
         default="all",
         help="Validation case to run.",
     )
@@ -185,8 +140,6 @@ def main() -> int:
             validate_rc_thermal(gspice, work)
         if args.case in {"all", "seed"}:
             validate_transient_seed_behavior(gspice, work)
-        if args.case in {"all", "osdi"}:
-            validate_osdi_flicker(gspice, source, work)
     return 0
 
 

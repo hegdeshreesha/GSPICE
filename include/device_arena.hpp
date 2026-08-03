@@ -5,7 +5,7 @@
 // DeviceStateArena — Contiguous device state memory pool (Pillar 2/5).
 //
 // Problem:
-//   Each OSDIDevice currently stores prev_state_, next_state_, prev_react_,
+//   Each CompactDevice currently stores prev_state_, next_state_, prev_react_,
 //   prev2_react_, and prev_react_derivative_ as separate std::vector<double>
 //   members. For a circuit with 10,000 PSP103.4 instances (each with ~50
 //   state variables), this creates over 1,000,000 distinct heap allocations.

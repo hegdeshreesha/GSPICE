@@ -84,7 +84,7 @@ private:
         registerFeature("dc", FeatureMaturity::Validated, true, "DC sweep analysis");
         registerFeature("tran", FeatureMaturity::Validated, true, "Transient analysis");
         registerFeature("ac", FeatureMaturity::Validated, true, "AC small-signal analysis");
-        registerFeature("osdi", FeatureMaturity::Tested, true, "OSDI compact model loader");
+        registerFeature("native_compact_models", FeatureMaturity::Wired, false, "Native compact model registry");
         registerFeature("c_api", FeatureMaturity::Tested, true, "C API interface (SimulatorContext)");
         registerFeature("simulator_core", FeatureMaturity::Tested, true, "Decoupled simulator context");
         registerFeature("adjoint_sensitivity", FeatureMaturity::Tested, true, "Adjoint linear solver sensitivity engine");

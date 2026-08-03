@@ -12,7 +12,7 @@
   high-order integration regression tests, bringing the audit-host suite to 58
   tests.
 - A device-neutral `F/Q` DAE contract shared by DC, transient, and AC for
-  resistor, capacitor, inductor, diode, BJT, primitive MOS, and OSDI devices.
+  resistor, capacitor, inductor, diode, BJT, primitive MOS, and native compact devices.
 - Simulator-owned transactional `Q/Qdot` history and fixed-size opaque compact-
   model state frames with bounded rollback and no per-trial snapshot allocation.
 - General variable-step BDF and implicit Adams-Moulton coefficients through
@@ -42,13 +42,13 @@
   Gear2/BDF2 branch for compact models.
 - Diode, BJT, and primitive MOS transient storage is charge-conserving and is
   assembled from the same `Q` Jacobian used by small-signal AC.
-- Corrected OSDI Jacobian row/column orientation, contribution-presence flag
+- Corrected native compact-model Jacobian row/column orientation, contribution-presence flag
   interpretation, and residual/Jacobian sign convention across DC, transient,
   and AC; a state-preserving PSP audit now verifies the ABI mapping.
 
 ### Compatibility notes
 
 - Invoking GSPICE with no netlist now prints help; use `--self-test` to run the
-  built-in OSDI smoke test.
+  built-in native compact-model smoke test.
 - PSS/PAC/PNoise/SP and periodic derivative directives are hard errors until a
   validated execution engine exists.

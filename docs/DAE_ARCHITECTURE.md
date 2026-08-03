@@ -45,7 +45,7 @@ Architectural inspiration is allowed; source-level imitation is not.
 ## Current implementation
 
 `include/dae.hpp` defines the independent DAE request, result, and assembly
-types. Resistor, capacitor, inductor, diode, BJT, primitive MOS, and OSDI
+types. Resistor, capacitor, inductor, diode, BJT, primitive MOS, and native compact-model
 devices expose this contract. DC, transient, and AC prefer DAE evaluation and
 retain a compatibility fallback for devices that have not migrated. All three
 analyses therefore consume the same `F`, `Q`, `dF/dx`, and `dQ/dx` data for
@@ -70,11 +70,11 @@ integration on smooth native-device trajectories, temporarily switches to
 Gear2/BDF2 after alternating weakly damped slopes, and returns to trapezoidal
 after a stable interval. Compact models that request damping remain on Gear2.
 
-OSDI evaluation uses epoch-scoped bypass caching. The cache key includes the
+native compact-model evaluation uses epoch-scoped bypass caching. The cache key includes the
 analysis request, time, integration coefficient, evaluation epoch, and device
 inputs; it is invalidated by accepted-state changes, restore, and internal-node
 binding. Residual verification always performs a full high-precision
-evaluation. OSDI limiting flags prevent false Newton convergence. Optional
+evaluation. native compact-model limiting flags prevent false Newton convergence. Optional
 hidden internal-unknown expansion binds only uncollapsed topology roots into
 MNA without exposing them as user-visible voltage nodes.
 
@@ -99,7 +99,7 @@ Every migrated charge model must demonstrate:
 
 1. Migrate linear passives and establish analytical DAE tests.
 2. Bind the transactional state store to devices without changing legacy state.
-3. Migrate OSDI evaluation into the common DAE result while retaining a guarded
+3. Migrate native compact-model evaluation into the common DAE result while retaining a guarded
    compatibility path.
 4. Replace device-owned charge histories with simulator-owned `Q` history.
 5. Add general variable-step BDF and Adams integration formulas.

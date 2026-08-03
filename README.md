@@ -20,8 +20,7 @@ replacement for a mature or commercial signoff simulator.
 - Hierarchical subcircuit expansion, includes, library sections, conditionals,
   parameter expressions, model cards, initial conditions, and save selection
   for the supported syntax subset.
-- Optional SuiteSparse/KLU, OpenMP-assisted stamping, and experimental OSDI
-  compact-model loading.
+- Optional SuiteSparse/KLU and OpenMP-assisted stamping.
 - SPICE ASCII RAW and CSV transient output.
 - Deterministic Gaussian or uniform source Monte Carlo sampling, including
   optional Latin-hypercube sampling.
@@ -118,9 +117,9 @@ reference scale, with history-based scaling used by the normal accuracy
 presets. `LTE_MODE=STEPDOUBLING` selects the validation oracle for every
 eligible step. `TRAN_ORDER_ADAPTIVE`, `TRAP_RINGING`, `BREAKPOINT_GROWTH`,
 `NR_BYPASS`, `NODESET_ITERS`, and `NODESET_G` expose the associated controls.
-OSDI hidden internal-node expansion
-and limiting-RHS application are available as opt-in qualification paths via
-`OSDI_INTERNAL_NODES=1` and `OSDI_LIMITING_RHS=1`.
+External compiled-model plugins are disabled in this Apache build. Native
+compact-model support should be implemented directly in GSPICE under a
+permissive license boundary.
 `DAE_AUDIT=1` independently finite-differences migrated device `F` and `Q`
 Jacobians after the operating point and checks terminal-charge conservation;
 `DAE_AUDIT_TOL` controls its relative tolerance.

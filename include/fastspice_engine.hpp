@@ -15,7 +15,7 @@
 //   2. Track local terminal voltage delta:
 //        ΔV = max |v_k(t) - v_k(t_last)|
 //   3. If ΔV < reltol * V + vntol, mark the sub-block LATENT.
-//   4. LATENT sub-blocks skip expensive device model evaluation (OSDI eval / MOS
+//   4. LATENT sub-blocks skip expensive device model evaluation (native compact-model eval / MOS
 //      equations) and re-use their cached Jacobian/RHS stamp.
 //   5. Active sub-blocks are fully evaluated and re-stamped.
 //   6. Wake up latent sub-blocks instantly when terminal excitation occurs.

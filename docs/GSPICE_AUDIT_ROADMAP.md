@@ -16,10 +16,10 @@ This document is the current engineering baseline for making GSPICE a serious si
 - The parser now handles continuation lines, `.INCLUDE`/`.INC`, `.LIB file section` extraction, basic `.SUBCKT` expansion, nested subcircuits, `.IF`/`.ELSEIF`/`.ELSE`/`.ENDIF` conditionals, and numeric `.PARAM` expressions with units and common math functions.
 - Numeric scalar parsing is now strict in the parser: expressions such as `1k*2` are evaluated as expressions instead of being truncated to `1k`.
 - Unsupported active elements and unresolved simulator directives now fail loudly instead of being silently ignored. Output-selection directives such as `.SAVE`, `.PRINT`, `.PROBE`, and `.PLOT` are accepted as compatibility warnings while GSPICE writes all solved vectors.
-- IHP SG13G2 low-voltage MOS wrappers (`sg13_lv_nmos`, `sg13_lv_pmos`) now prefer the real active PSP/OSDI wrapper branch and preserve calculated instance parameters such as geometry-dependent area/perimeter values. Primitive MOS fallback is disabled by default and requires `GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1` for placeholder smoke decks.
+- IHP SG13G2 low-voltage MOS wrappers (`sg13_lv_nmos`, `sg13_lv_pmos`) now prefer the real active PSP/native compact-model wrapper branch and preserve calculated instance parameters such as geometry-dependent area/perimeter values. Primitive MOS fallback is disabled by default and requires `GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1` for placeholder smoke decks.
 - The primitive MOS now includes first-order nonideal behavior: channel-length modulation, body-effect threshold shift, weak subthreshold current, simple gate/junction parasitic capacitance, and source/drain-to-bulk junction diode clamps.
-- GSPICE now has first-pass OSDI netlist plumbing: `.OSDI`/`.PRE_OSDI` loader directives, `.MODEL` card storage, and `N...` compact-model instance parsing. A built-in OSDI smoke model verifies the loader/model/device path, but real OpenVAF `.osdi` ABI compatibility and parameter binding are still incomplete.
-- GSPICE now auto-searches for missing OSDI model libraries through `GSPICE_OSDI_DIR`, `NGSPICE_OSDI_DIR`, the deck directory, and local `osdi` folders. The IHP PSP helper script `tools/build_ihp_psp_osdi.ps1` compiles `psp103.va` and `psp103_nqs.va` with OpenVAF when OpenVAF is installed.
+- GSPICE now has first-pass native compact-model netlist plumbing: `.native compact-model`/`.PRE_native compact-model` loader directives, `.MODEL` card storage, and `N...` compact-model instance parsing. A built-in native compact-model smoke model verifies the loader/model/device path, but real native compact-model `.native compact-model` ABI compatibility and parameter binding are still incomplete.
+- GSPICE now auto-searches for missing native compact models through `GSPICE_native compact-model_DIR`, `NGSPICE_native compact-model_DIR`, the deck directory, and local `native compact-model` folders. The IHP PSP helper script `tools/build_ihp_psp_native compact-model.ps1` compiles `psp103.va` and `psp103_nqs.va` with native compact-model when native compact-model is installed.
 - The current executable build issue was caused by duplicate `Path`/`PATH` process environment variables. Building succeeds when the process environment is cleaned before invoking CMake/MSBuild.
 - SuiteSparse/KLU is now an optional real sparse backend through vcpkg, with deployment scripts and smoke tests that verify external KLU calls.
 - `.DC` single-source sweeps are implemented and reuse the previous sweep solution as the next Newton initial guess.
@@ -41,13 +41,13 @@ This document is the current engineering baseline for making GSPICE a serious si
 - Behavioral `B` sources are implemented for `I={expression}` and `V={expression}` with nonlinear numerical Jacobian stamping. Expressions support `V(node)`, `V(node,ref)`, `I(branchDevice)`, `time`, arithmetic, comparisons, ternary `?:`, and common functions such as `sin`, `cos`, `exp`, `log`, `sqrt`, `abs`, `min`, `max`, `pow`, `limit`, and `if`.
 - Corner sweeps are implemented for operating-point source assignments using `.CORNER name SRC=value ...`.
 - Production specs are implemented with `.SPEC name V(node) MIN=value MAX=value`; OP/corner runs report pass/fail and Monte Carlo reports yield, mean, sigma, min, and max.
-- OSDI compact-model fidelity improved: compact-model devices stamp transient, small-signal AC, and noise hooks when a compiled model exposes them. Simple model cards bind parseable parameters, while large foundry model cards are kept on the compiled model defaults except safe selector parameters such as `type` until full `.PARAM` expression evaluation is implemented.
-- Model-fidelity reporting is now explicit: GSPICE prints `MODEL_STATUS: OSDI_LOADED` and `MODEL_STATUS: OSDI_DEVICE` lines, and refuses compact/PDK-looking MOS models from silently falling back to primitive Level-1 behavior unless an explicit debug environment override is set.
+- native compact-model fidelity improved: compact-model devices stamp transient, small-signal AC, and noise hooks when a compiled model exposes them. Simple model cards bind parseable parameters, while large foundry model cards are kept on the compiled model defaults except safe selector parameters such as `type` until full `.PARAM` expression evaluation is implemented.
+- Model-fidelity reporting is now explicit: GSPICE prints `MODEL_STATUS: native compact-model_LOADED` and `MODEL_STATUS: native compact-model_DEVICE` lines, and refuses compact/PDK-looking MOS models from silently falling back to primitive Level-1 behavior unless an explicit debug environment override is set.
 - Numerical-policy controls now include accuracy presets plus `NUMERICAL`/`CONVERGENCE`/`POLICY` presets such as `ROBUST`, which enable source stepping, GMIN stepping, line search, adaptive transient control, and higher Newton iteration limits.
 - Production-deck parser compatibility now accepts `.TEMP`, `.GLOBAL`, `.NODESET`, and functional `.IC V(node)=value` seeds. `.IC` seeds the initial solution and is honored directly for transient runs with `UIC`.
 - The CTest suite now includes syntax smoke tests plus an ASCII RAW numeric regression check for an RC step response.
 - Adaptive transient trial steps use simulator-owned contiguous transaction frames. Full-step and two-half-step LTE trials use one integration method, and device/Q/Qdot histories are committed only after acceptance.
-- Resistor, capacitor, inductor, diode, primitive MOS, BJT, and OSDI devices expose a common `F/Q` DAE contract. General variable-step BDF and implicit Adams-Moulton support orders 1 through 5, while charge participates in endpoint LTE checks. `TRTOL`, `CHGTOL`, and `MAXORD` have explicit transient meanings.
+- Resistor, capacitor, inductor, diode, primitive MOS, BJT, and native compact devices expose a common `F/Q` DAE contract. General variable-step BDF and implicit Adams-Moulton support orders 1 through 5, while charge participates in endpoint LTE checks. `TRTOL`, `CHGTOL`, and `MAXORD` have explicit transient meanings.
 - Audit mode independently finite-differences device `F/Q` Jacobians and checks terminal charge conservation with `.OPTIONS DAE_AUDIT=1`.
 - The nonlinear/linear stack now includes PN-junction transient limiting, row scaling, iterative refinement, and failure reports identifying the worst normalized unknown.
 - `tools/validate_transient.py` compares an RC deck against an analytic oracle.
@@ -56,11 +56,11 @@ This document is the current engineering baseline for making GSPICE a serious si
 
 - `.SUBCKT`, `.INCLUDE`, `.LIB`, `.IF`, and `.PARAM` support is stronger but still not signoff-class. Numeric parameter expressions, simple conditionals, nested includes, library sections, and subcircuit instance overrides work; advanced language constructs, complex quoting/tokenization, discipline-aware constructs, and many model-library corner cases remain incomplete.
 - PDK-grade MOS/BJT models must come through compiled compact models. The primitive MOS remains an improved but still simplified Level-1 style model, not BSIM/PSP/HICUM/EKV class modeling. The IHP SG13G2 primitive fallback is explicit opt-in compatibility only, not a production simulation path.
-- OSDI support now binds instance parameters and all recognized resolved model-card parameters, honors limiting during Newton convergence, offers guarded epoch-scoped device bypass, and can bind uncollapsed internal unknowns into hidden MNA slots. It participates in DC, transient, AC, and noise when the compiled model exposes the needed hooks. Internal-node expansion and limiting-RHS use remain opt-in pending broader OpenVAF/ngspice ABI, foundry-card, collapse-topology, charge-conservation, and golden-deck validation.
+- native compact-model support now binds instance parameters and all recognized resolved model-card parameters, honors limiting during Newton convergence, offers guarded epoch-scoped device bypass, and can bind uncollapsed internal unknowns into hidden MNA slots. It participates in DC, transient, AC, and noise when the compiled model exposes the needed hooks. Internal-node expansion and limiting-RHS use remain opt-in pending broader native compact-model/ngspice ABI, foundry-card, collapse-topology, charge-conservation, and golden-deck validation.
 - SuiteSparse/KLU is integrated for real and complex solves, and the internal path now has row scaling plus iterative refinement. GSPICE still needs condition diagnostics, iterative/preconditioned options, and larger stress tests.
 - Transient integration has backward-Euler, trapezoidal/Gear2, variable-step BDF/Adams through order 5, nonuniform polynomial predictor-corrector LTE, `p-1`/`p`/`p+1` order selection, a periodic step-doubling oracle, charge-aware LTE, source breakpoints, and automatic trap-ringing damping. It still needs better event scheduling, checkpoint/restart, stiff compact-model convergence-order qualification, and broad large-circuit validation.
 - Nonlinear solve has configurable tolerances, adaptive source/gmin continuation, line-search damping, `.NODESET` constraints, PN-junction transient limiting, worst-unknown diagnostics, and guarded compact-model bypass. It still needs broader per-device limiting and difficult large-circuit homotopy qualification.
-- AC analysis only works where devices provide correct small-signal stamps. MOS has first-pass `gm/gds`; OSDI, controlled sources, passives, and basic sources are covered, but full compact-model small-signal behavior still needs validation.
+- AC analysis only works where devices provide correct small-signal stamps. MOS has first-pass `gm/gds`; native compact-model, controlled sources, passives, and basic sources are covered, but full compact-model small-signal behavior still needs validation.
 - RF/PSS/HB/PAC/STB paths are mostly prototypes or simplified demonstrations, not production analysis engines.
 - Noise has first-pass output-referred resistor/diode/primitive-MOS support, but flicker noise, correlation, compact-model noise hooks, input-referred noise, integrated noise, and PNoise remain incomplete.
 - Transfer-function, sensitivity, pole/zero estimates, Monte Carlo, corners, production specs, behavioral sources, and transient measurements have first-pass implementations. Distortion, exact generalized-eigenvalue pole/zero extraction, analysis-wrapped `.STEP`, behavioral `.MEASURE` expressions, production process distributions, and reference-grade validation still need significant work.
@@ -68,9 +68,9 @@ This document is the current engineering baseline for making GSPICE a serious si
 
 ## Reference Targets
 
-ngspice provides a mature SPICE3-derived baseline with OP, DC sweep, AC, TRAN, noise, pole-zero, sensitivity, transfer function, and experimental PSS, plus broad device coverage, XSPICE mixed-signal capability, model libraries, subcircuits, parameters, behavioral sources, and Verilog-A/OSDI-oriented model flows. Reference: https://ngspice.sourceforge.io/docs/ngspice-manual.pdf
+ngspice provides a mature SPICE3-derived baseline with OP, DC sweep, AC, TRAN, noise, pole-zero, sensitivity, transfer function, and experimental PSS, plus broad device coverage, XSPICE mixed-signal capability, model libraries, subcircuits, parameters, behavioral sources, and native compact-model-oriented model flows. Reference: https://ngspice.sourceforge.io/docs/ngspice-manual.pdf
 
-Xyce provides a modern C++ simulator architecture with SPICE compatibility, high-performance parallel execution, large-circuit capability, formal documentation, regression testing guidance, Verilog-A/ADMS workflows, and advanced analyses. Reference: https://xyce.sandia.gov/documentation-tutorials/
+Xyce provides a modern C++ simulator architecture with SPICE compatibility, high-performance parallel execution, large-circuit capability, formal documentation, regression testing guidance, native compact-model workflows, and advanced analyses. Reference: https://xyce.sandia.gov/documentation-tutorials/
 
 ## Required Roadmap
 
@@ -97,9 +97,9 @@ Xyce provides a modern C++ simulator architecture with SPICE compatibility, high
 
 5. Add compact-model infrastructure.
    - Implement or integrate BSIM/PSP-class MOS support.
-   - Make Verilog-A/OSDI support compatible with OpenVAF-generated `.osdi` libraries.
-   - Bind `.MODEL` and instance parameters into OSDI model instances.
-   - Stamp OSDI charges/capacitances for transient and small-signal analyses.
+   - Make native compact-model support compatible with native compact-model-generated `.native compact-model` libraries.
+   - Bind `.MODEL` and instance parameters into native compact model instances.
+   - Stamp native compact-model charges/capacitances for transient and small-signal analyses.
    - Add diode/BJT/JFET/MESFET/HBT/HICUM/PSP model support as needed by Lumen PDKs.
 
 6. Add advanced analyses only after the core is reliable.

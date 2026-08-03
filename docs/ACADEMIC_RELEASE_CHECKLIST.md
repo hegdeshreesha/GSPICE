@@ -9,18 +9,18 @@ Target: GSPICE 1.3.0-academic-beta
 - [ ] Run all CTests with SuiteSparse/KLU enabled and with the internal fallback.
 - [ ] Run `DAE_AUDIT=1` decks across representative diode, BJT, and primitive
       MOS operating regions; archive the derivative and conservation reports.
-- [ ] Run the state-preserving OSDI derivative/conservation audit across
+- [ ] Run the state-preserving native compact-model derivative/conservation audit across
       representative compact-model operating regions and supported ABIs.
 - [ ] Measure convergence order for BE, trapezoidal, BDF2-5, and Adams2-5 on
       smooth analytic RLC/diode problems with fixed and changing step ratios.
-- [ ] Compare OP/DC/TRAN/AC results on public RLC, diode, BJT, and OSDI decks
+- [ ] Compare OP/DC/TRAN/AC results on public RLC, diode, BJT, and native compact-model decks
       against at least Xyce and ngspice; archive inputs, versions, tolerances,
       outputs, and comparison scripts.
 - [ ] Add at least one independent numeric oracle for every advertised beta
       analysis; do not count a success-string regex as an accuracy oracle.
 - [ ] Validate deterministic Monte Carlo repeatability for fixed seeds on both
       release platforms.
-- [ ] Validate every bundled OSDI binary on both release platforms and record
+- [ ] Validate every bundled native compact-model binary on both release platforms and record
       its compiler, ABI version, source/license, and SHA-256.
 - [ ] Confirm `LICENSE`, `CITATION.cff`, dependency licenses, third-party model
       licenses, and PDK redistribution terms with the institution's release

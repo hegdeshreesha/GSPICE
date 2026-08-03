@@ -201,7 +201,7 @@ public:
 
     /**
      * Optional device-requested maximum next transient step. Compact models can
-     * use this for Verilog-A $bound_step support after evaluating their state.
+     * use this for model-requested timestep bounds after evaluating their state.
      */
     virtual double transientBoundStep() const {
         return 0.0;
@@ -260,7 +260,7 @@ public:
     }
 
     // Device model operating-point variables (for example gm, gds, vth).
-    // OSDI devices populate these after a CALC_OP evaluation.
+    // Compact devices populate these after an operating-point evaluation.
     virtual void collectOperatingPointVariables(
         const VectorReal& x,
         std::vector<OperatingPointVariable>& variables) {

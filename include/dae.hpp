@@ -111,7 +111,7 @@ struct DaeEvaluation {
     }
 };
 
-// OSDI requires an iteration that invoked a limiting function to perform at
+// native compact-model requires an iteration that invoked a limiting function to perform at
 // least one more Newton evaluation. This gate is independent of whether the
 // optional residual-norm convergence check is enabled.
 inline bool daeNewtonIterationConverged(

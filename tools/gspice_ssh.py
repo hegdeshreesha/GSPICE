@@ -116,46 +116,6 @@ def process_and_deploy_netlist_dependencies(input_sp, host, scp_prefix, ssh_pref
     return input_sp, False
 
 
-def deploy_osdi_libraries(local_binary, host, scp_prefix, ssh_prefix, remote_dir):
-    """
-    Find local .osdi Verilog-A model files and deploy them to Machine B.
-    """
-    osdi_search_dirs = [
-        r"C:\EDA\GSPICE\osdi",
-    ]
-    if local_binary:
-        bin_dir = os.path.dirname(os.path.abspath(local_binary))
-        osdi_search_dirs.insert(0, os.path.join(bin_dir, "..", "osdi"))
-        osdi_search_dirs.insert(0, os.path.join(bin_dir, "osdi"))
-
-    osdi_files = []
-    seen_names = set()
-    for d in osdi_search_dirs:
-        if os.path.isdir(d):
-            for fn in os.listdir(d):
-                if fn.endswith(".osdi") and fn not in seen_names:
-                    fp = os.path.join(d, fn)
-                    if os.path.isfile(fp):
-                        osdi_files.append(fp)
-                        seen_names.add(fn)
-
-    if not osdi_files:
-        return
-
-    print(f"Deploying {len(osdi_files)} OSDI Verilog-A model libraries to Machine B ...")
-    remote_osdi_dir = f"{remote_dir}/osdi"
-    remote_models_osdi_dir = f"{remote_dir}/models/osdi"
-    remote_models_dir = f"{remote_dir}/models"
-
-    create_remote_dir(ssh_prefix, host, remote_osdi_dir)
-    create_remote_dir(ssh_prefix, host, remote_models_osdi_dir)
-
-    run_cmd(scp_prefix + osdi_files + [f"{host}:{remote_osdi_dir}/"], "deploy OSDI models (osdi)", print_on_error=False)
-    run_cmd(scp_prefix + osdi_files + [f"{host}:{remote_models_osdi_dir}/"], "deploy OSDI models (models/osdi)", print_on_error=False)
-    run_cmd(scp_prefix + osdi_files + [f"{host}:{remote_models_dir}/"], "deploy OSDI models (models)", print_on_error=False)
-    run_cmd(scp_prefix + osdi_files + [f"{host}:{remote_dir}/"], "deploy OSDI models (root)", print_on_error=False)
-
-
 def deploy_binary_runtime_dependencies(local_binary, host, scp_prefix, remote_dir):
     """
     Upload DLLs next to the selected local binary. This is required for the
@@ -301,9 +261,6 @@ def main():
             else:
                 print("WARNING: Could not upload local GSPICE binary; falling back to remote_gspice path", file=sys.stderr)
                 remote_gspice_bin = args.remote_gspice
-
-    # Deploy OSDI model libraries (psp103va.osdi, etc.) to Machine B
-    deploy_osdi_libraries(args.local_binary, host, scp_prefix, ssh_prefix, remote_dir)
 
     # 3) Process netlist dependencies (PDK models) and upload netlist
     sp_to_upload, is_temp_sp = process_and_deploy_netlist_dependencies(args.input, host, scp_prefix, ssh_prefix, remote_dir)

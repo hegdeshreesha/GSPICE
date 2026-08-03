@@ -10,7 +10,6 @@
 #include "devices/probe.hpp"
 #include "devices/current_source.hpp"
 #include "devices/multi_port.hpp"
-#include "devices/osdi_device.hpp"
 #include "devices/controlled_source.hpp"
 #include "devices/bjt.hpp"
 #include "devices/behavioral_source.hpp"
@@ -577,8 +576,7 @@ bool isLikelyCompactMosModelType(const std::string& modelType) {
     return type.find("PSP") != std::string::npos ||
            type.find("BSIM") != std::string::npos ||
            type.find("HICUM") != std::string::npos ||
-           type.find("EKV") != std::string::npos ||
-           type.find("OSDI") != std::string::npos;
+           type.find("EKV") != std::string::npos;
 }
 
 std::string applyLocalParams(
@@ -620,58 +618,6 @@ bool isIhpLvMosWrapper(const std::string& subcktNameUpper, int& typeOut) {
     return false;
 }
 
-bool hasOsdiDeviceInBody(const SubcktDef& def) {
-    for (const auto& line : def.body) {
-        auto tokens = tokenizeSimple(line.text);
-        if (!tokens.empty() && std::toupper(tokens[0][0]) == 'N') return true;
-    }
-    return false;
-}
-
-std::string osdiTerminalSummary(const gspice::OsdiDescriptorMetadata* metadata, uint32_t count) {
-    if (!metadata || metadata->nodes.empty() || count == 0) return "";
-    std::ostringstream out;
-    out << " terminals=";
-    const uint32_t limit = std::min<uint32_t>(count, static_cast<uint32_t>(metadata->nodes.size()));
-    for (uint32_t i = 0; i < limit; ++i) {
-        if (i != 0) out << ",";
-        out << metadata->nodes[i].name;
-    }
-    return out.str();
-}
-
-std::vector<PreLine> expandActiveOsdiWrapperBody(
-    const SubcktDef& def,
-    const std::string& subcktName,
-    const std::string& prefix,
-    const std::unordered_map<std::string, std::string>& pinMap,
-    std::unordered_map<std::string, std::string>& localParams,
-    std::vector<std::string>& errors) {
-    std::vector<PreLine> expanded;
-    auto activeBody = filterConditionalLines(def.body, localParams, errors, "subckt " + subcktName);
-    for (const auto& body : activeBody) {
-        auto bodyTokens = tokenizeSimple(body.text);
-        if (bodyTokens.empty()) continue;
-        if (std::toupper(bodyTokens[0][0]) != 'N') continue;
-        PreLine paramBody = body;
-        paramBody.text = applyLocalParams(paramBody.text, localParams);
-        expanded.push_back({remapPrimitiveLine(paramBody, prefix, pinMap), paramBody.source, paramBody.lineNo});
-    }
-    if (expanded.empty()) {
-        errors.push_back("OSDI wrapper subcircuit '" + subcktName +
-                         "' did not select an active compact-model device for instance " + prefix);
-    }
-    return expanded;
-}
-
-void appendUniquePath(std::vector<std::filesystem::path>& roots, const std::filesystem::path& path) {
-    if (path.empty()) return;
-    auto normalized = path.lexically_normal();
-    if (std::find(roots.begin(), roots.end(), normalized) == roots.end()) {
-        roots.push_back(normalized);
-    }
-}
-
 std::string getEnvVar(const char* envName) {
 #ifdef _WIN32
     char* buffer = nullptr;
@@ -688,35 +634,11 @@ std::string getEnvVar(const char* envName) {
 #endif
 }
 
-void appendEnvSearchRoots(std::vector<std::filesystem::path>& roots, const char* envName) {
-    std::string value = getEnvVar(envName);
-    if (value.empty()) return;
-    std::stringstream ss(value);
-    std::string item;
-    while (std::getline(ss, item, ';')) {
-        item = trimCopy(item);
-        if (!item.empty()) appendUniquePath(roots, item);
-    }
-}
-
 bool primitiveIhpFallbackEnabled() {
     std::string value = getEnvVar("GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK");
     if (value.empty()) return false;
     value = toUpperCopy(value);
     return !(value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
-}
-
-std::vector<std::filesystem::path> osdiSearchRoots(const std::string& sourcePath) {
-    std::vector<std::filesystem::path> roots;
-    appendEnvSearchRoots(roots, "GSPICE_OSDI_DIR");
-    appendEnvSearchRoots(roots, "NGSPICE_OSDI_DIR");
-    std::filesystem::path source(sourcePath);
-    appendUniquePath(roots, source.parent_path());
-    appendUniquePath(roots, source.parent_path() / "osdi");
-    appendUniquePath(roots, std::filesystem::current_path());
-    appendUniquePath(roots, std::filesystem::current_path() / "osdi");
-    appendUniquePath(roots, std::filesystem::current_path() / "build" / "osdi");
-    return roots;
 }
 
 std::string mapNodeToken(
@@ -1120,12 +1042,9 @@ std::vector<PreLine> expandSubcktInstance(
 
     int ihpMosType = 0;
     if (isIhpLvMosWrapper(toUpperCopy(subcktName), ihpMosType) && def.pins.size() >= 4) {
-        if (hasOsdiDeviceInBody(def)) {
-            return expandActiveOsdiWrapperBody(def, subcktName, prefix, pinMap, localParams, errors);
-        }
         if (!primitiveIhpFallbackEnabled()) {
             errors.push_back("IHP wrapper subcircuit '" + subcktName + "' for instance " + prefix +
-                             " does not contain a PSP/OSDI compact-model device. Refusing primitive MOS fallback; " +
+                             " requires a native compact model. Refusing primitive MOS fallback; " +
                              "set GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1 only for placeholder smoke decks.");
             return expanded;
         }
@@ -1150,7 +1069,7 @@ std::vector<PreLine> expandSubcktInstance(
         };
         expanded.push_back({
             ".GSPICEWARN IHP wrapper " + subcktName +
-                " did not contain a PSP/OSDI device; using GSPICE's simple MOS fallback for compatibility only.",
+                " is using GSPICE's simple MOS fallback for compatibility only.",
             line.source,
             line.lineNo
         });
@@ -1290,7 +1209,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_max_iter = std::max(settings.tran_max_iter, 160);
             settings.gmin = std::max(settings.gmin, 1e-12);
             settings.tran_lte_reltol = std::min(settings.tran_lte_reltol, 1e-3);
-            settings.osdi_limiting_rhs = true;
         } else if (policy == "FAST") {
             settings.source_stepping = false;
             settings.gmin_stepping = false;
@@ -1493,24 +1411,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "DAE_AUDIT_TOL" || key == "CHARGE_AUDIT_TOL") && hasNumeric && numeric > 0.0) {
         settings.dae_audit_tolerance = numeric;
-    }
-    else if (key == "OSDI_LIMITING_RHS" || key == "OSDILIMITINGRHS" || key == "OSDI_LIM_RHS" || key == "OSDI_LIMITING") {
-        settings.osdi_limiting_rhs = value.empty() ? true : truthy(value);
-    }
-    else if (key == "OSDI_TRAN_JACOBIAN" || key == "OSDITRANJACOBIAN" || key == "OSDI_TRAN_JAC" || key == "OSDI_STANDARD_TRAN_JACOBIAN") {
-        settings.osdi_tran_jacobian = value.empty() ? true : truthy(value);
-    }
-    else if (key == "OSDI_BIND_FULL_MODEL_PARAMS" || key == "OSDIFULLMODELPARAMS" || key == "OSDI_FULL_MODEL_PARAMS") {
-        settings.osdi_bind_full_model_params = value.empty() ? true : truthy(value);
-    }
-    else if (key == "OSDI_INTERNAL_NODES" || key == "OSDIINTERNALNODES" || key == "OSDI_EXPAND_INTERNAL_NODES") {
-        settings.osdi_internal_nodes = value.empty() ? true : truthy(value);
-    }
-    else if (key == "OSDI_SPICE_RHS" || key == "OSDISPICERHS" || key == "OSDI_NATIVE_RHS") {
-        settings.osdi_spice_rhs = value.empty() ? true : truthy(value);
-    }
-    else if (key == "OSDI_OPVARS" || key == "OSDI_OUTPUT_OPVARS" || key == "OPVARS") {
-        settings.osdi_output_opvars = value.empty() ? true : truthy(value);
     }
     else if (key == "FASTSPICE" || key == "FAST_SPICE" || key == "EVENT_DRIVEN") {
         settings.fastspice = value.empty() ? true : truthy(value);
@@ -1789,8 +1689,7 @@ Netlist Parser::parse(const std::string& filePath) {
         netlist.addError(error);
     }
 
-    // OSDI setup_model/setup_instance execute when device lines are
-    // elaborated. Resolve global simulation-environment directives first so
+    // Resolve global simulation-environment directives first so
     // their $simparam and temperature values do not depend on whether an
     // .OPTIONS or .TEMP line appears before or after the device instances.
     {
@@ -1819,27 +1718,9 @@ Netlist Parser::parse(const std::string& filePath) {
         if (tokens.empty()) continue;
 
         std::string firstTokenUpper = toUpperCopy(tokens[0]);
-        if (firstTokenUpper == "OSDI" || firstTokenUpper == "PRE_OSDI" || firstTokenUpper == "LOAD") {
-            if (tokens.size() < 2) {
-                netlist.addError("Line " + std::to_string(lineNo) + ": " + tokens[0] + " requires a library path.");
-                continue;
-            }
-            std::string osdiPath = stripQuotes(tokens[1]);
-            const std::string osdiPathUpper = toUpperCopy(osdiPath);
-            if (firstTokenUpper == "LOAD" &&
-                osdiPathUpper.size() >= 3 &&
-                osdiPathUpper.substr(osdiPathUpper.size() - 3) == ".VA") {
-                netlist.addError("Line " + std::to_string(lineNo) +
-                    ": LOAD of Verilog-A source requires OpenVAF compilation first. Compile to .osdi, then LOAD the .osdi file.");
-                continue;
-            }
-            if (osdiPath.rfind("builtin:", 0) != 0) {
-                osdiPath = resolveRelativePath(std::filesystem::path(preLine.source), osdiPath).string();
-            }
-            std::string loadError;
-            if (!netlist.loadOsdiLibrary(osdiPath, loadError)) {
-                netlist.addError("Line " + std::to_string(lineNo) + ": " + loadError);
-            }
+        if (firstTokenUpper == "LOAD") {
+            netlist.addError("Line " + std::to_string(lineNo) +
+                ": external compiled-model plugins are disabled in this Apache build; use a native compact model.");
             continue;
         }
 
@@ -2195,38 +2076,9 @@ Netlist Parser::parse(const std::string& filePath) {
                     }
                 }
                 netlist.setSettings(settings);
-            } else if (cmd == ".OSDI" || cmd == ".PRE_OSDI") {
-                if (tokens.size() < 2) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": " + cmd + " requires a library path.");
-                    continue;
-                }
-                std::string osdiPath = stripQuotes(tokens[1]);
-                if (osdiPath.rfind("builtin:", 0) != 0) {
-                    osdiPath = resolveRelativePath(std::filesystem::path(preLine.source), osdiPath).string();
-                }
-                std::string loadError;
-                if (!netlist.loadOsdiLibrary(osdiPath, loadError)) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": " + loadError);
-                }
             } else if (cmd == ".LOAD") {
-                if (tokens.size() < 2) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": .LOAD requires a library path.");
-                    continue;
-                }
-                std::string osdiPath = stripQuotes(tokens[1]);
-                const std::string osdiPathUpper = toUpperCopy(osdiPath);
-                if (osdiPathUpper.size() >= 3 && osdiPathUpper.substr(osdiPathUpper.size() - 3) == ".VA") {
-                    netlist.addError("Line " + std::to_string(lineNo) +
-                        ": .LOAD of Verilog-A source requires OpenVAF compilation first. Compile to .osdi, then .LOAD the .osdi file.");
-                    continue;
-                }
-                if (osdiPath.rfind("builtin:", 0) != 0) {
-                    osdiPath = resolveRelativePath(std::filesystem::path(preLine.source), osdiPath).string();
-                }
-                std::string loadError;
-                if (!netlist.loadOsdiLibrary(osdiPath, loadError)) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": " + loadError);
-                }
+                netlist.addError("Line " + std::to_string(lineNo) +
+                    ": external compiled-model plugins are disabled in this Apache build; use a native compact model.");
             } else if (cmd == ".MODEL") {
                 if (tokens.size() < 3) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .MODEL line ignored: " + line);
@@ -2258,15 +2110,6 @@ Netlist Parser::parse(const std::string& filePath) {
                     }
                 }
                 netlist.addModelCard(model);
-                if (toUpperCopy(tokens[2]) == "OSDI" && tokens.size() > 3) {
-                    std::string pathPart = tokens[3];
-                    size_t start = pathPart.find('"');
-                    size_t end = pathPart.find_last_of('"');
-                    if (start != std::string::npos && end != std::string::npos && end > start) {
-                        std::string path = pathPart.substr(start + 1, end - start - 1);
-                        netlist.addOsdiModel(tokens[1], path);
-                    }
-                }
             } else if (cmd == ".AC") {
                 if (tokens.size() < 5) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .AC line ignored: " + line);
@@ -2945,89 +2788,8 @@ Netlist Parser::parse(const std::string& filePath) {
                 "Line " + std::to_string(lineNo) +
                 ": subcircuit instance is not implemented yet; refusing to ignore active device: " + line);
         } else if (firstChar == 'N') {
-            // OSDI/OpenVAF-style compact model instance:
-            // Nname D G S B modelName [instance params...]
-            if (tokens.size() < 6) {
-                netlist.addError("Line " + std::to_string(lineNo) + ": invalid OSDI N-device line: " + line);
-                continue;
-            }
-            std::vector<int> nodes = {
-                netlist.getOrCreateNode(tokens[1]),
-                netlist.getOrCreateNode(tokens[2]),
-                netlist.getOrCreateNode(tokens[3]),
-                netlist.getOrCreateNode(tokens[4])
-            };
-            const ModelCard* model = netlist.findModelCard(tokens[5]);
-            if (!model) {
-                netlist.addError(
-                    "Line " + std::to_string(lineNo) +
-                    ": OSDI model card not found for '" + tokens[5] + "': " + line);
-                continue;
-            }
-            const OsdiDescriptor* desc = netlist.findOsdiDescriptor(model->type);
-            std::string autoLoadError;
-            if (!desc) {
-                auto roots = osdiSearchRoots(preLine.source);
-                if (netlist.tryAutoLoadOsdiForModelType(model->type, roots, autoLoadError)) {
-                    desc = netlist.findOsdiDescriptor(model->type);
-                }
-            }
-            if (!desc) {
-                netlist.addError(
-                    "Line " + std::to_string(lineNo) +
-                    ": OSDI model type '" + model->type +
-                    "' is not loaded. Add an OSDI/PRE_OSDI line for the compiled model before using: " +
-                    line + (autoLoadError.empty() ? "" : " (" + autoLoadError + ")"));
-                continue;
-            }
-            try {
-                const auto& settings = netlist.getSettings();
-                auto instanceParams = parseParameterTokens(tokens, 6);
-                const OsdiDescriptorMetadata* loadedMetadata =
-                    netlist.findOsdiMetadata(model->type);
-                auto sharedModel = netlist.findOsdiModelState(tokens[5]);
-                const bool modelStateWasShared = static_cast<bool>(sharedModel);
-                auto osdiDevice = std::make_unique<OSDIDevice>(
-                    tokens[0], *desc, nodes, model->params, instanceParams,
-                    settings.temperature_c,
-                    settings.osdi_limiting_rhs,
-                    settings.osdi_tran_jacobian,
-                    settings.osdi_bind_full_model_params,
-                    settings.osdi_spice_rhs,
-                    loadedMetadata,
-                    sharedModel,
-                    settings.gmin,
-                    settings.minr,
-                    settings.nominal_temperature_c,
-                    settings.geometry_scale,
-                    settings.reltol,
-                    settings.vntol,
-                    settings.abstol,
-                    settings.chgtol,
-                    settings.fluxtol);
-                if (!modelStateWasShared) {
-                    netlist.storeOsdiModelState(tokens[5], osdiDevice->sharedModelState());
-                }
-                netlist.addDevice(std::move(osdiDevice));
-                const char* descName = desc->name ? desc->name : desc->model_name;
-                netlist.addModelStatus(
-                    "OSDI_DEVICE instance=" + tokens[0] +
-                    " model=" + tokens[5] +
-                    " type=" + model->type +
-                    " descriptor=" + std::string(descName ? descName : "<unnamed>") +
-                    " osdi_nodes=" + std::to_string(desc->num_nodes) +
-                    osdiTerminalSummary(loadedMetadata, desc->num_terminals) +
-                    " model_state=" + std::string(modelStateWasShared ? "shared" : "created") +
-                    " simparam_gmin=" + formatNumericValue(settings.gmin) +
-                    " simparam_minr=" + formatNumericValue(settings.minr) +
-                    " simparam_tnom=" + formatNumericValue(settings.nominal_temperature_c) +
-                    " simparam_scale=" + formatNumericValue(settings.geometry_scale) +
-                    " internal_mode=" + std::string(settings.osdi_internal_nodes ? "bound-hidden" : "collapsed-only"));
-            } catch (const std::exception& ex) {
-                netlist.addError(
-                    "Line " + std::to_string(lineNo) +
-                    ": failed to create OSDI device '" + tokens[0] + "': " + ex.what());
-            }
+            netlist.addError("Line " + std::to_string(lineNo) +
+                ": external compact-model N devices are disabled in this Apache build; use a native compact model.");
         } else if (firstChar == 'M') {
             // MOSFET: Mname D G S B Model [W=..] [L=..]
             if (tokens.size() < 6) {
@@ -3068,7 +2830,7 @@ Netlist Parser::parse(const std::string& filePath) {
                         "Line " + std::to_string(lineNo) +
                         ": MOS model '" + tokens[5] + "' has compact/PDK type '" +
                         modelCard->type + "'. Refusing primitive Level-1 fallback. "
-                        "Load the matching OSDI/OpenVAF model or set GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK=1 only for debug smoke decks.");
+                        "Implement the model natively or set GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK=1 only for debug smoke decks.");
                     continue;
                 }
                 netlist.addWarning(
@@ -3079,7 +2841,7 @@ Netlist Parser::parse(const std::string& filePath) {
                 netlist.addError(
                     "Line " + std::to_string(lineNo) +
                     ": MOS model '" + tokens[5] + "' looks like a PDK compact model but no supported model card was loaded. "
-                    "Refusing primitive Level-1 fallback; load the real OSDI/OpenVAF model first.");
+                    "Refusing primitive Level-1 fallback; implement the model natively first.");
                 continue;
             }
 

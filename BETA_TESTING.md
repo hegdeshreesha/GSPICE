@@ -49,14 +49,14 @@ Start with:
 - `tests/decks/behavioral_voltage.sp`
 - `tests/decks/controlled_sources.sp`
 - `tests/decks/measure_tran.sp`
-- `tests/decks/osdi_psp_options.sp` when OSDI files are available
+- `tests/decks/error_ihp_primitive_fallback.sp` for compact-model fallback checks
 
 ## Validation
 
 Focused beta check:
 
 ```powershell
-ctest --test-dir C:\EDA\GSPICE\build -C Release -R "(smoke_osdi_options_deck|smoke_osdi_psp_inverter|smoke_osdi_limiting_rhs_option|smoke_osdi_model_status|regression_save_voltage_selection|smoke_tran_predictor_options|smoke_behavioral|smoke_controlled|smoke_measure|smoke_pz|smoke_tf|smoke_noise|smoke_step|smoke_mc)" --output-on-failure
+ctest --test-dir C:\EDA\GSPICE\build -C Release -R "(error_unsupported_compact_model|error_ihp_primitive_fallback|regression_save_voltage_selection|smoke_tran_predictor_options|smoke_behavioral|smoke_controlled|smoke_measure|smoke_pz|smoke_tf|smoke_noise|smoke_step|smoke_mc)" --output-on-failure
 ```
 
 Full local check:
@@ -67,22 +67,12 @@ ctest --test-dir C:\EDA\GSPICE\build -C Release --output-on-failure
 
 ## Compact Model Policy
 
-GSPICE must not silently downgrade PDK-grade active devices to primitive MOS behavior. If a deck needs PSP/BSIM/HICUM-class modeling, it should use compiled compact models through OSDI/OpenVAF-style libraries, or fail with a diagnostic explaining what is missing.
-
-Advanced OSDI controls are intentionally explicit:
-
-- `OSDI_LIMITING_RHS`
-- `OSDI_SPICE_RHS`
-- `OSDI_TRAN_JACOBIAN`
-- `OSDI_INTERNAL_NODES`
-- `OSDI_BIND_FULL_MODEL_PARAMS`
-
-Some controls are still experimental and should be validated against Ngspice/Xyce before trusting results.
+GSPICE must not silently downgrade PDK-grade active devices to primitive MOS behavior. External compiled-model plugins are disabled in the Apache build; unsupported compact models must fail with a diagnostic until native compact-model implementations are available.
 
 ## Known Limitations
 
-- PSP/OSDI support is under active validation.
-- Internal-node expansion is experimental.
+- Native PSP/BSIM/HICUM-class compact models are not production-ready yet.
+- Internal-node expansion for native compact models is not implemented yet.
 - Full foundry `.PARAM` expression binding is incomplete.
 - RF/PSS/HB/STB and exact pole-zero extraction are not production grade.
 - PSS, PAC, PNoise, SP execution, and periodic derivative analyses are
@@ -91,10 +81,10 @@ Some controls are still experimental and should be validated against Ngspice/Xyc
 
 ## Reference Simulator Direction
 
-GSPICE aims to combine independently implemented Verilog-A/OSDI rigor with:
+GSPICE aims to combine independently implemented native compact-model rigor with:
 
 - strict unsupported-feature diagnostics,
-- reference comparison against Ngspice/Xyce,
+- reference comparison against public analytic and measurement-backed decks,
 - reproducible run manifests through Lumen,
 - model-fidelity reporting per active instance,
 - and a growing regression suite for every advertised capability.

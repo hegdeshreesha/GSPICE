@@ -1,4 +1,4 @@
-* Missing PSP OSDI should fail loudly, never fallback silently
+* Unsupported native compact model should fail loudly, never fallback silently.
 .MODEL nch psp103va type=1
 VDD vdd 0 DC 1.8
 VIN gate 0 DC 0.8

@@ -30,7 +30,6 @@ New-Item -ItemType Directory -Path "$DistDir/include" -Force
 Copy-Item "build/Release/gspice.exe" "$DistDir/"
 Copy-Item "README.md" "$DistDir/"
 Copy-Item "test_*.sp" "$DistDir/examples/"
-Copy-Item "include/osdi.h" "$DistDir/include/"
 
 # 4. Zip the release
 $ZipFile = "dist/gspice_v$Version`_win64.zip"

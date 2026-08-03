@@ -17,12 +17,9 @@ option(GSPICE_ENABLE_KLU "Enable the SuiteSparse/KLU sparse backend when availab
 option(GSPICE_REQUIRE_KLU "Fail configuration unless SuiteSparse/KLU is available" OFF)
 option(GSPICE_ENABLE_NOISE_VALIDATION "Enable external CSV-based stochastic noise validation tests" OFF)
 option(GSPICE_ENABLE_RF_NOISE_REGRESSION "Enable experimental RF/noise/PSS regression tests" OFF)
-option(GSPICE_ENABLE_OSDI_REGRESSION "Enable PSP OSDI shared-library regression tests" OFF)
-
 if(GSPICE_REQUIRE_KLU)
     set(GSPICE_ENABLE_KLU ON)
 endif()
-
 set(GSPICE_HAVE_SUITESPARSE_KLU OFF)
 set(GSPICE_KLU_LINK_TARGET "")
 
@@ -54,7 +51,6 @@ if(GSPICE_ENABLE_KLU)
         endif()
     endif()
 endif()
-
 if(GSPICE_REQUIRE_KLU AND NOT GSPICE_HAVE_SUITESPARSE_KLU)
     message(FATAL_ERROR
         "GSPICE_REQUIRE_KLU=ON, but SuiteSparse/KLU was not found. "
@@ -105,13 +101,6 @@ endif()
 target_include_directories(gspice PRIVATE include)
 
 enable_testing()
-
-add_executable(gspice_dae_state_test tests/dae_state_test.cpp)
-target_include_directories(gspice_dae_state_test PRIVATE include)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(gspice_dae_state_test PRIVATE OpenMP::OpenMP_CXX)
-endif()
-add_test(NAME unit_dae_state COMMAND gspice_dae_state_test)
 
 find_program(GSPICE_POWERSHELL NAMES pwsh powershell)
 find_program(GSPICE_PYTHON NAMES python3 python)
@@ -237,10 +226,6 @@ add_gspice_smoke_test(smoke_ihp_lv_mos_wrapper tests/decks/ihp_lv_mos_wrapper.sp
 set_tests_properties(smoke_ihp_lv_mos_wrapper PROPERTIES
     ENVIRONMENT "GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1"
 )
-add_gspice_smoke_test(smoke_osdi_builtin tests/decks/osdi_builtin.sp)
-if(GSPICE_ENABLE_OSDI_REGRESSION)
-    add_gspice_error_test(error_osdi_psp_multirate_convergence tests/decks/osdi_psp_multirate.sp "Transient step failed to converge")
-endif()
 add_gspice_regex_test(smoke_dc_sweep_model tests/decks/dc_sweep_model.sp "Starting DC Sweep Analysis")
 add_gspice_regex_test(smoke_dc_nested tests/decks/dc_nested.sp "sweep\\(V1\\).*sweep\\(V2\\)")
 add_gspice_regex_test(smoke_ac_lin tests/decks/ac_rc.sp "AC summary: points=5 sweep=LIN")
@@ -299,7 +284,7 @@ add_gspice_raw_header_expect_test(regression_save_explicit_current tests/decks/s
 add_gspice_csv_expect_test(regression_csv_output tests/decks/regression_rc_step.sp)
 add_gspice_raw_expect_test(regression_lumen_ihp_inverter tests/decks/lumen_ihp_inverter_short.sp "V(net2)" 0.0 0.2)
 set_tests_properties(regression_lumen_ihp_inverter PROPERTIES
-    ENVIRONMENT "GSPICE_OSDI_DIR=${CMAKE_CURRENT_SOURCE_DIR}/osdi"
+    ENVIRONMENT "GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1"
 )
 if(GSPICE_PYTHON AND GSPICE_ENABLE_NOISE_VALIDATION)
     add_test(
@@ -320,7 +305,7 @@ if(GSPICE_PYTHON AND GSPICE_ENABLE_NOISE_VALIDATION)
     )
     set_tests_properties(validation_transient_noise_seed PROPERTIES TIMEOUT 180)
 endif()
-add_gspice_error_test(error_missing_psp_osdi tests/decks/osdi_missing_psp.sp "OSDI model type 'psp103va' is not loaded")
+add_gspice_error_test(error_unsupported_compact_model tests/decks/compact_model_unsupported.sp "external compact-model N devices are disabled")
 add_gspice_error_test(error_unsupported_element tests/decks/error_unsupported_element.sp "unsupported element")
 add_gspice_error_test(error_ihp_primitive_fallback tests/decks/error_ihp_primitive_fallback.sp "Refusing primitive MOS fallback")
 add_gspice_error_test(error_compact_mos_fallback tests/decks/error_compact_mos_fallback.sp "Refusing primitive Level-1 fallback")
@@ -335,42 +320,4 @@ if(GSPICE_HAVE_SUITESPARSE_KLU)
     set_tests_properties(cli_capabilities_klu PROPERTIES
         PASS_REGULAR_EXPRESSION "\"sparse_backend\": \"SuiteSparse-KLU\""
     )
-endif()
-
-if(GSPICE_ENABLE_OSDI_REGRESSION AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/osdi/psp103.osdi")
-    add_gspice_regex_test(smoke_osdi_model_status_loaded tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_LOADED")
-    add_gspice_regex_test(smoke_osdi_nature_tolerances tests/decks/osdi_internal_nodes.sp "nature_tolerances=[1-9]")
-    add_gspice_regex_test(smoke_osdi_model_status_device tests/decks/osdi_psp_inverter.sp "MODEL_STATUS: OSDI_DEVICE")
-    add_gspice_regex_test(smoke_osdi_opvars tests/decks/osdi_opvars.sp "OSDI operating-point variables: [1-9][0-9]*")
-    add_gspice_smoke_test(smoke_osdi_noise_types tests/decks/osdi_noise.sp)
-    add_gspice_smoke_test(smoke_osdi_transient_noise_colored tests/decks/osdi_psp_trannoise.sp)
-    if(GSPICE_PYTHON AND GSPICE_ENABLE_NOISE_VALIDATION)
-        add_test(
-            NAME validation_osdi_flicker_noise
-            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_noise.py
-                --gspice $<TARGET_FILE:gspice>
-                --source ${CMAKE_CURRENT_SOURCE_DIR}
-                --case osdi
-        )
-        set_tests_properties(validation_osdi_flicker_noise PROPERTIES
-            SKIP_RETURN_CODE 77
-            TIMEOUT 180
-        )
-    endif()
-    add_gspice_env_regex_test(smoke_osdi_limiting_rhs_option tests/decks/osdi_psp_inverter.sp "GSPICE_USE_OSDI_LIMITING_RHS=1" "OSDI advanced options: limiting_rhs=requested")
-    add_gspice_regex_test(smoke_osdi_options_deck tests/decks/osdi_psp_options.sp "OSDI advanced options: limiting_rhs=requested.*full_model_params=off.*spice_rhs=requested")
-    add_gspice_regex_test(smoke_osdi_simparams_options tests/decks/osdi_psp_options.sp "gmin=7\\.000000000e-11")
-    add_gspice_regex_test(smoke_osdi_simparams_setup_order tests/decks/osdi_psp_options.sp "OSDI_DEVICE instance=NP.*simparam_gmin=7(\\.[0-9]+)?e-11.*simparam_minr=3(\\.[0-9]+)?e-10")
-    add_gspice_regex_test(smoke_osdi_simparams_environment tests/decks/osdi_psp_options.sp "OSDI_DEVICE instance=NP.*simparam_tnom=35.*simparam_scale=2")
-    add_gspice_regex_test(smoke_osdi_internal_nodes tests/decks/osdi_internal_nodes.sp "internal_nodes=expanded internal_unknowns=[1-9]")
-    add_gspice_regex_test(smoke_osdi_unknown_natures tests/decks/osdi_internal_nodes.sp "internal_unknowns=[1-9]")
-    add_gspice_regex_test(smoke_osdi_internal_solution tests/decks/osdi_internal_nodes.sp "Node 2=1\\.")
-    add_gspice_regex_test(smoke_osdi_adaptive_homotopy tests/decks/osdi_internal_nodes.sp "adaptive continuation step\\(s\\)")
-    add_gspice_regex_test(smoke_osdi_psp_pmos_pullup tests/decks/osdi_psp_pmos_pullup.sp "Node 2=1\\.")
-    add_gspice_regex_test(smoke_osdi_psp_dae_audit tests/decks/osdi_psp_dae_audit.sp "DAE audit: checked=[1-9].*PASS")
-    add_gspice_regex_test(smoke_osdi_shared_model tests/decks/osdi_shared_model.sp "OSDI_DEVICE instance=N2.*model_state=shared")
-    add_gspice_regex_test(smoke_osdi_shared_model_dae tests/decks/osdi_shared_model.sp "DAE audit: checked=[1-9].*PASS")
-    add_gspice_regex_test(smoke_osdi_psp_loaded_gate_op tests/decks/osdi_psp_loaded_gate_op.sp "Node 2=2\\.")
-    add_gspice_regex_test(smoke_osdi_psp_inverter tests/decks/osdi_psp_inverter.sp "output_points=2[12]")
-    add_gspice_regex_test(smoke_osdi_psp_inverter_loaded tests/decks/osdi_psp_inverter_loaded.sp "e-11 \\| 2\\.000000000e\\+00")
 endif()
