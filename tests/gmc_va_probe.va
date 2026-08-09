@@ -1,0 +1,10 @@
+module va_probe(p, n);
+    electrical p, n;
+    parameter real G = 2m;
+    parameter real Cj = 3p;
+    real vd;
+    analog begin
+        vd = V(p, n);
+        I(p, n) <+ G * vd + ddt(Cj * vd);
+    end
+endmodule

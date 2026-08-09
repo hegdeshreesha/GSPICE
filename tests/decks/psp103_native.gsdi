@@ -1,0 +1,13 @@
+{
+  "schema": "gsdi-artifact-v0",
+  "producer": "gspice-native",
+  "model_type": "psp103va",
+  "terminal_count": 4,
+  "parameters": [],
+  "features": {
+    "op": true,
+    "tran": false,
+    "ac": true,
+    "noise": false
+  }
+}

@@ -1,0 +1,48 @@
+module deep_probe(p, n);
+    inout p, n;
+    electrical p, n;
+    parameter real G = 2m;
+    parameter real Cj = 3u;
+    parameter real Nwhite = 4p;
+    parameter real Nflicker = 9p;
+    analog function real gclamp;
+        input x, lo, hi;
+        real x, lo, hi;
+        begin
+            gclamp = min(max(x, lo), hi);
+        end
+    endfunction
+    analog function real gsoft;
+        input x;
+        real x;
+        begin
+            gsoft = 1.0 + 0.5 * gclamp(x, 0.0, 1.0);
+        end
+    endfunction
+    real v, w;
+    integer sel;
+    analog begin
+        sel = 2;
+        v = V(p, n);
+        w = exp(v) + ln(v + 1.0) + sqrt(abs(v) + 1.0)
+            + tanh(v) + sin(v) + cosh(v) + sinh(v) / 4.0
+            + (v > 0.5 ? v ** 2 : 0.5)
+            + max(v - 0.5, 0.0) + min(v, 1.5)
+            + log10(v * 10.0) + $ln(v + 2.0)
+            + limexp(v - 2.0) + $temperature / 300.0 - 1.0
+            + pow(v, 2) + gsoft(v - 0.25);
+        I(p, n) <+ G * w;
+        case (sel)
+            1: I(p, n) <+ 0.0;
+            2, 3: I(p, n) <+ 1e-9 * v;
+            default: I(p, n) <+ 2e-9 * v;
+        endcase
+        if (v > 0.0)
+            I(p, n) <+ 1e-12 * v;
+        else
+            I(p, n) <+ 0.0;
+        I(p, n) <+ white_noise(Nwhite, "thermal");
+        I(p, n) <+ flicker_noise(Nflicker, 1.0, "flicker");
+        I(p, n) <+ ddt(Cj * v);
+    end
+endmodule

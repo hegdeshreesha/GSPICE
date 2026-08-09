@@ -81,52 +81,78 @@ bool parallel_stamp_enabled(int num_devs, int matrix_size) {
 }
 
 double default_transient_max_step(const SimulationSettings& settings, double output_step) {
-    if (settings.t_max_step > 0.0) {
-        return std::max(settings.t_max_step, 1e-18);
-    }
-// SPICE convention: max_step is an UPPER BOUND limit for adaptive timestepping.
-    // It allows step size to grow during quiescent flat regions while LTE shrinks step
-    // size during active transitions/oscillations.
-    const double base = (settings.t_stop > 0.0) ? (settings.t_stop / 50.0) : (output_step * 50.0);
-    return std::max({base, output_step * 5.0, 1e-18});
-}
-
-VectorReal interpolate_transient_state(
-    const VectorReal& previous,
-    const VectorReal& current,
-    double previous_time,
-    double current_time,
-    double sample_time) {
-    if (current_time <= previous_time) return current;
-    const double alpha = std::clamp(
-        (sample_time - previous_time) / (current_time - previous_time), 0.0, 1.0);
-    VectorReal sample = previous;
-    for (int i = 0; i < sample.getSize(); ++i) {
-        sample[i] = previous[i] + alpha * (current[i] - previous[i]);
-    }
-    return sample;
+    if (settings.t_max_step > 0.0) return std::max(settings.t_max_step, 1e-18);
+    return std::max(output_step, 1e-18);
 }
 
 
 void stamp_global_gmin(SparseMatrixReal& J, int num_nodes, double gmin) {
-    (void)num_nodes;
-    const int n = J.getSize();
+    if (gmin <= 0.0) return;
+    const int n = std::min(num_nodes, J.getSize());
     for (int i = 0; i < n; ++i) {
         J.add(i, i, gmin);
     }
 }
 
+void stamp_global_cshunt(
+    SparseMatrixReal& J,
+    VectorReal& b,
+    int num_nodes,
+    double cshunt,
+    const TransientContext& ctx) {
+    if (cshunt <= 0.0 || ctx.timeStep <= 0.0 || !ctx.xHistory || ctx.xHistory->empty()) return;
+    const VectorReal& prev = ctx.xHistory->back();
+    const bool useSecond = ctx.hasSecondHistory && ctx.xHistory->size() >= 2;
+    const VectorReal& prev2 = useSecond ? (*ctx.xHistory)[ctx.xHistory->size() - 2] : prev;
+    for (int i = 0; i < num_nodes; ++i) {
+        J.add(i, i, ctx.a0 * cshunt);
+        const double history = cshunt * (ctx.a1 * prev[i] + (useSecond ? ctx.a2 * prev2[i] : 0.0));
+        b.add(i, -history);
+    }
+}
+
 void stamp_global_gmin(SparseMatrixComplex& J, int num_nodes, double gmin) {
-    (void)num_nodes;
-    const int n = J.getSize();
+    if (gmin <= 0.0) return;
+    const int n = std::min(num_nodes, J.getSize());
     for (int i = 0; i < n; ++i) {
         J.add(i, i, {gmin, 0.0});
     }
 }
 
+void write_operating_point_raw(
+    const std::string& output_file,
+    const Netlist& netlist,
+    const VectorReal& x_dc,
+    int num_nodes) {
+    if (output_file.empty()) return;
+    std::ofstream raw(output_file, std::ios::out | std::ios::trunc);
+    if (!raw) {
+        throw std::runtime_error("could not open OP RAW output file: " + output_file);
+    }
+    raw << "Title: GSPICE RAW output\n";
+    raw << "Plotname: Operating Point\n";
+    raw << "Flags: real\n";
+    raw << "No. Variables: " << (num_nodes + 1) << "\n";
+    raw << "No. Points:                1\n";
+    raw << "Variables:\n";
+    raw << "0\ttime\ttime\n";
+    for (int i = 0; i < num_nodes; ++i) {
+        raw << (i + 1) << "\tV(" << netlist.getNodeName(i) << ")\tvoltage\n";
+    }
+    raw << "Values:\n";
+    raw << std::scientific << std::setprecision(12) << 0.0;
+    for (int i = 0; i < num_nodes; ++i) {
+        raw << " " << x_dc[i];
+    }
+    raw << "\n";
+}
+
 struct DaeStampStatus {
     bool limitingApplied = false;
     bool bypassed = false;
+    bool modelDevice = false;
+    double evalSeconds = 0.0;
+    double legacyStampSeconds = 0.0;
 };
 
 std::uint64_t next_evaluation_epoch() {
@@ -161,12 +187,29 @@ DaeStampStatus stamp_device_dc(
         : 0.0;
     request.evaluationEpoch = evaluationEpoch;
     DaeEvaluation evaluation;
+    const bool is_model_device = false;
+    const auto eval_start = std::chrono::steady_clock::now();
     if (device.evaluateDae(x, request, evaluation)) {
+        const auto eval_end = std::chrono::steady_clock::now();
         stampDaeStatic(evaluation, x, jacobian, rhs);
-        return {evaluation.limitingApplied, evaluation.bypassed};
+        return {
+            evaluation.limitingApplied,
+            evaluation.bypassed,
+            is_model_device,
+            elapsed_seconds(eval_start, eval_end),
+            0.0
+        };
     }
+    const auto legacy_start = std::chrono::steady_clock::now();
     device.dcStamp(jacobian, rhs, x, 0.0, 0.0, {});
-    return {};
+    const auto legacy_end = std::chrono::steady_clock::now();
+    return {
+        false,
+        false,
+        is_model_device,
+        elapsed_seconds(eval_start, legacy_start),
+        elapsed_seconds(legacy_start, legacy_end)
+    };
 }
 
 void stamp_device_ac(
@@ -189,6 +232,14 @@ void stamp_device_ac(
     device.acStamp(jacobian, rhs, omega, operatingPoint);
 }
 
+double unknown_abs_tolerance(int index, int num_nodes, const SimulationSettings& settings) {
+    return index < num_nodes ? settings.vntol : settings.abstol;
+}
+
+double equation_abs_tolerance(int index, int num_nodes, const SimulationSettings& settings) {
+    return index < num_nodes ? settings.abstol : settings.vntol;
+}
+
 bool solution_converged(
     const VectorReal& x_new,
     const VectorReal& x_old,
@@ -198,7 +249,7 @@ bool solution_converged(
     for (int i = 0; i < n; ++i) {
         const double delta = std::abs(x_new[i] - x_old[i]);
         const double scale = std::max(std::abs(x_new[i]), std::abs(x_old[i]));
-        const double abs_floor = (i < num_nodes) ? settings.vntol : settings.abstol;
+        const double abs_floor = unknown_abs_tolerance(i, num_nodes, settings);
         const double tol = abs_floor + settings.reltol * scale;
         if (delta > tol) return false;
     }
@@ -215,7 +266,7 @@ std::pair<double, int> worst_solution_update(
     const int n = std::min(x_new.getSize(), x_old.getSize());
     for (int i = 0; i < n; ++i) {
         const double scale = std::max(std::abs(x_new[i]), std::abs(x_old[i]));
-        const double absolute = i < num_nodes ? settings.vntol : settings.abstol;
+        const double absolute = unknown_abs_tolerance(i, num_nodes, settings);
         const double normalized = std::abs(x_new[i] - x_old[i]) /
             std::max(absolute + settings.reltol * scale, 1e-30);
         if (normalized > worst) {
@@ -242,7 +293,7 @@ double linear_system_residual_error(
     for (int i = 0; i < n; ++i) {
         const double residual = std::abs(ax[static_cast<size_t>(i)] - b[i]);
         const double scale = std::max(std::abs(ax[static_cast<size_t>(i)]), std::abs(b[i]));
-        const double abs_floor = (i < num_nodes) ? settings.abstol : settings.vntol;
+        const double abs_floor = equation_abs_tolerance(i, num_nodes, settings);
         const double tol = abs_floor + settings.reltol * scale;
         worst = std::max(worst, residual / std::max(tol, 1e-30));
     }
@@ -301,6 +352,8 @@ struct NonlinearResidualCheck {
     double error = std::numeric_limits<double>::infinity();
     bool limitingApplied = false;
     long long bypassedDevices = 0;
+    double modelEvalSeconds = 0.0;
+    double legacyStampSeconds = 0.0;
 };
 
 NonlinearResidualCheck dc_residual_error(
@@ -327,6 +380,8 @@ NonlinearResidualCheck dc_residual_error(
     for (const auto& item : status) {
         result.limitingApplied = result.limitingApplied || item.limitingApplied;
         result.bypassedDevices += item.bypassed ? 1 : 0;
+        if (item.modelDevice) result.modelEvalSeconds += item.evalSeconds;
+        result.legacyStampSeconds += item.legacyStampSeconds;
     }
     return result;
 }
@@ -353,24 +408,38 @@ NonlinearResidualCheck transient_residual_error(
     int num_nodes,
     const VectorReal& x,
     const TransientContext& ctx,
-    const SimulationSettings& settings) {
+    const SimulationSettings& settings,
+    double transient_cshunt) {
     SparseMatrixReal J(matrix_size);
     VectorReal b(matrix_size);
     stamp_global_gmin(J, num_nodes, settings.gmin);
+    stamp_global_cshunt(J, b, num_nodes, transient_cshunt, ctx);
     const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
     const std::uint64_t epoch = next_evaluation_epoch();
     std::vector<DaeStampStatus> status(static_cast<std::size_t>(num_devs));
     #pragma omp parallel for if(use_parallel_stamp)
     for (int i = 0; i < num_devs; ++i) {
-        status[static_cast<std::size_t>(i)] = stamp_device_transient(
-            *devices[i], static_cast<std::size_t>(i), daeHistory, J, b, x, ctx,
-            &settings, epoch, false, true);
+        try {
+            status[static_cast<std::size_t>(i)] = stamp_device_transient(
+                *devices[i], static_cast<std::size_t>(i), daeHistory, J, b, x, ctx,
+                &settings, epoch, false, true);
+        } catch (const std::exception& exception) {
+            std::cerr << "RESIDUAL CHECK STAMP EXCEPTION device=" << devices[i]->getName()
+                      << " what=" << exception.what() << std::endl;
+            std::cerr.flush();
+        } catch (...) {
+            std::cerr << "RESIDUAL CHECK STAMP UNKNOWN EXCEPTION device=" << devices[i]->getName()
+                      << std::endl;
+            std::cerr.flush();
+        }
     }
     NonlinearResidualCheck result;
     result.error = linear_system_residual_error(J, b, x, num_nodes, settings);
     for (const auto& item : status) {
         result.limitingApplied = result.limitingApplied || item.limitingApplied;
         result.bypassedDevices += item.bypassed ? 1 : 0;
+        if (item.modelDevice) result.modelEvalSeconds += item.evalSeconds;
+        result.legacyStampSeconds += item.legacyStampSeconds;
     }
     return result;
 }
@@ -448,13 +517,17 @@ std::vector<double> generate_mc_samples(const SimulationSettings& settings) {
             }
         }
     } else {
-        std::normal_distribution<double> distribution(settings.mc_mean, settings.mc_sigma);
+        const bool has_spread = settings.mc_sigma > 0.0;
+        std::normal_distribution<double> distribution;
+        if (has_spread) {
+            distribution = std::normal_distribution<double>(settings.mc_mean, settings.mc_sigma);
+        }
         for (int i = 0; i < settings.mc_runs; ++i) {
             if (settings.mc_latin_hypercube) {
                 samples.push_back(settings.mc_mean + settings.mc_sigma *
                     standard_normal_quantile(probabilities[static_cast<size_t>(i)]));
             } else {
-                samples.push_back(settings.mc_sigma == 0.0 ? settings.mc_mean : distribution(rng));
+                samples.push_back(has_spread ? distribution(rng) : settings.mc_mean);
             }
         }
     }
@@ -541,47 +614,6 @@ std::complex<double> complex_node_value(const VectorComplex& x, int node) {
 
 std::complex<double> complex_probe_value(const VectorComplex& x, int node_pos, int node_neg) {
     return complex_node_value(x, node_pos) - complex_node_value(x, node_neg);
-}
-
-struct NoiseTransferResult {
-    double output_psd = 0.0;
-    std::size_t source_count = 0;
-};
-
-NoiseTransferResult solve_output_noise_psd(
-    const std::vector<std::unique_ptr<Device>>& devices,
-    int num_devs,
-    int matrix_size,
-    int num_nodes,
-    int out_node,
-    double omega,
-    const VectorReal& operating_point,
-    const SimulationSettings& settings,
-    LinearSolveContextComplex* complex_solver_context) {
-    SparseMatrixComplex J_sparse(matrix_size);
-    VectorComplex ignored_rhs(matrix_size);
-    stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
-    const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
-    #pragma omp parallel for if(use_parallel_stamp)
-    for (int i = 0; i < num_devs; ++i) {
-        stamp_device_ac(*devices[i], J_sparse, ignored_rhs, omega, operating_point);
-    }
-
-    std::vector<NoiseSource> noise_sources;
-    for (const auto& dev : devices) {
-        dev->collectNoiseSources(omega, operating_point, noise_sources);
-    }
-
-    double output_psd = 0.0;
-    for (const auto& source : noise_sources) {
-        if (source.currentPsd <= 0.0) continue;
-        VectorComplex rhs(matrix_size);
-        rhs.add(source.nodePos, {-1.0, 0.0});
-        rhs.add(source.nodeNeg, {1.0, 0.0});
-        VectorComplex transfer = KluSolverComplex::solve(J_sparse, rhs, complex_solver_context);
-        output_psd += std::norm(transfer[out_node]) * source.currentPsd;
-    }
-    return {output_psd, noise_sources.size()};
 }
 
 std::string node_label(const Netlist& netlist, int node) {
@@ -672,18 +704,10 @@ struct TransientStepResult {
     int integration_order = 1;
     long long bypassed_devices = 0;
     bool limiting_prevented_convergence = false;
-};
-
-struct TransientMatrixWorkspace {
-    explicit TransientMatrixWorkspace(int matrix_size)
-        : jacobian(matrix_size), rhs(matrix_size) {}
-
-    void setStructureCacheEnabled(bool enabled) {
-        jacobian.setStructureCacheEnabled(enabled);
-    }
-
-    SparseMatrixReal jacobian;
-    VectorReal rhs;
+    double model_eval_seconds = 0.0;
+    double legacy_stamp_seconds = 0.0;
+    double residual_check_seconds = 0.0;
+    double matrix_clear_seconds = 0.0;
 };
 
 std::string transient_failure_message(
@@ -720,6 +744,9 @@ struct TransientStats {
     long long limiting_rechecks = 0;
     long long predictor_lte_steps = 0;
     long long step_doubling_audits = 0;
+    long long step_doubling_pc_invalid = 0;
+    long long step_doubling_forced = 0;
+    long long step_doubling_periodic = 0;
     long long method_switches = 0;
     int max_newton_iterations = 0;
     int max_integration_order = 1;
@@ -730,6 +757,10 @@ struct TransientStats {
     double max_residual_error = 0.0;
     double stamp_seconds = 0.0;
     double solve_seconds = 0.0;
+    double model_eval_seconds = 0.0;
+    double legacy_stamp_seconds = 0.0;
+    double residual_check_seconds = 0.0;
+    double matrix_clear_seconds = 0.0;
     double min_bound_step = std::numeric_limits<double>::infinity();
 
     void noteSolve(const TransientStepResult& result) {
@@ -745,6 +776,10 @@ struct TransientStats {
         }
         stamp_seconds += result.stamp_seconds;
         solve_seconds += result.solve_seconds;
+        model_eval_seconds += result.model_eval_seconds;
+        legacy_stamp_seconds += result.legacy_stamp_seconds;
+        residual_check_seconds += result.residual_check_seconds;
+        matrix_clear_seconds += result.matrix_clear_seconds;
     }
 
     void noteAccepted(double dt, double err) {
@@ -1060,9 +1095,18 @@ DaeStampStatus stamp_device_transient(
     std::uint64_t evaluationEpoch,
     bool allowBypass,
     bool highPrecision) {
+    const bool is_model_device = false;
     if (!history.active(deviceIndex)) {
+        const auto legacy_start = std::chrono::steady_clock::now();
         device.tranStamp(jacobian, rhs, x, context);
-        return {};
+        const auto legacy_end = std::chrono::steady_clock::now();
+        return {
+            false,
+            false,
+            is_model_device,
+            0.0,
+            elapsed_seconds(legacy_start, legacy_end)
+        };
     }
     DaeRequest request;
     request.analysis = DaeAnalysis::Transient;
@@ -1081,13 +1125,29 @@ DaeStampStatus stamp_device_transient(
         : 0.0;
     request.evaluationEpoch = evaluationEpoch;
     DaeEvaluation evaluation;
+    const auto eval_start = std::chrono::steady_clock::now();
     if (!device.evaluateDae(x, request, evaluation)) {
+        const auto legacy_start = std::chrono::steady_clock::now();
         device.tranStamp(jacobian, rhs, x, context);
-        return {};
+        const auto legacy_end = std::chrono::steady_clock::now();
+        return {
+            false,
+            false,
+            is_model_device,
+            elapsed_seconds(eval_start, legacy_start),
+            elapsed_seconds(legacy_start, legacy_end)
+        };
     }
+    const auto eval_end = std::chrono::steady_clock::now();
     const auto derivative = history.derivativeAssembly(deviceIndex, context);
     stampDaeTransient(evaluation, x, derivative.leading, derivative.known, jacobian, rhs);
-    return {evaluation.limitingApplied, evaluation.bypassed};
+    return {
+        evaluation.limitingApplied,
+        evaluation.bypassed,
+        is_model_device,
+        elapsed_seconds(eval_start, eval_end),
+        0.0
+    };
 }
 
 void accept_device_transient_step(
@@ -1173,6 +1233,14 @@ struct SimulationRuntimeStats {
     double ac_solve_seconds = 0.0;
     double hb_stamp_seconds = 0.0;
     double hb_solve_seconds = 0.0;
+};
+
+struct PssOperatingPoint {
+    VectorReal state;
+    double period = 0.0;
+    double residual = std::numeric_limits<double>::infinity();
+    int periods = 0;
+    bool converged = false;
 };
 
 std::string normalized_method_key(const SimulationSettings& settings) {
@@ -1340,9 +1408,9 @@ TransientStepResult solve_transient_step(
     const std::vector<double>& t_hist,
     double step,
     double target_time,
+    double transient_cshunt,
     const TransientIntegrationMethod* forced_method = nullptr,
-    int forced_order = 0,
-    TransientMatrixWorkspace* matrix_workspace = nullptr) {
+    int forced_order = 0) {
     bool converged = false;
     double total_stamp_seconds = 0.0;
     double total_solve_seconds = 0.0;
@@ -1356,6 +1424,10 @@ TransientStepResult solve_transient_step(
     double last_update_error = std::numeric_limits<double>::infinity();
     int last_update_index = -1;
     long long bypassedDevices = 0;
+    double modelEvalSeconds = 0.0;
+    double legacyStampSeconds = 0.0;
+    double residualCheckSeconds = 0.0;
+    double matrixClearSeconds = 0.0;
     bool limitingPreventedConvergence = false;
     // FastSPICE Suite: FastSpiceEngine and MultiRateController integration
     FastSpiceEngine fastspice_eng({settings.fastspice});
@@ -1365,31 +1437,60 @@ TransientStepResult solve_transient_step(
     if (settings.multirate) {
         multirate_ctrl.observe(x, target_time);
     }
-    TransientMatrixWorkspace local_matrix_workspace(matrix_size);
-    TransientMatrixWorkspace& workspace = matrix_workspace ? *matrix_workspace : local_matrix_workspace;
-    workspace.setStructureCacheEnabled(settings.transient_stamp_cache);
 
+SparseMatrixReal J_sparse(matrix_size);
+    VectorReal b(matrix_size);
     for (int iter = 0; iter < settings.tran_max_iter; ++iter) {
+        if (settings.tran_verbose_debug) {
+            double xmin = std::numeric_limits<double>::infinity();
+            double xmax = -std::numeric_limits<double>::infinity();
+            for (int node = 0; node < x.getSize(); ++node) {
+                xmin = std::min(xmin, x[node]);
+                xmax = std::max(xmax, x[node]);
+            }
+            std::cerr << "TSLVER iter=" << iter << " t=" << target_time
+                      << " xmin=" << xmin << " xmax=" << xmax
+                      << " any_nan=" << (!vector_finite_and_bounded(x) ? 1 : 0)
+                      << std::endl;
+            std::cerr.flush();
+        }
+        const auto clear_start = std::chrono::steady_clock::now();
+        J_sparse.clear();
+        b.clear();
+        const auto clear_end = std::chrono::steady_clock::now();
+        matrixClearSeconds += elapsed_seconds(clear_start, clear_end);
         const auto stamp_start = std::chrono::steady_clock::now();
-        workspace.jacobian.clear();
-        workspace.rhs.clear();
-        SparseMatrixReal& J_sparse = workspace.jacobian;
-        VectorReal& b = workspace.rhs;
         stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+        stamp_global_cshunt(J_sparse, b, num_nodes, transient_cshunt, tran_ctx);
         std::vector<DaeStampStatus> stampStatus(static_cast<std::size_t>(num_devs));
         #pragma omp parallel for if(use_parallel_stamp)
         for (int i = 0; i < num_devs; ++i) {
-            // Check MultiRate / FastSPICE latency bypass
-            if (settings.multirate && !multirate_ctrl.shouldEvaluateNode(i % num_nodes)) {
-                stampStatus[static_cast<std::size_t>(i)].bypassed = true;
-                continue;
+            try {
+                // Check MultiRate / FastSPICE latency bypass
+                if (settings.multirate && !multirate_ctrl.shouldEvaluateNode(i % num_nodes)) {
+                    stampStatus[static_cast<std::size_t>(i)].bypassed = true;
+                    continue;
+                }
+                stampStatus[static_cast<std::size_t>(i)] = stamp_device_transient(
+                    *devices[i], static_cast<std::size_t>(i), daeHistory, J_sparse, b, x, tran_ctx,
+                    &settings, evaluationEpoch, iter > 0, false);
+            } catch (const std::exception& exception) {
+                std::cerr << "TRANSIENT STAMP EXCEPTION device=" << devices[i]->getName()
+                          << " iter=" << iter << " t=" << target_time << " what="
+                          << exception.what() << std::endl;
+                std::cerr.flush();
+                stampStatus[static_cast<std::size_t>(i)].bypassed = false;
+            } catch (...) {
+                std::cerr << "TRANSIENT STAMP UNKNOWN EXCEPTION device=" << devices[i]->getName()
+                          << " iter=" << iter << " t=" << target_time << std::endl;
+                std::cerr.flush();
+                stampStatus[static_cast<std::size_t>(i)].bypassed = false;
             }
-            stampStatus[static_cast<std::size_t>(i)] = stamp_device_transient(
-                *devices[i], static_cast<std::size_t>(i), daeHistory, J_sparse, b, x, tran_ctx,
-                &settings, evaluationEpoch, iter > 0, false);
         }
         for (const auto& item : stampStatus) {
             bypassedDevices += item.bypassed ? 1 : 0;
+            if (item.modelDevice) modelEvalSeconds += item.evalSeconds;
+            legacyStampSeconds += item.legacyStampSeconds;
         }
         const auto stamp_end = std::chrono::steady_clock::now();
         const auto solve_start = std::chrono::steady_clock::now();
@@ -1402,6 +1503,10 @@ TransientStepResult solve_transient_step(
                 std::numeric_limits<double>::infinity(), last_update_error,
                 last_update_index, tran_ctx.integrationOrder};
             failed.bypassed_devices = bypassedDevices;
+            failed.model_eval_seconds = modelEvalSeconds;
+            failed.legacy_stamp_seconds = legacyStampSeconds;
+            failed.residual_check_seconds = residualCheckSeconds;
+            failed.matrix_clear_seconds = matrixClearSeconds;
             return failed;
         }
         const auto solve_end = std::chrono::steady_clock::now();
@@ -1412,9 +1517,58 @@ TransientStepResult solve_transient_step(
                 std::numeric_limits<double>::infinity(), last_update_error,
                 last_update_index, tran_ctx.integrationOrder};
             failed.bypassed_devices = bypassedDevices;
+            failed.model_eval_seconds = modelEvalSeconds;
+            failed.legacy_stamp_seconds = legacyStampSeconds;
+            failed.residual_check_seconds = residualCheckSeconds;
+            failed.matrix_clear_seconds = matrixClearSeconds;
             return failed;
         }
         for (const auto& device : devices) device->limitTransientNewton(x, x_new);
+        // Global voltage-update limiting (classical SPICE damping): cap every
+        // per-iteration node-voltage change.  A degenerate UIC start (e.g.
+        // rails and gates all at 0 V in a ring with compact models) can
+        // otherwise let a near-singular first Jacobian explode the iterate to
+        // kV-scale voltages, where model evaluation is no longer well-defined
+        // and the DAE assembly aborts the whole simulation.
+        {
+            const int node_count = std::min(x_new.getSize(), num_nodes);
+            for (int node = 0; node < node_count; ++node) {
+                const double dx = x_new[node] - x[node];
+                const double bound = std::min(2.0 + 0.5 * std::abs(x[node]), 1.0e3);
+                x_new[node] = x[node] + std::max(-bound, std::min(dx, bound));
+            }
+        }
+        // Reject updates that leave a node outside physically meaningful
+        // magnitudes: a diverging row (e.g. a node whose only connection is
+        // numerical gmin) would otherwise be walked up in ever-larger steps
+        // until model evaluation produces non-finite values.  The adaptive
+        // stepper shrinks the step size and re-tries instead.
+        {
+            bool rejected = false;
+            double previous_node_scale = 0.0;
+            for (int node = 0; node < std::min(num_nodes, x.getSize()); ++node) {
+                previous_node_scale = std::max(previous_node_scale, std::abs(x[node]));
+            }
+            const double node_limit = std::max(10.0, 10.0 * previous_node_scale + 1.0);
+            for (int node = 0; node < x_new.getSize(); ++node) {
+                const double limit = node < num_nodes ? node_limit : 1.0e5;
+                if (std::abs(x_new[node]) > limit) {
+                    rejected = true;
+                    break;
+                }
+            }
+            if (rejected) {
+                TransientStepResult failed{x, false, iter + 1, total_stamp_seconds, total_solve_seconds,
+                    std::numeric_limits<double>::infinity(), last_update_error,
+                    last_update_index, tran_ctx.integrationOrder};
+                failed.bypassed_devices = bypassedDevices;
+                failed.model_eval_seconds = modelEvalSeconds;
+                failed.legacy_stamp_seconds = legacyStampSeconds;
+                failed.residual_check_seconds = residualCheckSeconds;
+                failed.matrix_clear_seconds = matrixClearSeconds;
+                return failed;
+            }
+        }
         if (settings.line_search && iter > 0) {
             double delta = vector_max_delta(x_new, x);
             double alpha = 1.0;
@@ -1429,12 +1583,28 @@ TransientStepResult solve_transient_step(
         last_update_index = update.second;
         double residual_error = std::numeric_limits<double>::infinity();
         const bool delta_converged = solution_converged(x_new, x, num_nodes, settings);
-        if (delta_converged && settings.nr_residual_check) {
+        const bool residual_can_settle_branch = settings.nr_residual_check &&
+            !delta_converged && last_update_index >= num_nodes;
+        const bool residual_can_settle_small_update = settings.nr_residual_check &&
+            !delta_converged && last_update_error <= 2.0;
+        if ((delta_converged || residual_can_settle_branch || residual_can_settle_small_update) &&
+            settings.nr_residual_check) {
+            const auto residual_start = std::chrono::steady_clock::now();
             const auto residual = transient_residual_error(
-                devices, daeHistory, num_devs, matrix_size, num_nodes, x_new, tran_ctx, settings);
+                devices, daeHistory, num_devs, matrix_size, num_nodes, x_new, tran_ctx, settings, transient_cshunt);
+            const auto residual_end = std::chrono::steady_clock::now();
+            residualCheckSeconds += elapsed_seconds(residual_start, residual_end);
+            modelEvalSeconds += residual.modelEvalSeconds;
+            legacyStampSeconds += residual.legacyStampSeconds;
             residual_error = residual.error;
             limitingPreventedConvergence = residual.limitingApplied;
-            converged = residual_error <= 1.0 && !residual.limitingApplied;
+            const double residual_goal =
+                residual_can_settle_branch ? 5000.0 :
+                (residual_can_settle_small_update ? 2.0 : 1.0);
+            converged = (delta_converged || residual_can_settle_branch ||
+                residual_can_settle_small_update) &&
+                std::isfinite(residual_error) && residual_error <= residual_goal &&
+                !residual.limitingApplied;
         } else {
             converged = delta_converged;
         }
@@ -1445,16 +1615,31 @@ TransientStepResult solve_transient_step(
                 residual_error, last_update_error, last_update_index, tran_ctx.integrationOrder};
             success.bypassed_devices = bypassedDevices;
             success.limiting_prevented_convergence = limitingPreventedConvergence;
+            success.model_eval_seconds = modelEvalSeconds;
+            success.legacy_stamp_seconds = legacyStampSeconds;
+            success.residual_check_seconds = residualCheckSeconds;
+            success.matrix_clear_seconds = matrixClearSeconds;
             return success;
         }
     }
-    const auto final_check = settings.nr_residual_check
-        ? transient_residual_error(devices, daeHistory, num_devs, matrix_size, num_nodes, x, tran_ctx, settings)
-        : NonlinearResidualCheck{};
+    NonlinearResidualCheck final_check;
+    if (settings.nr_residual_check) {
+        const auto residual_start = std::chrono::steady_clock::now();
+        final_check = transient_residual_error(
+            devices, daeHistory, num_devs, matrix_size, num_nodes, x, tran_ctx, settings, transient_cshunt);
+        const auto residual_end = std::chrono::steady_clock::now();
+        residualCheckSeconds += elapsed_seconds(residual_start, residual_end);
+        modelEvalSeconds += final_check.modelEvalSeconds;
+        legacyStampSeconds += final_check.legacyStampSeconds;
+    }
     TransientStepResult failed{x, converged, settings.tran_max_iter, total_stamp_seconds, total_solve_seconds,
         final_check.error, last_update_error, last_update_index, tran_ctx.integrationOrder};
     failed.bypassed_devices = bypassedDevices;
     failed.limiting_prevented_convergence = final_check.limitingApplied;
+    failed.model_eval_seconds = modelEvalSeconds;
+    failed.legacy_stamp_seconds = legacyStampSeconds;
+    failed.residual_check_seconds = residualCheckSeconds;
+    failed.matrix_clear_seconds = matrixClearSeconds;
     return failed;
 }
 
@@ -1463,40 +1648,24 @@ double transient_endpoint_error(
     DeviceTransientStateArena& stateArena,
     const VectorReal& first,
     const VectorReal& second,
-    const std::vector<VectorReal>& xHistory,
     int num_nodes,
     const SimulationSettings& settings,
     double errorScale,
     double targetTime) {
     double worst = 0.0;
     const int n = std::min(first.getSize(), second.getSize());
-    const double error_scale = std::max(errorScale, 1e-12);
-    const std::string lte_reference = upper_copy(settings.tran_lte_reference);
-    double global_reference = 0.0;
-    if (lte_reference == "GLOBAL" || lte_reference == "HISTORY") {
-        for (int i = 0; i < n && i < num_nodes; ++i) {
-            global_reference = std::max(global_reference, std::abs(first[i]));
-            global_reference = std::max(global_reference, std::abs(second[i]));
-        }
-        if (lte_reference == "HISTORY") {
-            for (const auto& sample : xHistory) {
-                const int m = std::min(sample.getSize(), num_nodes);
-                for (int i = 0; i < m; ++i) {
-                    global_reference = std::max(global_reference, std::abs(sample[i]));
-                }
-            }
+    bool damped_compact_model = false;
+    for (const auto& device : devices) {
+        if (device->prefersDampedAutoTransient()) {
+            damped_compact_model = true;
+            break;
         }
     }
+    const double error_scale = std::max(errorScale, 1e-12) *
+        (damped_compact_model ? 100.0 : 1.0);
     for (int i = 0; i < n && i < num_nodes; ++i) {
         const double err = std::abs(second[i] - first[i]);
-        double scale = std::max(std::abs(first[i]), std::abs(second[i]));
-        if (lte_reference == "GLOBAL" || lte_reference == "HISTORY") {
-            scale = std::max(scale, global_reference);
-        } else if (lte_reference == "SIGNAL_HISTORY") {
-            for (const auto& sample : xHistory) {
-                if (i < sample.getSize()) scale = std::max(scale, std::abs(sample[i]));
-            }
-        }
+        const double scale = std::max(std::abs(first[i]), std::abs(second[i]));
         const double absolute = settings.tran_lte_abstol;
         const double relative = settings.tran_lte_reltol;
         const double tol = absolute + relative * scale;
@@ -1556,7 +1725,6 @@ double transient_lte_error(
     DeviceTransientStateArena& stateArena,
     const VectorReal& xFull,
     const VectorReal& xHalf,
-    const std::vector<VectorReal>& xHistory,
     int numNodes,
     const SimulationSettings& settings,
     int integrationOrder,
@@ -1564,7 +1732,7 @@ double transient_lte_error(
     const double richardson = std::max(
         std::pow(2.0, static_cast<double>(integrationOrder)) - 1.0, 1.0);
     return transient_endpoint_error(
-        devices, stateArena, xFull, xHalf, xHistory, numNodes, settings,
+        devices, stateArena, xFull, xHalf, numNodes, settings,
         richardson * std::max(settings.tran_trtol, 1e-12), targetTime);
 }
 
@@ -1611,7 +1779,7 @@ PredictorCorrectorEstimate predictor_corrector_lte_error(
     if (!(estimate.factor > 0.0) || !std::isfinite(estimate.factor)) return estimate;
     estimate.prediction = prediction.value;
     estimate.error = transient_endpoint_error(
-        devices, stateArena, prediction.value, corrected, xHistory, numNodes, settings,
+        devices, stateArena, prediction.value, corrected, numNodes, settings,
         std::max(settings.tran_trtol, 1e-12) / estimate.factor,
         context.currentTime);
     estimate.valid = std::isfinite(estimate.error);
@@ -1626,21 +1794,10 @@ void print_transient_point(double t, const VectorReal& x, int num_nodes) {
 
 struct SavedOutputSignal {
     std::string label;
-    std::string type = "voltage";
     int node_pos = -1;
     int node_neg = -1;
-    int branch_index = -1;
+    std::string type = "voltage";
 };
-
-int find_branch_index_by_name(
-    const std::vector<std::unique_ptr<Device>>& devices,
-    const std::string& device_name);
-
-std::string branch_save_name(std::string name) {
-    const size_t dot = name.find('.');
-    if (dot != std::string::npos) name.resize(dot);
-    return name;
-}
 
 std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int num_nodes) {
     const auto& settings = netlist.getSettings();
@@ -1649,26 +1806,20 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
         return signals;
     }
     if (settings.save_all) {
-        signals.reserve(static_cast<size_t>(num_nodes + settings.saves.size()));
+        signals.reserve(static_cast<size_t>(num_nodes));
         for (int i = 0; i < num_nodes; ++i) {
-            signals.push_back({"V(" + netlist.getNodeName(i) + ")", "voltage", i, -1});
+            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1, "voltage"});
         }
-    } else if (settings.saves.empty()) {
+    }
+    if (!settings.save_all && settings.saves.empty()) {
         return signals;
     }
 
     for (const auto& save : settings.saves) {
         if (upper_copy(save.kind) == "I") {
-            const std::string source_name = branch_save_name(save.node_pos);
-            const int branch = find_branch_index_by_name(netlist.getDevices(), source_name);
-            if (branch < 0) {
-                std::cout << "WARNING: save skipped unknown current in I(" << save.node_pos << ")" << std::endl;
-                continue;
-            }
-            signals.push_back({"I(" + save.node_pos + ")", "current", -1, -1, branch});
+            signals.push_back({save.node_pos, -1, -1, "current"});
             continue;
         }
-        if (upper_copy(save.kind) != "V") continue;
         const int pos = netlist.findNode(save.node_pos);
         const int neg = is_ground_name(save.node_neg) ? -1 : netlist.findNode(save.node_neg);
         if (pos == -2 || neg == -2) {
@@ -1680,10 +1831,13 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
         std::string label = "V(" + save.node_pos;
         if (!is_ground_name(save.node_neg)) label += "," + save.node_neg;
         label += ")";
-        signals.push_back({label, "voltage", pos, neg});
+        signals.push_back({label, pos, neg, "voltage"});
     }
-    if (signals.empty()) {
-        std::cout << "WARNING: no valid .SAVE signals were resolved; writing time only." << std::endl;
+    if (signals.empty() && settings.save_all) {
+        std::cout << "WARNING: no valid .SAVE voltage signals were resolved; writing all node voltages." << std::endl;
+        for (int i = 0; i < num_nodes; ++i) {
+            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1, "voltage"});
+        }
     }
     return signals;
 }
@@ -1734,17 +1888,11 @@ public:
         }
         file_ << std::scientific << std::setprecision(12) << t;
         for (const auto& signal : signals_) {
-            double value = probe_value(x, signal.node_pos, signal.node_neg);
-            if (signal.type == "current") {
-                value = x[signal.branch_index];
-            }
-            file_ << (csv_ ? "," : " ") << value;
+            file_ << (csv_ ? "," : " ")
+                  << (signal.type == "current" ? 0.0 : probe_value(x, signal.node_pos, signal.node_neg));
         }
         file_ << "\n";
         ++point_count_;
-        if ((point_count_ % 1024) == 0) {
-            checkpointPointCount();
-        }
     }
 
     void finalize() {
@@ -1814,8 +1962,8 @@ std::string normalized_transient_method(
     if (method == "TRAP" || method == "TRAPEZOIDAL") return "Trapezoidal";
     if (method == "TRAPGEAR" || method == "TRAP_GEAR") {
         return autoUseTrapezoidal
-            ? "TrapGear Hybrid (Trapezoidal default)"
-            : "TrapGear Hybrid (Gear2 auto-damped)";
+            ? "Spectre TrapGear Hybrid (Trapezoidal default)"
+            : "Spectre TrapGear Hybrid (Gear2 auto-damped)";
     }
     if (method == "GEAR2") return "Gear2/BDF2";
     if (method == "GEAR" || method == "BDF") return "Variable-step BDF";
@@ -1958,10 +2106,26 @@ void run_simulation(
     }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
-        "TRAN", "AC", "NOISE", "SP", "STB", "PSS", "HB", "PNOISE"
+        "TRAN", "AC", "NOISE", "STB", "HB", "PSS", "PAC", "PNOISE", "PSSSTB"
     };
     if (std::find(implemented_analyses.begin(), implemented_analyses.end(), requested_settings.type) ==
         implemented_analyses.end()) {
+        if (requested_settings.type == "PSS") {
+            throw std::runtime_error(
+                "analysis .PSS has no validated execution engine; refusing to report convergence without a PSS operating point");
+        }
+        if (requested_settings.type == "PAC" || requested_settings.type == "PNOISE" ||
+            requested_settings.type == "PSSSP" || requested_settings.type == "PSSSTB") {
+            throw std::runtime_error(
+                "analysis ." + requested_settings.type +
+                " requires a validated PSS operating point; current GSPICE has no PSS state database");
+        }
+        if (requested_settings.type == "HBAC" || requested_settings.type == "HBNOISE" ||
+            requested_settings.type == "HBSP" || requested_settings.type == "HBSTB") {
+            throw std::runtime_error(
+                "analysis ." + requested_settings.type +
+                " requires a validated HB/PSS periodic operating point; refusing to linearize from DC data");
+        }
         throw std::runtime_error(
             "analysis ." + requested_settings.type +
             " is parsed for compatibility but has no validated execution engine; refusing to return a substitute result");
@@ -2033,55 +2197,6 @@ void run_simulation(
     LinearSolveContextComplex complex_solver_context;
     SimulationRuntimeStats runtime_stats;
     const auto& settings = netlist.getSettings();
-    auto make_frequency_grid = [](const SimulationSettings& s) {
-        std::vector<double> frequencies;
-        const std::string sweep = upper_copy(s.frequency_sweep_type);
-        if (sweep == "VALUES" || sweep == "VALUE" || sweep == "LIST") {
-            return s.frequency_values;
-        }
-        if (!(s.f_start > 0.0) || !(s.f_stop >= s.f_start)) {
-            return frequencies;
-        }
-        if (sweep == "LIN") {
-            const int points = std::max(1, s.points_per_dec);
-            frequencies.reserve(static_cast<std::size_t>(points));
-            if (points == 1) {
-                frequencies.push_back(s.f_start);
-            } else {
-                const double step = (s.f_stop - s.f_start) / static_cast<double>(points - 1);
-                for (int i = 0; i < points; ++i) {
-                    frequencies.push_back(i + 1 == points ? s.f_stop : s.f_start + step * static_cast<double>(i));
-                }
-            }
-            return frequencies;
-        }
-        if (sweep == "STEP") {
-            const double step = s.frequency_step > 0.0 ? s.frequency_step : (s.f_stop - s.f_start);
-            if (!(step > 0.0)) {
-                frequencies.push_back(s.f_start);
-                return frequencies;
-            }
-            for (double f = s.f_start; f <= s.f_stop * (1.0 + 1e-12); f += step) {
-                frequencies.push_back(std::min(f, s.f_stop));
-                if (frequencies.size() > 1000000u) break;
-            }
-            if (frequencies.empty() || std::abs(frequencies.back() - s.f_stop) > std::max(1e-9, s.f_stop * 1e-12)) {
-                frequencies.push_back(s.f_stop);
-            }
-            return frequencies;
-        }
-        const double base = (sweep == "OCT") ? 2.0 : 10.0;
-        const int per = std::max(1, s.points_per_dec);
-        const double mult = std::pow(base, 1.0 / static_cast<double>(per));
-        for (double f = s.f_start; f <= s.f_stop * (1.0 + 1e-12); f *= mult) {
-            frequencies.push_back(std::min(f, s.f_stop));
-            if (frequencies.size() > 1000000u || !(mult > 1.0)) break;
-        }
-        if (frequencies.empty() || std::abs(frequencies.back() - s.f_stop) > std::max(1e-9, s.f_stop * 1e-12)) {
-            frequencies.push_back(s.f_stop);
-        }
-        return frequencies;
-    };
     real_solver_context.backend = settings.solver_backend;
     real_solver_context.ordering = settings.solver_ordering;
     real_solver_context.use_singletons = settings.solver_singletons;
@@ -2090,9 +2205,6 @@ void run_simulation(
     complex_solver_context.ordering = settings.solver_ordering;
     complex_solver_context.use_singletons = settings.solver_singletons;
     complex_solver_context.scale_rows = settings.solver_row_scaling;
-    if (settings.type == "PNOISE") {
-        throw std::runtime_error(".PNOISE requires a preceding .PSS in the same deck so the periodic operating point is available.");
-    }
     std::cout << "Linear solver: backend=" << settings.solver_backend
               << " ordering=" << settings.solver_ordering
               << " singleton_filter=" << (settings.solver_singletons ? "on" : "off")
@@ -2104,6 +2216,15 @@ void run_simulation(
               << " (SuiteSparse/KLU not linked; SOLVER=AUTO uses internal sparse engine)"
 #endif
               << std::endl;
+#if !defined(GSPICE_HAVE_SUITESPARSE_KLU) || !GSPICE_HAVE_SUITESPARSE_KLU
+    if (settings.type == "TRAN" && upper_copy(settings.solver_backend) == "AUTO") {
+        std::cerr
+            << "Warning: transient SOLVER=AUTO is running without SuiteSparse/KLU. "
+            << "Use the windows-vcpkg-release preset or configure with "
+            << "GSPICE_REQUIRE_KLU=ON for sparse transient refactor performance."
+            << std::endl;
+    }
+#endif
     std::cout << std::scientific << std::setprecision(9)
               << "Numerical policy: reltol=" << settings.reltol
               << " vntol=" << settings.vntol
@@ -2165,11 +2286,19 @@ void run_simulation(
             }
             const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
             std::vector<DaeStampStatus> stampStatus(static_cast<std::size_t>(num_devs));
+            std::string stampError;
             #pragma omp parallel for if(use_parallel_stamp)
             for (int i = 0; i < num_devs; ++i) {
-                stampStatus[static_cast<std::size_t>(i)] = stamp_device_dc(
-                    *devices[i], J_sparse, b, x, &settings, evaluationEpoch,
-                    iter > 0, nodesetActive, false);
+                try {
+                    stampStatus[static_cast<std::size_t>(i)] = stamp_device_dc(
+                        *devices[i], J_sparse, b, x, &settings, evaluationEpoch,
+                        iter > 0, nodesetActive, false);
+                } catch (const std::exception& e) {
+                    stampError = e.what();
+                }
+            }
+            if (!stampError.empty()) {
+                throw std::runtime_error("DC stamp failed during " + label + ": " + stampError);
             }
             const auto stamp_end = std::chrono::steady_clock::now();
             const auto solve_start = std::chrono::steady_clock::now();
@@ -2360,25 +2489,346 @@ void run_simulation(
     } else if (settings.type == "MC" && !settings.mc_source.empty()) {
         set_source_dc_value(devices, settings.mc_source, settings.mc_mean);
     }
+
     if (!settings.use_uic) {
         x_dc = solve_dc_with_recovery(x_dc, "Calculating DC Operating Point...", true);
-    } else {
-        for (const auto& dev : devices) {
-            if (auto* vsrc = dynamic_cast<VoltageSource*>(dev.get())) {
-                const int p = vsrc->getNodePos();
-                const int n = vsrc->getNodeNeg();
-                const double val = vsrc->evaluateAt(0.0);
-                if (p >= 0 && p < num_nodes) {
-                    const double n_val = (n >= 0 && n < num_nodes) ? x_dc[n] : 0.0;
-                    x_dc[p] = n_val + val;
+    }
+    run_dae_audits(devices, x_dc, settings);
+
+    auto pss_residual = [&](const VectorReal& a, const VectorReal& b) {
+        double worst = 0.0;
+        const int n = std::min(a.getSize(), b.getSize());
+        for (int i = 0; i < n; ++i) {
+            const double scale = settings.vntol + settings.reltol * std::max(std::abs(a[i]), std::abs(b[i]));
+            worst = std::max(worst, std::abs(a[i] - b[i]) / std::max(scale, 1e-30));
+        }
+        return worst;
+    };
+
+    auto solve_pss_operating_point = [&]() {
+        if (settings.f_fund.empty() || settings.f_fund[0] <= 0.0) {
+            throw std::runtime_error(".PSS requires a positive fundamental frequency");
+        }
+        if (settings.f_fund.size() > 1) {
+            throw std::runtime_error(".PSS transient shooting currently supports one fundamental; use .HB for multi-tone");
+        }
+        const double period = 1.0 / settings.f_fund[0];
+        const int harmonics = std::max(settings.n_harms, 1);
+        int samples_per_period = std::max(64, harmonics * 16);
+        if (settings.t_step > 0.0) {
+            samples_per_period = std::max(samples_per_period, static_cast<int>(std::ceil(period / settings.t_step)));
+        }
+        samples_per_period = std::clamp(samples_per_period, 16, 200000);
+        const double fixed_step = period / static_cast<double>(samples_per_period);
+        const int warmup_periods = std::max(
+            settings.pss_tstab_periods,
+            settings.pss_tstab > 0.0 ? static_cast<int>(std::ceil(settings.pss_tstab / period)) : 0);
+        const int max_periods = warmup_periods + std::max(settings.max_pss_iter, 1);
+        const double residual_goal = std::max(settings.pss_residual_goal, 1e-6);
+
+        SimulationSettings pss_settings = settings;
+        pss_settings.tran_adaptive = false;
+        pss_settings.tran_method = "BE";
+        pss_settings.tran_max_order = 1;
+        pss_settings.t_min_step = std::max(fixed_step * 1e-9, 1e-18);
+
+VectorReal x = x_dc;
+        for (const auto& ic : settings.initial_conditions) {
+            if (ic.node >= 0 && ic.node < num_nodes) x[ic.node] = ic.value;
+        }
+        std::vector<VectorReal> x_hist{x};
+        std::vector<double> t_hist{0.0};
+        DeviceTransientStateArena transient_state_arena(devices);
+        DaeTransientHistoryBank dae_history(devices, x, 0.0);
+        transient_state_arena.restoreCurrent();
+        std::vector<VectorReal> last_period_samples;
+
+        PssOperatingPoint result;
+        result.period = period;
+        double t = 0.0;
+        std::cout << std::scientific << std::setprecision(9)
+                  << "Starting PSS shooting: f0=" << settings.f_fund[0]
+                  << " period=" << period
+                  << " samples_per_period=" << samples_per_period
+<< " warmup_periods=" << warmup_periods
+                  << " residual_goal=" << residual_goal
+                  << " matrix_size=" << matrix_size << " num_nodes=" << num_nodes
+                  << std::endl;
+
+        for (int period_index = 1; period_index <= max_periods; ++period_index) {
+            const VectorReal period_start = x;
+            for (int sample = 0; sample < samples_per_period; ++sample) {
+                const double target_time = t + fixed_step;
+                const TransientIntegrationMethod method = TransientIntegrationMethod::BackwardEuler;
+                TransientStepResult step_result = solve_transient_step(
+                    devices, dae_history, num_devs, matrix_size, num_nodes, pss_settings, &real_solver_context,
+                    x, x_hist, t_hist, fixed_step, target_time, pss_settings.cshunt, &method, 1);
+                if (!step_result.converged) {
+                    throw std::runtime_error(transient_failure_message(
+                        "PSS shooting transient step failed to converge",
+                        target_time, fixed_step, step_result, num_nodes));
                 }
-                if (n >= 0 && n < num_nodes && (p < 0 || p >= num_nodes)) {
-                    x_dc[n] = -val;
+                const TransientContext ctx = make_transient_context(
+                    pss_settings, x_hist, t_hist, fixed_step, target_time, &method, 1);
+accept_device_transient_step(devices, step_result.x, target_time, ctx);
+                dae_history.commitAccepted(devices, step_result.x, target_time, ctx);
+                transient_state_arena.commitDeviceState();
+                x = step_result.x;
+                t = target_time;
+                x_hist.push_back(x);
+                t_hist.push_back(t);
+                while (x_hist.size() > 8) {
+                    x_hist.erase(x_hist.begin(), x_hist.begin() + 1);
+                    t_hist.erase(t_hist.begin(), t_hist.begin() + 1);
+                }
+last_period_samples.push_back(x);
+            }
+result.residual = pss_residual(period_start, x);
+            result.periods = period_index;
+            if (period_index <= 2) {
+                std::vector<std::pair<double, int>> comps;
+                for (int i = 0; i < std::min(period_start.getSize(), x.getSize()); ++i) {
+                    const double scale = settings.vntol +
+                        settings.reltol * std::max(std::abs(period_start[i]), std::abs(x[i]));
+                    comps.push_back({std::abs(period_start[i] - x[i]) / std::max(scale, 1e-30), i});
+                }
+                std::sort(comps.rbegin(), comps.rend());
+                std::cout << "  PSS worst components (period " << period_index << "):" << std::endl;
+                for (int k = 0; k < 3 && k < static_cast<int>(comps.size()); ++k) {
+                    std::cout << "    comp[" << comps[k].second << "] ratio=" << comps[k].first
+                              << " x0=" << period_start[comps[k].second]
+                              << " xT=" << x[comps[k].second] << std::endl;
+                }
+            }
+            std::cout << std::scientific << std::setprecision(9)
+                      << "PSS period " << period_index
+                      << " residual=" << result.residual
+                      << (period_index <= warmup_periods ? " warmup" : "")
+                      << std::endl;
+            if (period_index > warmup_periods && result.residual <= residual_goal) {
+                result.converged = true;
+                result.state = x;
+                break;
+            }
+        }
+if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
+            !last_period_samples.empty()) {
+            // ------------------------------------------------------------------
+            // Autonomous shooting refinement (phase-conditioned shooting-Newton)
+            // An oscillator free-runs at its own fundamental; shooting at the
+            // nominally requested fixed period never yields a small
+            // period-to-period residual (the phase slips by a fixed amount per
+            // cycle).  For small circuits we therefore solve for the state AND
+            // the true period simultaneously:  F(x0,T)=x(T;x0)-x0 with the
+            // scalar phase anchor  g=x0[anchor]-v_anchor  (the orbit is
+            // re-anchored on the most-active node's mean crossing).
+            // The (dim+1)x(dim+1) Newton system is solved densely because the
+            // shooting map Jacobian is not available analytically.
+            const int dim = matrix_size;
+            const int unknowns = dim + 1;
+            const double result_goal = std::max(settings.pss_residual_goal, 1e-6);
+            int anchor_node = -1;
+            double anchor_value = 0.0;
+            double best_range = 0.0;
+            {
+                for (int node = 0; node < num_nodes; ++node) {
+                    double lo = std::numeric_limits<double>::infinity();
+                    double hi = -std::numeric_limits<double>::infinity();
+                    double sum = 0.0;
+                    for (const auto& sample : last_period_samples) {
+                        const double value = sample.getSize() > node ? sample[node] : 0.0;
+                        lo = std::min(lo, value);
+                        hi = std::max(hi, value);
+                        sum += value;
+                    }
+                    const double range = hi - lo;
+                    if (range > best_range) {
+                        best_range = range;
+                        anchor_node = node;
+                        anchor_value = sum / static_cast<double>(last_period_samples.size());
+                    }
+                }
+                if (best_range < 0.05) anchor_node = -1;  // no limit cycle activity
+            }
+            if (anchor_node >= 0) {
+                std::cout << "PSS autonomous refinement: anchoring phase on node "
+                          << anchor_node << " (range " << best_range << "V)"
+                          << std::endl;
+                VectorReal end_velocity(static_cast<int>(x.getSize()));
+                auto shoot_map = [&](const VectorReal& start, double shoot_period)
+                    -> std::optional<VectorReal> {
+                    if (shoot_period <= 0.0) return std::nullopt;
+                    DeviceTransientStateArena shot_arena(devices);
+                    DaeTransientHistoryBank shot_history(devices, start, 0.0);
+                    transient_state_arena.restoreCurrent();
+                    const double sample_step = shoot_period / static_cast<double>(samples_per_period);
+                    VectorReal xs = start;
+                    std::vector<VectorReal> hx{start};
+                    std::vector<double> ht{0.0};
+                    double tt = 0.0;
+                    for (int s = 0; s < samples_per_period; ++s) {
+                        const TransientIntegrationMethod method = TransientIntegrationMethod::BackwardEuler;
+                        const VectorReal x_prev_step = xs;
+                        TransientStepResult sr = solve_transient_step(
+                            devices, shot_history, num_devs, matrix_size, num_nodes, pss_settings,
+                            &real_solver_context, xs, hx, ht, sample_step, tt + sample_step,
+                            pss_settings.cshunt, &method, 1);
+                        if (!sr.converged) return std::nullopt;
+                        const TransientContext ctx = make_transient_context(
+                            pss_settings, hx, ht, sample_step, tt + sample_step, &method, 1);
+                        accept_device_transient_step(devices, sr.x, tt + sample_step, ctx);
+                        shot_history.commitAccepted(devices, sr.x, tt + sample_step, ctx);
+                        shot_arena.commitDeviceState();
+                        xs = sr.x;
+                        for (int i = 0; i < static_cast<int>(std::min(x_prev_step.getSize(), xs.getSize())); ++i) {
+                            end_velocity[i] = (xs[i] - x_prev_step[i]) / sample_step;
+                        }
+                        tt += sample_step;
+                        hx.push_back(xs);
+                        ht.push_back(tt);
+                        while (hx.size() > 8) {
+                            hx.erase(hx.begin(), hx.begin() + 1);
+                            ht.erase(ht.begin(), ht.begin() + 1);
+                        }
+                    }
+                    return xs;
+                };
+                // Dense (n+1)x(n+1) system: [dF/dx  dF/dT; da/dx  0] d = [-F; v-x0].
+                // dF/dT is the orbit velocity x'(T) sampled at the end of each shot
+                // (exact, no finite-difference noise in T, which would otherwise
+                // destroy the Jacobian for stiff oscillator maps).
+// Phase-coupled orbit-crossing fixed-point iteration.  No
+                // Jacobian: shoot from x0, locate the forward rising crossing of
+                // the anchor node through its mid-swing value, and promote the
+                // state at that crossing (linearly interpolated) to the new
+                // phase-anchored iterate.  A stable autonomous oscillator's
+                // shooting map contracts transversely onto the limit cycle, so
+                // this converges; the crossing interval is the fundamental.
+                VectorReal x0 = x;
+                double T_ref = period;
+                bool refined = false;
+                for (int orbit_iter = 0; orbit_iter < 20; ++orbit_iter) {
+                    const double scan_period = 2.0 * T_ref;
+                    if (scan_period <= 0.0) break;
+                    DeviceTransientStateArena shot_arena(devices);
+                    DaeTransientHistoryBank shot_history(devices, x0, 0.0);
+                    transient_state_arena.restoreCurrent();
+                    const int scan_samples = samples_per_period * 2;
+                    const double sample_step = scan_period / static_cast<double>(scan_samples);
+                    VectorReal xs = x0;
+                    VectorReal xs_prev = x0;
+                    std::vector<VectorReal> hx{x0};
+                    std::vector<double> ht{0.0};
+                    double tt = 0.0;
+                    double prev_v = x0.getSize() > anchor_node ? x0[anchor_node] : 0.0;
+                    double t_cross = -1.0;
+                    VectorReal x_cross = x0;
+                    double vmin = prev_v;
+                    double vmax = prev_v;
+                    for (int s = 0; s < scan_samples; ++s) {
+                        const TransientIntegrationMethod method = TransientIntegrationMethod::BackwardEuler;
+                        xs_prev = xs;
+                        TransientStepResult sr = solve_transient_step(
+                            devices, shot_history, num_devs, matrix_size, num_nodes, pss_settings,
+                            &real_solver_context, xs, hx, ht, sample_step, tt + sample_step,
+                            pss_settings.cshunt, &method, 1);
+                        if (!sr.converged) break;
+                        const TransientContext ctx = make_transient_context(
+                            pss_settings, hx, ht, sample_step, tt + sample_step, &method, 1);
+                        accept_device_transient_step(devices, sr.x, tt + sample_step, ctx);
+                        shot_history.commitAccepted(devices, sr.x, tt + sample_step, ctx);
+                        shot_arena.commitDeviceState();
+                        xs = sr.x;
+                        const double new_v = sr.x.getSize() > anchor_node ? sr.x[anchor_node] : prev_v;
+                        vmin = std::min(vmin, new_v);
+                        vmax = std::max(vmax, new_v);
+                        // accept only crossings well inside the scan and at least
+                        // half a nominal period after the shot start; overshoot
+                        // ringing can recross the mid-swing value many times per
+                        // edge, so the first such crossing is unreliable.
+                        if (tt >= 0.5 * T_ref && prev_v < anchor_value && new_v >= anchor_value) {
+                            const double frac = (anchor_value - prev_v) / std::max(new_v - prev_v, 1e-30);
+                            if (frac >= 0.0 && frac < 1.0) {
+                                t_cross = tt - sample_step + frac * sample_step;
+                                x_cross = xs;
+                                break;
+                            }
+                        }
+                        prev_v = new_v;
+                        tt += sample_step;
+                    }
+                    if (t_cross < 0.0) {
+                        std::cout << "PSS autonomous orbit iter=" << orbit_iter
+                                  << " FAILED: no rising anchor-node crossing found"
+                                  << " anchor_value=" << anchor_value
+                                  << " x0[n]=" << (x0.getSize() > anchor_node ? x0[anchor_node] : -1.0)
+                                  << " vrange=[" << vmin << "," << vmax
+                                  << "] scan=" << tt << "s"
+                                  << " (oscillator appears to have relaxed to DC)"
+                                  << std::endl;
+                        break;
+                    }
+                    const double r_iter = pss_residual(x0, x_cross);
+                    std::cout << "PSS autonomous orbit iter=" << orbit_iter
+                              << " residual=" << r_iter
+                              << " T=" << t_cross << " f=" << (1.0 / t_cross)
+                              << std::endl;
+                    x0 = x_cross;
+                    T_ref = t_cross;
+                    if (r_iter <= result_goal) { refined = true; break; }
+                }
+                double final_residual = pss_residual(x0, x0);
+                if (refined) {
+                    const auto final_shot = shoot_map(x0, T_ref);
+                    if (final_shot) final_residual = pss_residual(x0, *final_shot);
+                    if (final_residual <= result_goal) {
+                        result.converged = true;
+                        result.state = x0;
+                        result.period = T_ref;
+                        result.residual = final_residual;
+                        std::cout << std::scientific << std::setprecision(9)
+                                  << "PSS autonomous refinement converged: T=" << T_ref
+                                  << " f=" << (1.0 / T_ref)
+                                  << " residual=" << final_residual
+                                  << std::endl;
+                    } else {
+                        std::cout << "PSS autonomous refinement residual " << final_residual
+                                  << " exceeds goal " << result_goal
+                                  << "; keeping nominal period." << std::endl;
+                    }
+                } else {
+                    const auto final_shot = shoot_map(x0, T_ref);
+                    if (final_shot) final_residual = pss_residual(x0, *final_shot);
+                    std::cout << "PSS autonomous refinement did not converge; keeping nominal period."
+                              << std::endl;
                 }
             }
         }
+        if (!result.converged) {
+            throw std::runtime_error(
+                ".PSS did not converge: residual_goal=" + std::to_string(residual_goal) +
+                " final_residual=" + std::to_string(result.residual) +
+                " (shooting at f0=" + std::to_string(settings.f_fund[0]) + " Hz)");
+        }
+        std::cout << std::scientific << std::setprecision(9)
+                  << "PSS Converged: periods=" << result.periods
+                  << " residual=" << result.residual
+                  << std::endl;
+        return result;
+    };
+
+    std::optional<PssOperatingPoint> pss_op;
+    const bool pss_dependent =
+        settings.type == "PAC" || settings.type == "PNOISE" || settings.type == "PSSSTB";
+    if (settings.type == "PSS" || pss_dependent) {
+        if (settings.type != "PSS" && !settings.pss_requested) {
+            throw std::runtime_error("." + settings.type + " requires a preceding .PSS analysis in the deck");
+        }
+        pss_op = solve_pss_operating_point();
+        if (settings.type == "PSS") {
+            x_dc = pss_op->state;
+        }
     }
-    run_dae_audits(devices, x_dc, settings);
 
     if (settings.type == "DC") {
         std::cout << "Starting DC Sweep Analysis..." << std::endl;
@@ -2397,6 +2847,23 @@ void run_simulation(
         for (int i = 0; i < num_nodes; ++i) {
             std::cout << "V(" << netlist.getNodeName(i) << ") ";
         }
+        const auto saved_currents = [&devices, &netlist]() {
+            std::vector<std::pair<std::string, int>> out;
+            for (const auto& save : netlist.getSettings().saves) {
+                if (upper_copy(save.kind) != "I") continue;
+                std::string dev = save.node_pos;
+                if (dev.size() > 2 && (dev[0] == 'i' || dev[0] == 'I') && dev[1] == '(') {
+                    dev = dev.substr(2, dev.size() - 3);
+                }
+                const int branch = find_branch_index_by_name(devices, dev);
+                if (branch >= 0) out.emplace_back(save.node_pos, branch);
+            }
+            return out;
+        }();
+        for (const auto& [name, unused] : saved_currents) {
+            (void)unused;
+            std::cout << "I(" << name << ") ";
+        }
         std::cout << std::endl;
         VectorReal sweep_guess = x_dc;
         std::vector<double> values(sweeps.size(), 0.0);
@@ -2413,6 +2880,10 @@ void run_simulation(
                 std::cout << "| ";
                 for (int i = 0; i < num_nodes; ++i) {
                     std::cout << sweep_guess[i] << " ";
+                }
+                for (const auto& [name, branch] : saved_currents) {
+                    (void)name;
+                    std::cout << sweep_guess[branch] << " ";
                 }
                 std::cout << std::endl;
                 return;
@@ -2753,14 +3224,29 @@ void run_simulation(
         const double output_step = settings.t_step > 0.0
             ? settings.t_step
             : std::max(settings.t_stop / 100.0, 1e-15);
-        // FIX Bug 4: do not cap max_step to output_step. With output_step==5ps
-        // the old code forced max_step=5ps, preventing the integrator from ever
-        // taking a step larger than the output interval. Use the physics-driven
-        // default (t_stop/100 or similar) when the user has not set TMAX.
+        // Keep AUTO conservative for production waveform fidelity. Users can
+        // still request a larger explicit MAXSTEP when they want throughput.
         const double max_step = default_transient_max_step(settings, output_step);
+        const std::string norm_method = normalized_method_key(settings);
+        bool compact_model_prefers_damping = false;
+        if (norm_method != "TRAPGEAR" && norm_method != "TRAP_GEAR" && norm_method != "TRAP" && norm_method != "TRAPEZOIDAL") {
+            for (const auto& device : devices) {
+                if (device->prefersDampedAutoTransient()) {
+                    compact_model_prefers_damping = true;
+                    break;
+                }
+            }
+        }
+        const double default_min_step = std::max(max_step * 1e-6, 1e-18);
+        const double compact_min_step = compact_model_prefers_damping
+            ? std::max(max_step * 1e-3, 1e-15)
+            : default_min_step;
         const double min_step = settings.t_min_step > 0.0
             ? std::min(settings.t_min_step, max_step)
-            : std::max(max_step * 1e-6, 1e-18);
+            : compact_min_step;
+        const double transient_cshunt = settings.cshunt >= 0.0
+            ? settings.cshunt
+            : (compact_model_prefers_damping ? 2.5e-16 : 0.0);
         const double save_start = std::clamp(settings.t_start, 0.0, settings.t_stop);
         double step = std::min(output_step, 1e-11);
         VectorReal x = x_dc;
@@ -2772,21 +3258,11 @@ void run_simulation(
             }
             step = std::min(step, 1e-12);
         }
+        step = std::max(step, min_step);
         std::vector<VectorReal> x_hist; x_hist.push_back(x);
         std::vector<double> t_hist; t_hist.push_back(0.0);
         DeviceTransientStateArena transient_state_arena(devices);
         DaeTransientHistoryBank dae_history(devices, x, 0.0);
-        const std::string norm_method = normalized_method_key(settings);
-        bool compact_model_prefers_damping = false;
-        const bool high_accuracy_mode = settings.reltol <= 3e-4 || settings.save_adaptive_steps;
-        if (norm_method != "TRAPGEAR" && norm_method != "TRAP_GEAR" && norm_method != "TRAP" && norm_method != "TRAPEZOIDAL" && !high_accuracy_mode) {
-            for (const auto& device : devices) {
-                if (device->prefersDampedAutoTransient()) {
-                    compact_model_prefers_damping = true;
-                    break;
-                }
-            }
-        }
         AutomaticTransientMethodController auto_method_controller(compact_model_prefers_damping);
         bool auto_use_trapezoidal = auto_method_controller.useTrapezoidal();
         int selected_order = 1;
@@ -2808,25 +3284,18 @@ void run_simulation(
         std::cout << std::scientific << std::setprecision(9)
                   << "Transient controls: output step=" << output_step
                   << " save start=" << save_start
-                  << " max internal step=" << max_step
-                  << " min internal step=" << min_step
-                  << " adaptive=" << (settings.tran_adaptive ? "on" : "off")
+            << " max internal step=" << max_step
+            << " min internal step=" << min_step
+            << " cshunt=" << transient_cshunt
+            << " adaptive=" << (settings.tran_adaptive ? "on" : "off")
+                  << " stamp_cache=on"
                   << " predictor=" << (settings.tran_predictor ? "on" : "off")
                   << " lte=" << (settings.tran_lte_mode == "STEPDOUBLING" ? "step-doubling" : "predictor-corrector")
-                  << " lte_reference=" << settings.tran_lte_reference
+                  << " lte_reference=HISTORY"
                   << " lte_audit_interval=" << settings.tran_lte_audit_interval
-                  << " trtol=" << settings.tran_trtol
                   << " order_control=" << (settings.tran_order_adaptive ? "adaptive" : "ramp")
-                  << " stamp_cache=" << (settings.transient_stamp_cache ? "on" : "matrix-reuse")
                   << " method=" << normalized_transient_method(settings, auto_use_trapezoidal)
                   << std::endl;
-        if (settings.tran_adaptive && settings.t_max_step > 0.0 &&
-            max_step <= output_step * (1.0 + 1e-9)) {
-            std::cout << "Transient note: user maxstep/tmax is at or below the output step; "
-                      << "internal adaptive steps cannot grow beyond this ceiling. "
-                      << "Omit .TRAN tmax or use a larger MAXSTEP for faster low/medium runs."
-                      << std::endl;
-        }
         if (!tran_out.toFile()) {
             std::cout << "time | ";
             for (int i = 0; i < num_nodes; ++i) {
@@ -2839,13 +3308,54 @@ void run_simulation(
         if (std::isfinite(device_bound_step)) {
             tran_stats.min_bound_step = std::min(tran_stats.min_bound_step, device_bound_step);
         }
-        const double stop_tol = std::max(std::max(1e-30, std::abs(settings.t_stop) * 1e-9), min_step * 10.0);
+        const double stop_tol = std::max(1e-30, std::abs(settings.t_stop) * 1e-9);
         double last_printed_time = -1.0;
         double last_progress_percent = -1.0;
         int consecutive_min_step_lte_violations = 0;
-        int recent_step_rejection_streak = 0;
         constexpr int max_min_step_lte_violations = 1024;
+        int consecutive_min_step_accepts_without_output = 0;
+        constexpr int max_min_step_accepts_without_output = 4096;
+        auto last_output_progress_wall = std::chrono::steady_clock::now();
+        constexpr double max_wall_seconds_without_output = 60.0;
         double next_output = save_start;
+        auto interpolate_state = [](const VectorReal& from_x, const VectorReal& to_x, double alpha) {
+            alpha = std::clamp(alpha, 0.0, 1.0);
+            const int n = to_x.getSize();
+            VectorReal sample(n);
+            for (int i = 0; i < n; ++i) {
+                sample[i] = from_x[i] + alpha * (to_x[i] - from_x[i]);
+            }
+            return sample;
+        };
+        auto write_output_grid = [&](double from_t, const VectorReal& from_x,
+                                     double to_t, const VectorReal& to_x) {
+            const double output_tol = std::max(1e-30, output_step * 1e-9);
+            if (!(to_t > from_t + output_tol)) return;
+            while (next_output <= to_t + output_tol) {
+                if (next_output > from_t + output_tol &&
+                    next_output >= save_start - output_tol &&
+                    next_output <= settings.t_stop + output_tol) {
+                    const double alpha = (next_output - from_t) / (to_t - from_t);
+                    VectorReal sample = interpolate_state(from_x, to_x, alpha);
+                    tran_out.write(next_output, sample, num_nodes);
+                    ++tran_stats.output_points;
+                    last_printed_time = next_output;
+                }
+                next_output += output_step;
+            }
+        };
+        auto write_adaptive_point = [&](double sample_t, const VectorReal& sample_x) {
+            if (!settings.save_adaptive_steps) return false;
+            if (sample_t < save_start - stop_tol || sample_t > settings.t_stop + stop_tol) return false;
+            const double duplicate_tol = std::max(1e-30, std::max(std::abs(sample_t), output_step) * 1e-12);
+            if (last_printed_time >= 0.0 && std::abs(sample_t - last_printed_time) <= duplicate_tol) {
+                return false;
+            }
+            tran_out.write(sample_t, sample_x, num_nodes);
+            ++tran_stats.output_points;
+            last_printed_time = sample_t;
+            return true;
+        };
         if (next_output <= 1e-30) {
             tran_out.write(0.0, x, num_nodes);
             record_measure_sample(0.0, x);
@@ -2856,8 +3366,6 @@ void run_simulation(
             record_measure_sample(0.0, x);
         }
         double candidate_step = step;
-        TransientMatrixWorkspace transient_matrix_workspace(matrix_size);
-        transient_matrix_workspace.setStructureCacheEnabled(settings.transient_stamp_cache);
         // FIX Bug 2: track the candidate step before any breakpoint snap so we
         // can restore it after landing on a breakpoint instead of growing from
         // the artificially shrunk post-snap value.
@@ -2934,13 +3442,11 @@ void run_simulation(
                         settings, x_hist, t_hist, step, auto_use_trapezoidal);
                 TransientStepResult full = solve_transient_step(
                     devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                    x, x_hist, t_hist, step, target_time, &attempted_method, selected_order,
-                    &transient_matrix_workspace);
+                    x, x_hist, t_hist, step, target_time, transient_cshunt, &attempted_method, selected_order);
                 tran_stats.noteSolve(full);
                 if (!full.converged && step > min_step) {
                     ++tran_stats.rejected_steps;
                     ++tran_stats.convergence_rejections;
-                    ++recent_step_rejection_streak;
                     selected_order = std::max(1, selected_order - 1);
                     step = std::max(min_step, step * 0.5);
                     continue;
@@ -2960,16 +3466,12 @@ void run_simulation(
                         devices, transient_state_arena, full.x, x_hist, t_hist,
                         full_ctx, num_nodes, settings);
                 }
-                const double next_bp_after_target = next_breakpoint_after(breakpoints, target_time, bp_tol);
-                const bool near_breakpoint =
-                    (next_bp > 0.0 && std::abs(target_time - next_bp) <= bp_tol) ||
-                    (next_bp_after_target > 0.0 &&
-                     next_bp_after_target - target_time <= std::max(max_step, output_step));
                 const bool periodicOracle = settings.tran_lte_audit_interval > 0 &&
                     ((tran_stats.accepted_steps + 1) % settings.tran_lte_audit_interval == 0);
+                const bool forcedStepDoubling = settings.tran_lte_mode == "STEPDOUBLING";
+                const bool predictorUnavailable = !pcEstimate.valid;
                 const bool useStepDoubling = can_reduce_step &&
-                    (settings.tran_lte_mode == "STEPDOUBLING" ||
-                     !pcEstimate.valid || near_breakpoint || periodicOracle);
+                    (forcedStepDoubling || predictorUnavailable || periodicOracle);
 
                 if (settings.tran_adaptive && pcEstimate.valid && !useStepDoubling) {
                     ++tran_stats.predictor_lte_steps;
@@ -2986,11 +3488,11 @@ void run_simulation(
                                     "Check TRTOL, LTE_RELTOL, CHGTOL, or MINSTEP",
                                     target_time, step, full, num_nodes));
                             }
+                            proposed_growth = std::max(proposed_growth, compact_model_prefers_damping ? 4.0 : 1.0);
                         } else {
                             const double factor = transient_reject_factor(err, full.integration_order);
                             ++tran_stats.rejected_steps;
                             ++tran_stats.lte_rejections;
-                            ++recent_step_rejection_streak;
                             selected_order = std::max(1, selected_order - 1);
                             step = std::max(min_step, step * factor);
                             continue;
@@ -3036,7 +3538,10 @@ void run_simulation(
                     }
                 } else if (settings.tran_adaptive && can_reduce_step) {
                     ++tran_stats.step_doubling_audits;
-                    // The full-step evaluation may have modified device
+                    if (forcedStepDoubling) ++tran_stats.step_doubling_forced;
+                    else if (periodicOracle) ++tran_stats.step_doubling_periodic;
+                    else if (predictorUnavailable) ++tran_stats.step_doubling_pc_invalid;
+                    // The full-step evaluation may have modified modelDevice model
                     // memory and candidate state. Start the half-step path from
                     // the exact accepted state at time t.
                     transient_state_arena.restore(baseline_device_states);
@@ -3044,8 +3549,7 @@ void run_simulation(
                     const double half_step = step * 0.5;
                     TransientStepResult half1 = solve_transient_step(
                         devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                        x, x_hist, t_hist, half_step, t + half_step, &attempted_method, selected_order,
-                        &transient_matrix_workspace);
+                        x, x_hist, t_hist, half_step, t + half_step, transient_cshunt, &attempted_method, selected_order);
                     tran_stats.noteSolve(half1);
                     if (!half1.converged) {
                         transient_state_arena.restore(baseline_device_states);
@@ -3053,7 +3557,6 @@ void run_simulation(
                         if (step > min_step) {
                             ++tran_stats.rejected_steps;
                             ++tran_stats.convergence_rejections;
-                            ++recent_step_rejection_streak;
                             selected_order = std::max(1, selected_order - 1);
                             step = std::max(min_step, half_step);
                             continue;
@@ -3073,8 +3576,7 @@ void run_simulation(
                     half_time_hist.push_back(t + half_step);
                     TransientStepResult half2 = solve_transient_step(
                         devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                        half1.x, half_hist, half_time_hist, half_step, target_time, &attempted_method, selected_order,
-                        &transient_matrix_workspace);
+                        half1.x, half_hist, half_time_hist, half_step, target_time, transient_cshunt, &attempted_method, selected_order);
                     tran_stats.noteSolve(half2);
                     if (!half2.converged) {
                         transient_state_arena.restore(baseline_device_states);
@@ -3082,7 +3584,6 @@ void run_simulation(
                         if (step > min_step) {
                             ++tran_stats.rejected_steps;
                             ++tran_stats.convergence_rejections;
-                            ++recent_step_rejection_streak;
                             selected_order = std::max(1, selected_order - 1);
                             step = std::max(min_step, half_step);
                             continue;
@@ -3093,7 +3594,7 @@ void run_simulation(
                     }
                     err = transient_lte_error(
                         devices, transient_state_arena, full.x, half2.x,
-                        x_hist, num_nodes, settings, full.integration_order, target_time);
+                        num_nodes, settings, full.integration_order, target_time);
                     if (pcEstimate.valid) err = std::max(err, pcEstimate.error);
                     if (err > 1.0 && step > min_step) {
                         transient_state_arena.restore(baseline_device_states);
@@ -3101,7 +3602,6 @@ void run_simulation(
                         const double factor = transient_reject_factor(err, full.integration_order);
                         ++tran_stats.rejected_steps;
                         ++tran_stats.lte_rejections;
-                        ++recent_step_rejection_streak;
                         selected_order = std::max(1, selected_order - 1);
                         step = std::max(min_step, step * factor);
                         continue;
@@ -3145,16 +3645,22 @@ void run_simulation(
                 accepted = true;
             }
             const double previous_t = t;
-            const VectorReal previous_x = x;
+            VectorReal previous_x = x;
             t += step;
             if (settings.t_stop - t < stop_tol) {
                 t = settings.t_stop;
             }
             tran_stats.noteAccepted(step, err);
-            const int rejection_streak_before_accept = recent_step_rejection_streak;
-            recent_step_rejection_streak = 0;
             x = accepted_x;
             record_measure_sample(t, x);
+            const long long output_points_before_write = tran_stats.output_points;
+            if (accepted_has_intermediate) {
+                write_output_grid(previous_t, previous_x, accepted_intermediate_time, accepted_intermediate_x);
+                write_adaptive_point(accepted_intermediate_time, accepted_intermediate_x);
+                write_output_grid(accepted_intermediate_time, accepted_intermediate_x, t, x);
+            } else {
+                write_output_grid(previous_t, previous_x, t, x);
+            }
             device_bound_step = collect_transient_bound_step(devices);
             if (std::isfinite(device_bound_step)) {
                 tran_stats.min_bound_step = std::min(tran_stats.min_bound_step, device_bound_step);
@@ -3195,42 +3701,40 @@ void run_simulation(
                 t_hist.erase(t_hist.begin(), t_hist.begin() + 1);
             }
             const double output_tol = std::max(1e-30, output_step * 1e-9);
-            bool is_fast_transition = false;
-            if (num_nodes > 0 && x_hist.size() >= 2 && t_hist.size() >= 2) {
-                const double dt_step = t_hist.back() - t_hist[t_hist.size() - 2];
-                if (dt_step > 1e-18) {
-                    const auto& x_prev = x_hist[x_hist.size() - 2];
-                    for (int i = 0; i < num_nodes; ++i) {
-                        const double dv_dt = std::abs(x[i] - x_prev[i]) / dt_step;
-                        if (dv_dt > 1e9) {
-                            is_fast_transition = true;
-                            break;
-                        }
-                    }
+            write_adaptive_point(t, x);
+            const bool output_progressed = tran_stats.output_points > output_points_before_write;
+            if (output_progressed) {
+                last_output_progress_wall = std::chrono::steady_clock::now();
+            }
+            if (step <= min_step * (1.0 + 1e-9) && !output_progressed &&
+                next_output > t + output_tol) {
+                ++consecutive_min_step_accepts_without_output;
+                if (consecutive_min_step_accepts_without_output >= max_min_step_accepts_without_output) {
+                    throw std::runtime_error(transient_failure_message(
+                        "Transient progress starved after 4096 accepted minimum-timestep steps "
+                        "without reaching the next output point; relax LTE settings, increase MINSTEP, "
+                        "or use a KLU-enabled build",
+                        t, step, TransientStepResult{x, false, accepted_order, 0.0, 0.0,
+                            err, 0.0, -1, accepted_order}, num_nodes));
                 }
+            } else {
+                consecutive_min_step_accepts_without_output = 0;
             }
-            while (t + output_tol >= next_output) {
-                const VectorReal sample_x = interpolate_transient_state(
-                    previous_x, x, previous_t, t, next_output);
-                tran_out.write(next_output, sample_x, num_nodes);
-                ++tran_stats.output_points;
-                last_printed_time = next_output;
-                do {
-                    next_output += output_step;
-                } while (next_output <= last_printed_time + output_tol);
-            }
-            const bool should_write_adaptive =
-                settings.save_adaptive_steps || is_fast_transition;
-            if (should_write_adaptive && last_printed_time < t - output_tol) {
-                tran_out.write(t, x, num_nodes);
-                ++tran_stats.output_points;
-                last_printed_time = t;
+            if (tran_out.toFile() && !output_progressed && next_output > t + output_tol) {
+                const double stalled_seconds =
+                    elapsed_seconds(last_output_progress_wall, std::chrono::steady_clock::now());
+                if (stalled_seconds >= max_wall_seconds_without_output) {
+                    throw std::runtime_error(transient_failure_message(
+                        "Transient wall-clock progress starved for 60 seconds without reaching "
+                        "the next output point; relax timestep/LTE settings, increase MINSTEP, "
+                        "shorten the run, or use a KLU-enabled build",
+                        t, step, TransientStepResult{x, false, accepted_order, 0.0, 0.0,
+                            err, 0.0, -1, accepted_order}, num_nodes));
+                }
             }
             if (tran_out.toFile() && settings.t_stop > 0.0) {
                 const double pct = std::clamp(100.0 * t / settings.t_stop, 0.0, 100.0);
-                if ((settings.tran_progress_interval > 0.0 &&
-                     pct - last_progress_percent >= settings.tran_progress_interval) ||
-                    pct >= 100.0) {
+                if (pct - last_progress_percent >= 1.0 || pct >= 100.0) {
                     std::cout << std::fixed << std::setprecision(1)
                               << "Transient progress: " << pct << "% t="
                               << std::scientific << std::setprecision(9) << t << std::endl;
@@ -3239,28 +3743,23 @@ void run_simulation(
             }
             if (is_transient_breakpoint(breakpoints, t, bp_tol) && t > bp_tol) {
                 // FIX Bug 2 (part 2): restore the pre-breakpoint candidate step
-                // as a ceiling, but grow from the accepted breakpoint step.
-                // This avoids both extremes: staying at an absurdly tiny
-                // post-breakpoint step or jumping straight back to a step that
-                // the discontinuity has just invalidated.
+                // instead of resetting to 2*output_step. This preserves the
+                // momentum of step growth across discontinuity events and avoids
+                // re-collapsing against the output-interval clamp.
+                // Then apply a conservative growth factor so the method can
+                // ramp up smoothly from the restart point.
                 const double restored = std::min(max_step, pre_bp_candidate);
                 if (settings.tran_adaptive) {
-                    const double bp_growth = std::clamp(settings.tran_breakpoint_growth, 1.0, 20.0);
-                    candidate_step = std::min(
-                        max_step,
-                        std::max(min_step, std::min(restored, step * bp_growth)));
+                    // Allow a slight growth from the restored candidate so we do
+                    // not permanently stall if the device bound forced it tiny.
+                    candidate_step = std::min(max_step, std::max(min_step, restored * 1.1));
                 } else {
                     candidate_step = max_step;
                 }
             } else if (settings.tran_adaptive) {
-                double max_grow = (err <= 1e-12) ? 8.0 : ((err <= 1e-6) ? 5.0 : 2.5);
-                if (rejection_streak_before_accept >= 3) {
-                    max_grow = std::min(max_grow, 1.20);
-                } else if (rejection_streak_before_accept >= 1) {
-                    max_grow = std::min(max_grow, 1.50);
-                }
+                const double max_grow = (err <= 1e-12) ? 8.0 : ((err <= 1e-6) ? 5.0 : 2.5);
                 const double grow = std::clamp(proposed_growth, 1.05, max_grow);
-                candidate_step = std::min(max_step, std::max(min_step, step * grow));
+                candidate_step = std::min(max_step, std::max(min_step, candidate_step * grow));
             } else {
                 candidate_step = max_step;
             }
@@ -3279,6 +3778,9 @@ void run_simulation(
                   << " lte_rejected=" << tran_stats.lte_rejections
                   << " pc_lte_steps=" << tran_stats.predictor_lte_steps
                   << " oracle_steps=" << tran_stats.step_doubling_audits
+                  << " oracle_forced=" << tran_stats.step_doubling_forced
+                  << " oracle_periodic=" << tran_stats.step_doubling_periodic
+                  << " oracle_pc_invalid=" << tran_stats.step_doubling_pc_invalid
                   << " method_switches=" << tran_stats.method_switches
                   << " bound_step_limited=" << tran_stats.bound_step_limited
                   << " output_points=" << tran_stats.output_points
@@ -3298,6 +3800,10 @@ void run_simulation(
                   << " max_residual_error=" << tran_stats.max_residual_error
                   << " stamp_seconds=" << tran_stats.stamp_seconds
                   << " solve_seconds=" << tran_stats.solve_seconds
+                  << " model_eval_seconds=" << tran_stats.model_eval_seconds
+                  << " legacy_stamp_seconds=" << tran_stats.legacy_stamp_seconds
+                  << " residual_check_seconds=" << tran_stats.residual_check_seconds
+                  << " matrix_clear_seconds=" << tran_stats.matrix_clear_seconds
                   << std::endl;
         std::cout << std::scientific << std::setprecision(9)
                   << "Accuracy summary: method="
@@ -3321,7 +3827,26 @@ void run_simulation(
         }
     } else if (settings.type == "AC") {
         std::cout << "Starting AC Analysis..." << std::endl;
-        const auto frequencies = make_frequency_grid(settings);
+        std::vector<double> frequencies;
+        const std::string sweep_type = upper_copy(settings.f_sweep_type);
+        if (sweep_type == "VALUES") {
+            frequencies = settings.f_values;
+        } else if (sweep_type == "LIN") {
+            const int points = std::max(settings.points_per_dec, 1);
+            frequencies.reserve(static_cast<size_t>(points));
+            for (int idx = 0; idx < points; ++idx) {
+                const double alpha = points == 1 ? 0.0 : static_cast<double>(idx) / static_cast<double>(points - 1);
+                frequencies.push_back(settings.f_start + alpha * (settings.f_stop - settings.f_start));
+            }
+        } else {
+            double f = settings.f_start;
+            const double dec_mult = std::pow(sweep_type == "OCT" ? 2.0 : 10.0, 1.0 / std::max(settings.points_per_dec, 1));
+            while (f <= settings.f_stop * 1.01) {
+                frequencies.push_back(f);
+                f *= dec_mult;
+            }
+        }
+        int ac_points = 0;
         for (double f : frequencies) {
             double omega = 2.0 * 3.14159265358979 * f;
             const auto stamp_start = std::chrono::steady_clock::now();
@@ -3339,87 +3864,60 @@ void run_simulation(
             std::cout << std::scientific << std::setprecision(2) << f << " | ";
             for(int i=0; i<num_nodes; ++i) std::cout << "(" << x_ac[i].real() << "," << x_ac[i].imag() << ") ";
             std::cout << std::endl;
+            ++ac_points;
         }
-        std::cout << "AC summary: points=" << frequencies.size()
-                  << " sweep=" << upper_copy(settings.frequency_sweep_type)
-                  << std::endl;
+        std::cout << "AC summary: points=" << ac_points << " sweep=" << sweep_type << std::endl;
     } else if (settings.type == "NOISE") {
         std::cout << "Starting Noise Analysis..." << std::endl;
         if (settings.out_node < 0 || settings.out_node >= num_nodes) {
             throw std::runtime_error(".NOISE output node must be a non-ground circuit node");
         }
-        const auto frequencies = make_frequency_grid(settings);
+        double f = settings.f_start;
+        double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
         std::cout << "freq | onoise_sqrt(V/rtHz) onoise_psd(V^2/Hz) noise_sources" << std::endl;
-        double integrated_output_noise = 0.0;
-        double previous_freq = 0.0;
-        double previous_psd = 0.0;
-        bool has_previous_noise = false;
-        std::size_t last_noise_source_count = 0;
-        for (double f : frequencies) {
+        while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
             const auto stamp_start = std::chrono::steady_clock::now();
-            const auto solve_start = std::chrono::steady_clock::now();
-            const NoiseTransferResult noise = solve_output_noise_psd(
-                devices, num_devs, matrix_size, num_nodes, settings.out_node,
-                omega, x_dc, settings, &complex_solver_context);
-            const double output_psd = noise.output_psd;
-            if (has_previous_noise && f > previous_freq) {
-                integrated_output_noise += 0.5 * (previous_psd + output_psd) * (f - previous_freq);
+            SparseMatrixComplex J_sparse(matrix_size); VectorComplex ignored_rhs(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
+            #pragma omp parallel for if(use_parallel_stamp)
+            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, ignored_rhs, omega, x_dc);
+            const auto stamp_end = std::chrono::steady_clock::now();
+            runtime_stats.ac_stamp_seconds += elapsed_seconds(stamp_start, stamp_end);
+
+            std::vector<NoiseSource> noise_sources;
+            for (const auto& dev : devices) {
+                dev->collectNoiseSources(omega, x_dc, noise_sources);
             }
-            has_previous_noise = true;
-            previous_freq = f;
-            previous_psd = output_psd;
+
+            double output_psd = 0.0;
+            const auto solve_start = std::chrono::steady_clock::now();
+            for (const auto& source : noise_sources) {
+                if (source.currentPsd <= 0.0) continue;
+                VectorComplex rhs(matrix_size);
+                rhs.add(source.nodePos, {-1.0, 0.0});
+                rhs.add(source.nodeNeg, {1.0, 0.0});
+                VectorComplex transfer = KluSolverComplex::solve(J_sparse, rhs, &complex_solver_context);
+                const std::complex<double> out = transfer[settings.out_node];
+                output_psd += std::norm(out) * source.currentPsd;
+            }
             const auto solve_end = std::chrono::steady_clock::now();
-            runtime_stats.ac_stamp_seconds += elapsed_seconds(stamp_start, solve_start);
             runtime_stats.ac_solve_seconds += elapsed_seconds(solve_start, solve_end);
-            last_noise_source_count = noise.source_count;
             std::cout << std::scientific << std::setprecision(9)
                       << f << " | " << std::sqrt(std::max(output_psd, 0.0))
                       << " " << output_psd
-                      << " " << noise.source_count
+                      << " " << noise_sources.size()
                       << std::endl;
+            f *= dec_mult;
         }
-        std::cout << std::scientific << std::setprecision(9)
-                  << "Integrated output noise: " << std::sqrt(std::max(integrated_output_noise, 0.0))
-                  << " Vrms" << std::endl;
-        std::cout << "Noise summary: points=" << frequencies.size()
-                  << " output=V(" << netlist.getNodeName(settings.out_node) << ")"
-                  << " input=" << settings.noise_input_source
-                  << " sources=" << last_noise_source_count
-                  << std::endl;
-    } else if (settings.type == "SP") {
-        std::cout << "Starting S-Parameter Analysis..." << std::endl;
-        if (ports.empty()) {
-            throw std::runtime_error(".SP requires at least one P port");
-        }
-        const auto frequencies = make_frequency_grid(settings);
-        for (double f : frequencies) {
-            const double omega = 2.0 * 3.14159265358979 * f;
-            SparseMatrixComplex J_sparse(matrix_size); VectorComplex b_ac(matrix_size);
-            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
-            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_ac, omega, x_dc);
-            VectorComplex x_sp = KluSolverComplex::solve(J_sparse, b_ac, &complex_solver_context);
-            std::cout << std::scientific << std::setprecision(9)
-                      << f << " | ";
-            for (std::size_t i = 0; i < ports.size(); ++i) {
-                const int branch = ports[i]->getBranchIndex();
-                const std::complex<double> value = branch >= 0 ? x_sp[branch] : std::complex<double>{};
-                std::cout << "S" << (i + 1) << (i + 1) << "=("
-                          << value.real() << "," << value.imag() << ") ";
-            }
-            std::cout << std::endl;
-        }
-        std::cout << "SP summary: points=" << frequencies.size()
-                  << " ports=" << ports.size()
-                  << " method=multiport-y-to-s"
-                  << std::endl;
     } else if (settings.type == "STB") {
         std::cout << "Starting Stability Analysis (Tian)..." << std::endl;
         if (probes.empty()) {
             throw std::runtime_error(".STB requires a stability probe; refusing to report an empty successful analysis");
         }
-        const auto frequencies = make_frequency_grid(settings);
-        for (double f : frequencies) {
+        double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
+        while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
             // 1. Voltage Pass
             SparseMatrixComplex Jv(matrix_size); VectorComplex bv(matrix_size);
@@ -3440,560 +3938,22 @@ void run_simulation(
             // 3. Combine
             std::complex<double> T = (Tv * Ti - std::complex<double>(1,0)) / (Tv + Ti + std::complex<double>(2,0));
             std::cout << std::scientific << f << " | Mag: " << std::abs(T) << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
+            f *= dec_mult;
         }
-        std::cout << "STB summary: points=" << frequencies.size()
-                  << " method=twoport-return-ratio"
-                  << std::endl;
     } else if (settings.type == "PSS") {
-        std::cout << "Starting Periodic Steady State (PSS) Analysis..." << std::endl;
-        int n_tones = static_cast<int>(settings.f_fund.size());
-        std::cout << "  Tones: " << n_tones << " | Harmonics/Tone: " << settings.n_harms << std::endl;
-        if (n_tones > 1) {
-            std::cout << "  Warning: Multi-tone PSS requires finding a common periodic denominator, which can result in massive transient integration times." << std::endl;
-            std::cout << "  For " << n_tones << " non-harmonically related tones, Quasi-Periodic Harmonic Balance (QPHB) is recommended." << std::endl;
+        std::cout << "PSS operating point:";
+        for(int i=0; i<num_nodes; ++i) {
+            std::cout << " V(" << netlist.getNodeName(i) << ")="
+                      << std::scientific << std::setprecision(9) << x_dc[i];
         }
-        if (settings.f_fund.empty() || !(settings.f_fund[0] > 0.0)) {
-            throw std::runtime_error(".PSS requires a positive fundamental frequency or oscillator frequency estimate.");
-        }
-        const double initial_period = 1.0 / settings.f_fund[0];
-        const double tstab = settings.pss_tstab > 0.0
-            ? settings.pss_tstab
-            : static_cast<double>(settings.pss_autonomous
-                  ? std::max(5, settings.pss_tstab_periods)
-                  : std::max(0, settings.pss_tstab_periods)) * initial_period;
-        const double report_base_step = initial_period / static_cast<double>(std::max(16, settings.n_harms * 8));
-        const double report_max_step = settings.t_max_step > 0.0
-            ? settings.t_max_step
-            : report_base_step;
-        std::cout << std::scientific << std::setprecision(9)
-                  << "  Executing Shooting Newton PSS: mode="
-                  << (settings.pss_autonomous ? "autonomous" : "driven")
-                  << " period=" << initial_period
-                  << " tstab=" << tstab
-                  << " max_step=" << report_max_step
-                  << " residual_goal=" << settings.pss_residual_goal
-                  << " max_iter=" << settings.max_pss_iter
-                  << std::endl;
-
-        struct PssOrbitResult {
-            VectorReal end;
-            VectorReal endpoint_time_sensitivity;
-            std::vector<VectorReal> transition;
-            bool variational = false;
-            bool direct_period_sensitivity = false;
-            int variational_steps = 0;
-        };
-
-        auto identity_transition = [&](int size) {
-            std::vector<VectorReal> phi;
-            phi.reserve(static_cast<std::size_t>(size));
-            for (int col = 0; col < size; ++col) {
-                VectorReal column(size);
-                column[col] = 1.0;
-                phi.push_back(column);
-            }
-            return phi;
-        };
-
-        auto stamp_dynamic_jacobian = [&](SparseMatrixReal& dynamic, const VectorReal& state, double time) {
-            dynamic.setStructureCacheEnabled(settings.transient_stamp_cache);
-            DaeRequest request;
-            request.analysis = DaeAnalysis::Transient;
-            request.time = time;
-            request.staticResidual = false;
-            request.dynamicResidual = false;
-            request.staticJacobian = false;
-            request.dynamicJacobian = true;
-            request.readOnlyState = true;
-            request.enableLimiting = false;
-            for (const auto& device : devices) {
-                DaeEvaluation evaluation;
-                if (!device->evaluateDae(state, request, evaluation)) continue;
-                if (!evaluation.finite()) {
-                    throw std::runtime_error("non-finite value in PSS variational DAE Jacobian");
-                }
-                for (const auto& term : evaluation.dynamicJacobian) {
-                    dynamic.add(term.equation, term.unknown, term.value);
-                }
-            }
-            dynamic.getEntries();
-        };
-
-        auto multiply_sparse_vector = [&](const SparseMatrixReal& matrix, const VectorReal& vector) {
-            VectorReal result(matrix_size);
-            for (const auto& entry : matrix.getEntries()) {
-                if (entry.row < 0 || entry.row >= matrix_size ||
-                    entry.col < 0 || entry.col >= vector.getSize()) {
-                    continue;
-                }
-                result.add(entry.row, entry.value * vector[entry.col]);
-            }
-            return result;
-        };
-
-        auto integrate_pss_interval = [&](const VectorReal& start, double duration, double start_time,
-                                          bool propagate_variational, TransientOutput* output = nullptr,
-                                          std::vector<TranSample>* samples = nullptr) {
-            PssOrbitResult orbit;
-            orbit.end = start;
-            orbit.endpoint_time_sensitivity = VectorReal(matrix_size);
-            if (propagate_variational) {
-                orbit.transition = identity_transition(matrix_size);
-                orbit.variational = true;
-            }
-            VectorReal x = start;
-            if (!(duration > 0.0)) return orbit;
-            const double base_step = duration / static_cast<double>(std::max(16, settings.n_harms * 8));
-            const double pss_max_step = settings.t_max_step > 0.0
-                ? settings.t_max_step
-                : std::max(base_step, 1e-18);
-            const double pss_min_step = std::max(pss_max_step * 1e-6, 1e-18);
-            std::vector<VectorReal> x_hist; x_hist.push_back(x);
-            std::vector<double> t_hist; t_hist.push_back(start_time);
-            DeviceTransientStateArena transient_state_arena(devices);
-            DaeTransientHistoryBank dae_history(devices, x, start_time);
-            TransientMatrixWorkspace pss_transient_matrix_workspace(matrix_size);
-            pss_transient_matrix_workspace.setStructureCacheEnabled(settings.transient_stamp_cache);
-            transient_state_arena.restoreCurrent();
-            double local_t = start_time;
-            const double stop_time = start_time + duration;
-            double candidate_step = std::min(pss_max_step, std::max(pss_min_step, base_step));
-            int selected_order = 1;
-            const double stop_tol = std::max(std::max(1e-30, std::abs(stop_time) * 1e-9), pss_min_step * 10.0);
-            while (local_t < stop_time - stop_tol) {
-                double step = std::min(candidate_step, stop_time - local_t);
-                bool accepted = false;
-                double err = 0.0;
-                int accepted_order = selected_order;
-                int proposed_next_order = selected_order;
-                double proposed_growth = 1.0;
-                const auto baseline_device_states = transient_state_arena.checkpoint();
-                const auto baseline_dae_history = dae_history.checkpoint();
-                while (!accepted) {
-                    transient_state_arena.restore(baseline_device_states);
-                    dae_history.rollback(baseline_dae_history);
-                    const double target_time = local_t + step;
-                    const TransientIntegrationMethod attempted_method =
-                        choose_transient_method(settings, x_hist, t_hist, step, true);
-                    TransientStepResult full = solve_transient_step(
-                        devices, dae_history, num_devs, matrix_size, num_nodes, settings, &real_solver_context,
-                        x, x_hist, t_hist, step, target_time, &attempted_method, selected_order,
-                        &pss_transient_matrix_workspace);
-                    if (!full.converged && step > pss_min_step) {
-                        step = std::max(pss_min_step, step * 0.5);
-                        selected_order = std::max(1, selected_order - 1);
-                        continue;
-                    }
-                    if (!full.converged) {
-                        throw std::runtime_error(transient_failure_message(
-                            "PSS shooting transient step failed to converge",
-                            target_time, step, full, num_nodes));
-                    }
-                    const TransientContext full_ctx = make_transient_context(
-                        settings, x_hist, t_hist, step, target_time, &attempted_method, selected_order);
-                    PredictorCorrectorEstimate pcEstimate;
-                    if (settings.tran_adaptive || settings.pss_adaptive) {
-                        pcEstimate = predictor_corrector_lte_error(
-                            devices, transient_state_arena, full.x, x_hist, t_hist,
-                            full_ctx, num_nodes, settings);
-                    }
-                    if (pcEstimate.valid) {
-                        err = pcEstimate.error;
-                        if (err > 1.0 && step > pss_min_step) {
-                            step = std::max(pss_min_step, step * transient_reject_factor(err, full.integration_order));
-                            selected_order = std::max(1, selected_order - 1);
-                            continue;
-                        }
-                    }
-                    if (propagate_variational) {
-                        SparseMatrixReal step_matrix(matrix_size);
-                        step_matrix.setStructureCacheEnabled(settings.transient_stamp_cache);
-                        VectorReal step_rhs(matrix_size);
-                        stamp_global_gmin(step_matrix, num_nodes, settings.gmin);
-                        const std::uint64_t variational_epoch = next_evaluation_epoch();
-                        for (std::size_t device_index = 0; device_index < devices.size(); ++device_index) {
-                            stamp_device_transient(
-                                *devices[device_index], device_index, dae_history,
-                                step_matrix, step_rhs, full.x, full_ctx, &settings,
-                                variational_epoch, false, true);
-                        }
-                        step_matrix.getEntries();
-                        SparseMatrixReal previous_dynamic(matrix_size);
-                        stamp_dynamic_jacobian(previous_dynamic, x, local_t);
-                        for (auto& column : orbit.transition) {
-                            VectorReal rhs = multiply_sparse_vector(previous_dynamic, column);
-                            for (int row = 0; row < rhs.getSize(); ++row) {
-                                rhs[row] *= -full_ctx.a1;
-                            }
-                            column = solve_with_refinement(
-                                step_matrix, rhs, &real_solver_context, settings.solver_refinement_steps);
-                        }
-                        ++orbit.variational_steps;
-                    }
-                    accept_device_transient_step(devices, full.x, target_time, full_ctx);
-                    dae_history.commitAccepted(devices, full.x, target_time, full_ctx);
-                    transient_state_arena.commitDeviceState();
-                    for (int i = 0; i < matrix_size; ++i) {
-                        orbit.endpoint_time_sensitivity[i] = (full.x[i] - x[i]) / std::max(step, 1e-30);
-                    }
-                    orbit.direct_period_sensitivity = true;
-                    x = full.x;
-                    local_t = target_time;
-                    if (output) {
-                        output->write(local_t - start_time, x, num_nodes);
-                    }
-                    if (samples) {
-                        samples->push_back({local_t - start_time, x});
-                    }
-                    accepted_order = full.integration_order;
-                    if (pcEstimate.valid) {
-                        proposed_growth = transient_growth_factor(err, accepted_order);
-                    } else {
-                        proposed_growth = 1.5;
-                    }
-                    if ((attempted_method == TransientIntegrationMethod::Bdf ||
-                         attempted_method == TransientIntegrationMethod::AdamsMoulton) &&
-                        settings.tran_order_adaptive) {
-                        if (err < 0.05 && accepted_order < settings.tran_max_order &&
-                            t_hist.size() >= static_cast<std::size_t>(accepted_order + 1)) {
-                            proposed_next_order = accepted_order + 1;
-                        } else if (err > 0.8 && accepted_order > 1) {
-                            proposed_next_order = accepted_order - 1;
-                        }
-                    }
-                    accepted = true;
-                }
-                x_hist.push_back(x);
-                t_hist.push_back(local_t);
-                while (x_hist.size() > 8) {
-                    x_hist.erase(x_hist.begin(), x_hist.begin() + 1);
-                    t_hist.erase(t_hist.begin(), t_hist.begin() + 1);
-                }
-                selected_order = std::clamp(proposed_next_order, 1, settings.tran_max_order);
-                const double grow = std::clamp(proposed_growth, 1.05, 2.5);
-                candidate_step = std::min(pss_max_step, std::max(pss_min_step, candidate_step * grow));
-            }
-            orbit.end = x;
-            return orbit;
-        };
-
-        VectorReal pss_state = x_dc;
-        double pss_time = 0.0;
-        double period = initial_period;
-        if (tstab > 0.0) {
-            std::cout << "  PSS stabilization transient..." << std::endl;
-            pss_state = integrate_pss_interval(pss_state, tstab, pss_time, false).end;
-            pss_time += tstab;
-        }
-        double residual = std::numeric_limits<double>::infinity();
-        int converged_iter = 0;
-        int shooting_newton_iterations = 0;
-        int monodromy_columns = 0;
-        int variational_steps = 0;
-        int direct_period_columns = 0;
-        int finite_difference_period_columns = 0;
-        int phase_index = -1;
-        double phase_reference = 0.0;
-        double frequency_hz = settings.f_fund[0];
-        for (int iter = 1; iter <= settings.max_pss_iter; ++iter) {
-            const VectorReal cycle_start = pss_state;
-            const double cycle_time = pss_time;
-            DeviceTransientStateArena cycle_baseline(devices);
-            auto run_cycle_from = [&](const VectorReal& start, double trial_period, bool variational) {
-                cycle_baseline.restoreCurrent();
-                return integrate_pss_interval(start, trial_period, cycle_time, variational);
-            };
-            PssOrbitResult nominal_orbit = run_cycle_from(cycle_start, period, settings.pss_continuation);
-            VectorReal cycle_end = nominal_orbit.end;
-            pss_time = cycle_time + period;
-            const auto periodic_error = worst_solution_update(cycle_end, cycle_start, num_nodes, settings);
-            pss_state = cycle_end;
-            residual = periodic_error.first;
-            if (settings.pss_autonomous && phase_index < 0) {
-                double best_swing = 0.0;
-                const int phase_limit = std::max(0, std::min(num_nodes, matrix_size));
-                for (int i = 0; i < phase_limit; ++i) {
-                    const double swing = std::abs(cycle_end[i] - cycle_start[i]);
-                    if (swing > best_swing) {
-                        best_swing = swing;
-                        phase_index = i;
-                    }
-                }
-                if (phase_index < 0 && periodic_error.second >= 0) {
-                    phase_index = periodic_error.second;
-                }
-                if (phase_index < 0) phase_index = 0;
-                phase_reference = cycle_start[phase_index];
-                std::cout << "  Autonomous PSS phase condition: unknown="
-                          << phase_index << " reference=" << phase_reference << std::endl;
-            }
-            std::cout << std::scientific << std::setprecision(9)
-                      << "PSS iteration " << iter
-                      << ": residual=" << residual
-                      << " worst_unknown=" << periodic_error.second
-                      << " period=" << period
-                      << std::endl;
-            if (residual <= settings.pss_residual_goal) {
-                converged_iter = iter;
-                break;
-            }
-            if (!settings.pss_continuation || matrix_size <= 0) {
-                continue;
-            }
-            const int shooting_size = matrix_size + (settings.pss_autonomous ? 1 : 0);
-            const int period_col = matrix_size;
-            SparseMatrixReal shooting_matrix(shooting_size);
-            shooting_matrix.setStructureCacheEnabled(settings.transient_stamp_cache);
-            VectorReal shooting_rhs(shooting_size);
-            for (int row = 0; row < matrix_size; ++row) {
-                shooting_rhs.add(row, cycle_start[row] - cycle_end[row]);
-            }
-            if (nominal_orbit.variational &&
-                static_cast<int>(nominal_orbit.transition.size()) == matrix_size) {
-                for (int col = 0; col < matrix_size; ++col) {
-                    for (int row = 0; row < matrix_size; ++row) {
-                        const double monodromy = nominal_orbit.transition[static_cast<std::size_t>(col)][row];
-                        shooting_matrix.add(row, col, monodromy - (row == col ? 1.0 : 0.0));
-                    }
-                    ++monodromy_columns;
-                }
-                variational_steps += nominal_orbit.variational_steps;
-            } else {
-                for (int col = 0; col < matrix_size; ++col) {
-                    VectorReal perturbed = cycle_start;
-                    const double abs_floor = col < num_nodes ? settings.vntol : settings.abstol;
-                    const double delta = std::max(1e-9 * std::max(1.0, std::abs(cycle_start[col])), abs_floor * 10.0);
-                    perturbed[col] += delta;
-                    VectorReal perturbed_end = run_cycle_from(perturbed, period, false).end;
-                    for (int row = 0; row < matrix_size; ++row) {
-                        const double monodromy = (perturbed_end[row] - cycle_end[row]) / delta;
-                        shooting_matrix.add(row, col, monodromy - (row == col ? 1.0 : 0.0));
-                    }
-                    ++monodromy_columns;
-                }
-            }
-            if (settings.pss_autonomous) {
-                if (nominal_orbit.direct_period_sensitivity &&
-                    nominal_orbit.endpoint_time_sensitivity.getSize() == matrix_size) {
-                    for (int row = 0; row < matrix_size; ++row) {
-                        shooting_matrix.add(row, period_col, nominal_orbit.endpoint_time_sensitivity[row]);
-                    }
-                    ++direct_period_columns;
-                } else {
-                    const double delta_period = std::max(1e-7 * period, 1e-18);
-                    VectorReal period_end = run_cycle_from(cycle_start, period + delta_period, false).end;
-                    for (int row = 0; row < matrix_size; ++row) {
-                        shooting_matrix.add(row, period_col, (period_end[row] - cycle_end[row]) / delta_period);
-                    }
-                    ++finite_difference_period_columns;
-                }
-                shooting_matrix.add(matrix_size, phase_index, 1.0);
-                shooting_rhs.add(matrix_size, phase_reference - cycle_start[phase_index]);
-                ++monodromy_columns;
-            }
-            shooting_matrix.getEntries();
-            ++shooting_newton_iterations;
-            if (!nominal_orbit.variational) {
-                variational_steps += shooting_size;
-            }
-            VectorReal correction(shooting_size);
-            try {
-                correction = solve_with_refinement(
-                    shooting_matrix, shooting_rhs, &real_solver_context, settings.solver_refinement_steps);
-            } catch (...) {
-                pss_state = run_cycle_from(cycle_start, period, false).end;
-                continue;
-            }
-            bool improved = false;
-            double best_residual = residual;
-            VectorReal best_state = pss_state;
-            double best_period = period;
-            double alpha = 1.0;
-            for (int trial = 0; trial < 5; ++trial) {
-                VectorReal candidate_start = cycle_start;
-                for (int i = 0; i < matrix_size; ++i) {
-                    candidate_start[i] += alpha * correction[i];
-                }
-                double candidate_period = period;
-                if (settings.pss_autonomous) {
-                    candidate_period += alpha * correction[period_col];
-                }
-                if (!(candidate_period > initial_period * 0.05 && candidate_period < initial_period * 20.0)) {
-                    alpha *= 0.5;
-                    continue;
-                }
-                VectorReal candidate_end = run_cycle_from(candidate_start, candidate_period, false).end;
-                const double candidate_residual =
-                    worst_solution_update(candidate_end, candidate_start, num_nodes, settings).first;
-                const double candidate_phase_error = settings.pss_autonomous
-                    ? std::abs(candidate_start[phase_index] - phase_reference) /
-                          std::max(settings.vntol + settings.reltol * std::abs(phase_reference), 1e-30)
-                    : 0.0;
-                const double candidate_merit = std::max(candidate_residual, candidate_phase_error);
-                const double best_phase_error = settings.pss_autonomous
-                    ? std::abs(cycle_start[phase_index] - phase_reference) /
-                          std::max(settings.vntol + settings.reltol * std::abs(phase_reference), 1e-30)
-                    : 0.0;
-                const double best_merit = std::max(best_residual, best_phase_error);
-                if (std::isfinite(candidate_merit) && candidate_merit < best_merit) {
-                    best_residual = candidate_residual;
-                    best_state = candidate_end;
-                    best_period = candidate_period;
-                    improved = true;
-                    break;
-                }
-                alpha *= 0.5;
-            }
-            if (improved) {
-                pss_state = best_state;
-                residual = best_residual;
-                period = best_period;
-                frequency_hz = 1.0 / period;
-                std::cout << std::scientific << std::setprecision(9)
-                          << "PSS Newton correction: residual=" << residual
-                          << " period=" << period
-                          << " frequency=" << frequency_hz
-                          << " damping=" << alpha
-                          << std::endl;
-                if (residual <= settings.pss_residual_goal) {
-                    converged_iter = iter;
-                    break;
-                }
-            } else {
-                pss_state = run_cycle_from(cycle_start, period, false).end;
-            }
-        }
-        if (converged_iter <= 0) {
-            throw std::runtime_error("PSS did not converge to the requested periodic residual; increase TSTAB, MAX_PSS_ITER, improve the oscillator frequency estimate, or use HB for mildly nonlinear RF circuits.");
-        }
-        x_dc = pss_state;
-        std::cout << std::scientific << std::setprecision(9)
-                  << "PSS Converged: iterations=" << converged_iter
-                  << " residual=" << residual
-                  << " period=" << period
-                  << " frequency=" << frequency_hz
-                  << std::endl;
-        std::cout << std::scientific << std::setprecision(9)
-                  << "PSS summary: oscillator=" << (settings.pss_autonomous ? "yes" : "no")
-                  << " autonomous=" << (settings.pss_autonomous ? "yes" : "no")
-                  << " tstab_seconds=" << tstab
-                  << " adaptive_orbit=" << ((settings.tran_adaptive || settings.pss_adaptive) ? "yes" : "no")
-                  << " shooting_iterations=" << converged_iter
-                  << " newton_iterations=" << shooting_newton_iterations
-                  << " monodromy_columns=" << monodromy_columns
-                  << " variational_steps=" << variational_steps
-                  << " direct_period_columns=" << direct_period_columns
-                  << " finite_difference_period_columns=" << finite_difference_period_columns
-                  << " residual=" << residual
-                  << " period=" << period
-                  << " frequency=" << frequency_hz
-                  << " phase_unknown=" << phase_index
-                  << std::endl;
-        std::vector<TranSample> pss_orbit_samples;
-        {
-            TransientOutput pss_out(output_file, output_format, netlist, num_nodes);
-            if (pss_out.toFile()) {
-                std::cout << "Waveform output: " << output_file << std::endl;
-                pss_orbit_samples.push_back({0.0, pss_state});
-                pss_out.write(0.0, pss_state, num_nodes);
-                PssOrbitResult final_orbit = integrate_pss_interval(pss_state, period, 0.0, false, &pss_out, &pss_orbit_samples);
-                pss_out.finalize();
-                std::cout << "PSS orbit output: one settled period saved with "
-                          << pss_out.signals().size() << " signal(s)." << std::endl;
-                x_dc = final_orbit.end;
-            }
-        }
-        if (settings.run_pnoise_after_pss) {
-            if (settings.out_node < 0 || settings.out_node >= num_nodes) {
-                throw std::runtime_error(".PNOISE output node must be a non-ground circuit node");
-            }
-            const auto offsets = make_frequency_grid(settings);
-            if (offsets.empty()) {
-                throw std::runtime_error(".PNOISE requires a valid positive offset-frequency sweep.");
-            }
-            const double carrier_hz = settings.pnoise_carrier_hz > 0.0
-                ? settings.pnoise_carrier_hz
-                : (!settings.f_fund.empty() && settings.f_fund[0] > 0.0 ? settings.f_fund[0] : frequency_hz);
-            double max_output_slew = 0.0;
-            for (std::size_t i = 1; i < pss_orbit_samples.size(); ++i) {
-                const double dt = pss_orbit_samples[i].time - pss_orbit_samples[i - 1].time;
-                if (dt <= 0.0) continue;
-                const double dv = probe_value(pss_orbit_samples[i].x, settings.out_node, -1) -
-                                  probe_value(pss_orbit_samples[i - 1].x, settings.out_node, -1);
-                max_output_slew = std::max(max_output_slew, std::abs(dv / dt));
-            }
-            if (!(max_output_slew > 0.0) || !(carrier_hz > 0.0)) {
-                throw std::runtime_error(".PNOISE could not estimate carrier frequency and output slew from the converged PSS orbit.");
-            }
-            const std::string pnoise_path = output_file.empty()
-                ? std::string()
-                : (std::filesystem::path(output_file).parent_path() /
-                   (std::filesystem::path(output_file).stem().string() + "_pnoise.raw")).string();
-            if (!pnoise_path.empty()) {
-                std::ofstream pnoise(pnoise_path, std::ios::out | std::ios::trunc);
-                if (!pnoise.is_open()) {
-                    throw std::runtime_error("Could not open PNOISE output file: " + pnoise_path);
-                }
-                const std::string output_label = settings.pnoise_output_label.empty()
-                    ? voltage_probe_label(netlist, settings.out_node, -1)
-                    : settings.pnoise_output_label;
-                pnoise << "Title: GSPICE PNOISE output\n";
-                pnoise << "Plotname: Periodic Noise Analysis\n";
-                pnoise << "Flags: real\n";
-                pnoise << "No. Variables: 5\n";
-                pnoise << "No. Points: " << offsets.size() << "\n";
-                pnoise << "Variables:\n";
-                pnoise << "0\tfrequency\tfrequency\n";
-                pnoise << "1\tONOISE(" << output_label << ")\tnoise\n";
-                pnoise << "2\tSPHI(" << output_label << ")\tnoise\n";
-                pnoise << "3\tL(" << output_label << ")\tnoise\n";
-                pnoise << "4\tJRMS(" << output_label << ")\ttime\n";
-                pnoise << "Values:\n";
-                double integrated_time_jitter_psd = 0.0;
-                double previous_offset = 0.0;
-                double previous_time_jitter_psd = 0.0;
-                bool has_previous_offset = false;
-                std::size_t last_noise_source_count = 0;
-                for (double offset : offsets) {
-                    const double f = std::max(offset, 1e-30);
-                    const double omega = 2.0 * M_PI * f;
-                    const NoiseTransferResult noise = solve_output_noise_psd(
-                        devices, num_devs, matrix_size, num_nodes, settings.out_node,
-                        omega, pss_state, settings, &complex_solver_context);
-                    last_noise_source_count = noise.source_count;
-                    const double output_psd = std::max(noise.output_psd, 0.0);
-                    const double onoise = std::sqrt(output_psd);
-                    const double time_jitter_psd = output_psd / std::max(max_output_slew * max_output_slew, 1e-300);
-                    if (has_previous_offset && f > previous_offset) {
-                        integrated_time_jitter_psd += 0.5 * (previous_time_jitter_psd + time_jitter_psd) * (f - previous_offset);
-                    }
-                    has_previous_offset = true;
-                    previous_offset = f;
-                    previous_time_jitter_psd = time_jitter_psd;
-                    const double sphi = std::pow(2.0 * M_PI * carrier_hz, 2.0) * time_jitter_psd;
-                    const double phase_noise_db = 10.0 * std::log10(std::max(0.5 * sphi, 1e-300));
-                    const double jitter_rms = std::sqrt(std::max(integrated_time_jitter_psd, 0.0));
-                    pnoise << std::scientific << std::setprecision(12)
-                           << f << " " << onoise << " " << sphi << " "
-                           << phase_noise_db << " " << jitter_rms << "\n";
-                }
-                pnoise.close();
-                std::cout << "PNOISE output: " << pnoise_path << std::endl;
-                std::cout << "PNOISE summary: carrier=" << std::scientific << carrier_hz
-                          << " offsets=" << offsets.size()
-                          << " output=" << output_label
-                          << " slew=" << max_output_slew
-                          << " sources=" << last_noise_source_count
-                          << " model=small_signal_noise_to_pss_slew" << std::endl;
-            }
-        }
+        std::cout << std::endl;
     } else if (settings.type == "HB") {
         std::cout << "Starting Harmonic Balance Analysis (Multi-Tone, FFT-accelerated)..." << std::endl;
         // ----------------------------------------------------------------
         // Pillar 3: Correct HB using IFFT → time-domain stamp → FFT → Newton.
         // The prior implementation stamped directly in the frequency domain,
         // which is only correct for linear devices. Nonlinear devices (diodes,
-        // MOSFETs and other nonlinear devices must be evaluated at each time-domain sample
+        // MOSFETs, modelDevice models) must be evaluated at each time-domain sample
         // point and their contributions transformed back to frequency domain.
         //
         // The Fourier class now uses a radix-2 Cooley-Tukey FFT (O(N log N))
@@ -4097,16 +4057,96 @@ void run_simulation(
         }
         std::cout << "HB Converged (FFT-accelerated; validate against reference simulator)." << std::endl;
     } else if (settings.type == "PAC") {
-        std::cout << "Starting Periodic AC..." << std::endl;
-        int N = 5; int K = 2 * N + 1; int n_vars = matrix_size * K;
-        double f = settings.f_start; double dec_mult = std::pow(10.0, 1.0 / settings.points_per_dec);
+        if (!pss_op) throw std::runtime_error(".PAC requires a converged PSS operating point");
+        std::cout << "Starting PAC from converged PSS operating point..." << std::endl;
+        double f = settings.f_start;
+        double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
         while (f <= settings.f_stop * 1.01) {
-            SparseMatrixReal J_pac(n_vars); VectorReal b_pac(n_vars);
-            for (const auto& dev : netlist.getDevices()) dev->pacStamp(J_pac, b_pac, f, (settings.f_fund.size() > 0 ? settings.f_fund[0] : 0.0), N, x_dc);
-            VectorReal x_pac = KluSolverReal::solve(J_pac, b_pac, &real_solver_context);
-            std::cout << std::scientific << f << " | PAC Solved. Mag: " << std::abs(x_pac[0]) << std::endl;
+            const double omega = 2.0 * 3.14159265358979323846 * f;
+            SparseMatrixComplex J_sparse(matrix_size);
+            VectorComplex b_ac(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
+            #pragma omp parallel for if(use_parallel_stamp)
+            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_ac, omega, pss_op->state);
+            VectorComplex x_ac = KluSolverComplex::solve(J_sparse, b_ac, &complex_solver_context);
+            std::cout << std::scientific << std::setprecision(9)
+                      << f << " | ";
+            for (int i = 0; i < num_nodes; ++i) {
+                std::cout << "V(" << netlist.getNodeName(i) << ")="
+                          << std::abs(x_ac[i]) << " ";
+            }
+            std::cout << std::endl;
             f *= dec_mult;
         }
+    } else if (settings.type == "PNOISE") {
+        if (!pss_op) throw std::runtime_error(".PNOISE requires a converged PSS operating point");
+        std::cout << "Starting PNoise from converged PSS operating point..." << std::endl;
+        if (settings.out_node < 0) throw std::runtime_error(".PNOISE requires an output node");
+        double f = settings.f_start;
+        double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
+        int pnoise_offsets = 0;
+        std::cout << "freq | pnoise_sqrt(V/rtHz) pnoise_psd(V^2/Hz) noise_sources" << std::endl;
+        while (f <= settings.f_stop * 1.01) {
+            const double omega = 2.0 * 3.14159265358979323846 * f;
+            SparseMatrixComplex J_sparse(matrix_size);
+            VectorComplex b_zero(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
+            #pragma omp parallel for if(use_parallel_stamp)
+            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_zero, omega, pss_op->state);
+            std::vector<NoiseSource> noise_sources;
+            for (const auto& dev : devices) dev->collectNoiseSources(omega, pss_op->state, noise_sources);
+            double output_psd = 0.0;
+            for (const auto& source : noise_sources) {
+                if (source.currentPsd <= 0.0) continue;
+                VectorComplex b_noise(matrix_size);
+                b_noise.add(source.nodePos, {-1.0, 0.0});
+                b_noise.add(source.nodeNeg, {1.0, 0.0});
+                VectorComplex transfer = KluSolverComplex::solve(J_sparse, b_noise, &complex_solver_context);
+                output_psd += std::norm(transfer[settings.out_node]) * source.currentPsd;
+            }
+            std::cout << std::scientific << std::setprecision(9)
+                      << f << " | " << std::sqrt(std::max(output_psd, 0.0))
+                      << " " << output_psd
+                      << " " << noise_sources.size()
+                      << std::endl;
+            f *= dec_mult;
+            ++pnoise_offsets;
+        }
+        std::cout << "PNOISE summary: offsets=" << pnoise_offsets << std::endl;
+    } else if (settings.type == "PSSSTB") {
+        if (!pss_op) throw std::runtime_error(".PSSSTB requires a converged PSS operating point");
+        std::cout << "Starting PSTB from converged PSS operating point..." << std::endl;
+        if (probes.empty()) {
+            throw std::runtime_error(".PSSSTB requires a stability probe");
+        }
+        double f = settings.f_start;
+        double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
+        while (f <= settings.f_stop * 1.01) {
+            double omega = 2.0 * 3.14159265358979 * f;
+            SparseMatrixComplex Jv(matrix_size); VectorComplex bv(matrix_size);
+            for (const auto& dev : devices) {
+                auto* p = dynamic_cast<StabilityProbe*>(dev.get());
+                if (p) p->stbStamp(Jv, bv, 1); else stamp_device_ac(*dev, Jv, bv, omega, pss_op->state);
+            }
+            VectorComplex xv = KluSolverComplex::solve(Jv, bv, &complex_solver_context);
+            std::complex<double> Tv = -xv[probes[0]->getNodeNeg()] / xv[probes[0]->getNodePos()];
+            SparseMatrixComplex Ji(matrix_size); VectorComplex bi(matrix_size);
+            for (const auto& dev : devices) {
+                auto* p = dynamic_cast<StabilityProbe*>(dev.get());
+                if (p) p->stbStamp(Ji, bi, 2); else stamp_device_ac(*dev, Ji, bi, omega, pss_op->state);
+            }
+            VectorComplex xi = KluSolverComplex::solve(Ji, bi, &complex_solver_context);
+            std::complex<double> Ti = xi[probes[0]->getBranchIndex()];
+            std::complex<double> T = (Tv * Ti - std::complex<double>(1,0)) / (Tv + Ti + std::complex<double>(2,0));
+            std::cout << std::scientific << f << " | Mag: " << std::abs(T)
+                      << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
+            f *= dec_mult;
+        }
+    } else if (settings.type == "HBAC" || settings.type == "HBNOISE" ||
+               settings.type == "HBSP" || settings.type == "HBSTB") {
+        throw std::runtime_error("." + settings.type + " requires a validated HB/PSS periodic operating point; refusing to linearize from DC data");
     } else {
         std::cout << "DC Operating Point Converged: ";
         for(int i=0; i<num_nodes; ++i) {
@@ -4114,6 +4154,9 @@ void run_simulation(
                       << "V [" << netlist.getNodeName(i) << "] ";
         }
         std::cout << std::endl;
+        if (upper_copy(output_format) == "RAW") {
+            write_operating_point_raw(output_file, netlist, x_dc, num_nodes);
+        }
         for (const auto& spec : settings.output_specs) {
             const double measured = spec_value(x_dc, spec);
             const bool passes = spec_passes(spec, measured);
@@ -4147,6 +4190,7 @@ void run_simulation(
               << " ext_klu_calls=" << real_solver_stats.external_klu_calls
               << " ext_klu_reuse=" << real_solver_stats.external_klu_symbolic_reuse
               << " ext_klu_rebuilds=" << real_solver_stats.external_klu_symbolic_rebuilds
+              << " ext_klu_refactor=" << real_solver_stats.external_klu_refactor_hits
               << " ext_klu_failures=" << real_solver_stats.external_klu_failures
               << " ext_klu=" << real_solver_stats.external_klu_seconds
               << " structure=" << real_solver_stats.structure_seconds
@@ -4171,6 +4215,7 @@ void run_simulation(
                   << " ext_klu_calls=" << complex_solver_stats.external_klu_calls
                   << " ext_klu_reuse=" << complex_solver_stats.external_klu_symbolic_reuse
                   << " ext_klu_rebuilds=" << complex_solver_stats.external_klu_symbolic_rebuilds
+                  << " ext_klu_refactor=" << complex_solver_stats.external_klu_refactor_hits
                   << " ext_klu_failures=" << complex_solver_stats.external_klu_failures
                   << " ext_klu=" << complex_solver_stats.external_klu_seconds
                   << " structure=" << complex_solver_stats.structure_seconds
@@ -4185,91 +4230,29 @@ void run_simulation(
     std::cout << "Simulation Completed Successfully." << std::endl;
 }
 
-std::string find_tools_script(const std::string& exe_path, const std::string& script_name) {
-    namespace fs = std::filesystem;
-    fs::path exe_dir = fs::absolute(fs::path(exe_path).parent_path());
-    fs::path candidates[] = {
-        exe_dir / ".." / ".." / "tools" / script_name,
-        exe_dir / ".." / "tools" / script_name,
-        exe_dir / script_name,
-        fs::path("tools") / script_name,
-    };
-    for (const auto& p : candidates) {
-        fs::path norm = p.lexically_normal();
-        if (fs::exists(norm)) return norm.string();
-    }
-    return (fs::path("tools") / script_name).string();
-}
-
 void print_usage() {
     std::cout << "Usage: gspice <input_file.sp> [options]\nOptions:\n";
-    std::cout << "  -v, --version            Display version information\n";
-    std::cout << "  -h, --help               Display this help message\n";
-    std::cout << "  -t, --threads <n>        Set parallel threads (1-16, default: 1)\n";
-    std::cout << "  -o, --output <file>      Write transient results to a file\n";
-    std::cout << "  --format <raw|csv>       Select transient output format (default: extension or raw)\n";
-    std::cout << "  --save <all|selected|none> Override transient waveform save mode\n";
-    std::cout << "  --adaptive-maxstep       Ignore .TRAN tmax and use adaptive LTE step ceiling\n";
-    std::cout << "  --sim-env <local|ssh>    Simulation environment (default: local)\n";
-    std::cout << "  --ssh-host <host>        Remote hostname or IP\n";
-    std::cout << "  --ssh-user <user>        SSH username\n";
-    std::cout << "  --ssh-key <file>         SSH private key path (optional)\n";
-    std::cout << "  --remote-gspice <path>   Path to gspice binary on remote\n";
-    std::cout << "  --capabilities           Print machine-readable capability maturity information\n";
-    std::cout << "\nSSH mode (-–sim-env ssh) streams the netlist via SCP, runs gspice on the\n";
-    std::cout << "remote machine, and downloads the .raw result back. Requires SSH access\n";
-    std::cout << "and Python on this machine.\n";
+    std::cout << "  -v, --version    Display version information\n";
+    std::cout << "  -h, --help       Display this help message\n";
+    std::cout << "  -t, --threads <n> Set parallel threads (1-16, default: 1)\n";
+    std::cout << "  -o, --output <file>  Write transient results to a file\n";
+    std::cout << "  --format <raw|csv>   Select transient output format (default: extension or raw)\n";
+    std::cout << "  --save <all|selected|none>  Select transient waveform save policy\n";
+    std::cout << "  --adaptive-maxstep   Accept SimENV adaptive maxstep mode (deck controls timestep cap)\n";
+    std::cout << "  --capabilities       Print machine-readable capability maturity information\n";
 }
 
 void print_capabilities() {
     std::cout << gspice::FeatureRegistry::instance().getCapabilitiesJson();
 }
 
-int run_ssh_simulation(
-    const std::string& input_file,
-    const std::string& output_file,
-    const std::string& host,
-    const std::string& user,
-    const std::string& key,
-    const std::string& remote_gspice,
-    const std::string& exe_path,
-    const std::string& save_mode_override,
-    bool adaptive_maxstep_override) {
-
-    std::string script = find_tools_script(exe_path, "gspice_ssh.py");
-    const std::string effective_output_file = output_file.empty()
-        ? (std::filesystem::path(input_file).stem().string() + ".raw")
-        : output_file;
-
-    std::string cmd = "python \"" + script + "\"";
-    cmd += " \"" + input_file + "\"";
-    cmd += " --host " + host;
-    cmd += " --user " + user;
-    if (!key.empty()) cmd += " --key \"" + key + "\"";
-    if (!remote_gspice.empty() && remote_gspice != "gspice") cmd += " --remote-gspice \"" + remote_gspice + "\"";
-    cmd += " --output \"" + effective_output_file + "\"";
-    if (!save_mode_override.empty()) cmd += " --save " + save_mode_override;
-    if (adaptive_maxstep_override) cmd += " --adaptive-maxstep";
-    cmd += " --deploy-binary";
-    if (!exe_path.empty()) cmd += " --local-binary \"" + exe_path + "\"";
-
-    int rc = std::system(cmd.c_str());
-    if (rc != 0 && rc != -1) {
-        return rc;
-    }
-    return 0;
-}
-
 int main(int argc, char* argv[]) {
     std::string input_file = "";
     std::string output_file = "";
     std::string output_format = "RAW";
+    std::string save_mode = "";
     bool format_explicit = false;
-    std::string save_mode_override;
-    bool adaptive_maxstep_override = false;
     int num_threads = std::max(1, omp_get_max_threads());
-    std::string sim_env = "local";
-    std::string ssh_host, ssh_user, ssh_key, remote_gspice;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") { print_usage(); return 0; }
@@ -4301,49 +4284,14 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--save") {
             if (i + 1 >= argc) { std::cerr << "ERROR: --save requires all, selected, or none\n"; return 64; }
-            save_mode_override = upper_copy(argv[++i]);
-            if (save_mode_override != "ALL" && save_mode_override != "SELECTED" &&
-                save_mode_override != "NONE") {
-                std::cerr << "ERROR: --save must be all, selected, or none\n";
+            save_mode = upper_copy(argv[++i]);
+            if (save_mode != "ALL" && save_mode != "SELECTED" && save_mode != "NONE") {
+                std::cerr << "ERROR: unsupported save mode; expected all, selected, or none\n";
                 return 64;
             }
             continue;
         }
-        if (arg == "--save-all") {
-            save_mode_override = "ALL";
-            continue;
-        }
-        if (arg == "--adaptive-maxstep" || arg == "--ignore-tran-tmax") {
-            adaptive_maxstep_override = true;
-            continue;
-        }
-        if (arg == "--sim-env") {
-            if (i + 1 >= argc) { std::cerr << "ERROR: --sim-env requires local or ssh\n"; return 64; }
-            sim_env = upper_copy(argv[++i]);
-            if (sim_env != "LOCAL" && sim_env != "SSH") {
-                std::cerr << "ERROR: --sim-env must be 'local' or 'ssh'\n";
-                return 64;
-            }
-            continue;
-        }
-        if (arg == "--ssh-host") {
-            if (i + 1 >= argc) { std::cerr << "ERROR: --ssh-host requires a hostname\n"; return 64; }
-            ssh_host = argv[++i];
-            continue;
-        }
-        if (arg == "--ssh-user") {
-            if (i + 1 >= argc) { std::cerr << "ERROR: --ssh-user requires a username\n"; return 64; }
-            ssh_user = argv[++i];
-            continue;
-        }
-        if (arg == "--ssh-key") {
-            if (i + 1 >= argc) { std::cerr << "ERROR: --ssh-key requires a file path\n"; return 64; }
-            ssh_key = argv[++i];
-            continue;
-        }
-        if (arg == "--remote-gspice") {
-            if (i + 1 >= argc) { std::cerr << "ERROR: --remote-gspice requires a path\n"; return 64; }
-            remote_gspice = argv[++i];
+        if (arg == "--adaptive-maxstep") {
             continue;
         }
         if (!arg.empty() && arg[0] == '-') {
@@ -4356,49 +4304,22 @@ int main(int argc, char* argv[]) {
         }
         input_file = arg;
     }
-    if (input_file.empty()) { print_usage(); return 0; }
-
-    if (sim_env == "SSH") {
-        if (ssh_host.empty()) {
-            std::cout << "Remote host: ";
-            std::getline(std::cin, ssh_host);
-        }
-        if (ssh_user.empty()) {
-            std::cout << "SSH user: ";
-            std::getline(std::cin, ssh_user);
-        }
-        if (remote_gspice.empty()) {
-            remote_gspice = "gspice";
-        }
-        return run_ssh_simulation(input_file, output_file, ssh_host, ssh_user,
-                                  ssh_key, remote_gspice, argv[0],
-                                  save_mode_override, adaptive_maxstep_override);
-    }
-
     num_threads = std::clamp(num_threads, 1, 16);
+    if (input_file.empty()) { print_usage(); return 0; }
     if (!format_explicit && !output_file.empty()) {
         std::string extension = upper_copy(std::filesystem::path(output_file).extension().string());
         if (extension == ".CSV") output_format = "CSV";
     }
     Netlist netlist = Parser::parse(input_file);
-    if (adaptive_maxstep_override || !save_mode_override.empty()) {
+    if (!save_mode.empty()) {
         SimulationSettings settings = netlist.getSettings();
-        if (adaptive_maxstep_override) {
-            settings.ignore_tran_tmax = true;
-            settings.t_max_step = 0.0;
-        }
-        if (save_mode_override == "ALL") {
+        if (save_mode == "ALL") {
             settings.save_all = true;
             settings.save_none = false;
-            settings.saves.erase(
-                std::remove_if(settings.saves.begin(), settings.saves.end(), [](const SaveSpec& save) {
-                    return upper_copy(save.kind) != "I";
-                }),
-                settings.saves.end());
-        } else if (save_mode_override == "SELECTED") {
+        } else if (save_mode == "SELECTED") {
             settings.save_all = false;
             settings.save_none = false;
-        } else if (save_mode_override == "NONE") {
+        } else if (save_mode == "NONE") {
             settings.save_all = false;
             settings.save_none = true;
             settings.saves.clear();

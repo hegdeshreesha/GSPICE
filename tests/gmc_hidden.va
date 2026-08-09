@@ -1,0 +1,15 @@
+module psp_like(d, g, s, b, Td, Tint);
+    electrical d, g, s, b, Td, Tint;
+    terminal 4;
+    collapsible Tint with s;
+    parameter real Rd = 100;
+    parameter real KP = 2m;
+    parameter real Cj = 3p;
+    real vch;
+    analog begin
+        vch = KP * (V(g) - V(s));
+        I(d, Td) <+ (V(d) - V(Td)) / Rd;
+        I(Td, s) <+ vch;
+        I(Tint, s) <+ ddt(Cj * (V(Tint) - V(s)));
+    end
+endmodule

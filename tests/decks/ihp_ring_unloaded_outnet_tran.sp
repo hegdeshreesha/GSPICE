@@ -1,0 +1,28 @@
+Lumen IHP ring oscillator unloaded OUTNET transient regression
+.LIB "C:\EDA\LumenCircuitStudio\external\ihp_pdk\ihp-sg13g2\libs.tech\ngspice\models\cornerMOSlv.lib" mos_tt
+
+X10 STG1 STG3 VDD VDD sg13_lv_pmos l=0.13u w=0.15u ng=1 m=2
+X14 OUTNET STG3 VDD VDD sg13_lv_pmos l=0.13u w=0.15u ng=1 m=2
+X15 STG1 STG3 VSS VSS sg13_lv_nmos l=0.13u w=0.15u ng=1 m=1
+X16 STG2 STG1 VSS VSS sg13_lv_nmos l=0.13u w=0.15u ng=1 m=1
+X17 STG3 STG2 VSS VSS sg13_lv_nmos l=0.13u w=0.15u ng=1 m=1
+X18 OUTNET STG3 VSS VSS sg13_lv_nmos l=0.13u w=0.15u ng=1 m=1
+V0 VSS 0 DC 0
+V1 VDD VSS DC 1
+X0 STG2 STG1 VDD VDD sg13_lv_pmos l=0.13u w=0.15u ng=1 m=2
+X1 STG3 STG2 VDD VDD sg13_lv_pmos l=0.13u w=0.15u ng=1 m=2
+C0 STG1 VSS 100f
+C1 STG2 VSS 100f
+C2 STG3 VSS 100f
+
+.NODESET STG3=0
+.NODESET STG2=1
+.NODESET STG1=0
+.IC STG3=0
+.IC STG2=1
+.IC STG1=0
+
+.OPTIONS ACCURACY=VERYHIGH METHOD=AUTO ADAPTIVE=1 SAVE=ALL SOLVER=AUTO TRAN_STAMP_CACHE=1 RELTOL=1e-4 VNTOL=100n ABSTOL=10f TRTOL=1 LTE_RELTOL=3e-4 TRABSTOL=100n ITL4=120 MAXSTEP=AUTO CSHUNT=0.25f
+.TRAN 2e-11 100n UIC
+.SAVE ALL
+.END

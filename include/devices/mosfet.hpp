@@ -283,9 +283,17 @@ private:
     std::array<bool, 4> capCurrentValid_{};
 
     static bool primitiveMosTransientCapsEnabled() {
+#ifdef _MSC_VER
+        char* buffer = nullptr;
+        size_t length = 0;
+        if (_dupenv_s(&buffer, &length, "GSPICE_ENABLE_PRIMITIVE_MOS_CAPS") != 0 || !buffer) return true;
+        std::string setting(buffer);
+        std::free(buffer);
+#else
         const char* value = std::getenv("GSPICE_ENABLE_PRIMITIVE_MOS_CAPS");
         if (!value) return true;
         std::string setting(value);
+#endif
         std::transform(setting.begin(), setting.end(), setting.begin(), [](unsigned char ch) {
             return static_cast<char>(std::tolower(ch));
         });

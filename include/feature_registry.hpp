@@ -5,6 +5,10 @@
 #include <map>
 #include <iostream>
 
+#ifndef GSPICE_VERSION
+#define GSPICE_VERSION "development"
+#endif
+
 namespace gspice {
 
 enum class FeatureMaturity {
@@ -51,7 +55,7 @@ public:
     std::string getCapabilitiesJson() const {
         std::string json = "{\n";
         json += "  \"name\": \"GSPICE\",\n";
-        json += "  \"version\": \"0.1.0-beta\",\n";
+        json += "  \"version\": \"" GSPICE_VERSION "\",\n";
         json += "  \"maturity\": \"academic-beta\",\n";
 #if defined(GSPICE_HAVE_SUITESPARSE_KLU) && GSPICE_HAVE_SUITESPARSE_KLU
         json += "  \"sparse_backend\": \"SuiteSparse-KLU\",\n";
@@ -84,7 +88,24 @@ private:
         registerFeature("dc", FeatureMaturity::Validated, true, "DC sweep analysis");
         registerFeature("tran", FeatureMaturity::Validated, true, "Transient analysis");
         registerFeature("ac", FeatureMaturity::Validated, true, "AC small-signal analysis");
-        registerFeature("native_compact_models", FeatureMaturity::Wired, false, "Native compact model registry");
+        registerFeature("native_compact_models", FeatureMaturity::Tested, true, "Native GMC/GSDI model registry with fail-closed unsupported models");
+        registerFeature("bsim3_gsdi", FeatureMaturity::Tested, true, "Native BSIM3 level-49 OP/DC/AC/tran/noise route through GSDI/GMC with binned geometry, leakage, and verbose compatibility diagnostics");
+        registerFeature("bsim4_gsdi", FeatureMaturity::Tested, true, "Native BSIM4 level-54 OP/DC/AC/tran/noise route through GSDI/GMC");
+        registerFeature("bsim3_full_reference", FeatureMaturity::Prototype, false, "Full independent benchmark parity is not yet complete");
+        registerFeature("bsim4_full_reference", FeatureMaturity::Prototype, false, "Full independent BSIM4.8.3 benchmark parity is not yet complete");
+        registerFeature("gmc_generated_noise", FeatureMaturity::Tested, true, "GMC-generated white_noise/flicker_noise sources emit through GSDI noise vectors");
+        registerFeature("juncap2_ideal_srh_bbt", FeatureMaturity::Tested, true, "Native JUNCAP2 ideal, SRH, and BBT current branches");
+        registerFeature("juncap2_tat", FeatureMaturity::Tested, true, "Native smoothed TAT branch with derivative coverage");
+        registerFeature("juncap2_avalanche", FeatureMaturity::Tested, true, "Native smoothed reverse-breakdown branch with derivative coverage");
+        registerFeature("psp103_native", FeatureMaturity::Tested, true, "Native PSP103 OP/DC/AC/tran/noise path with parser and IHP alias coverage; not full OpenVAF equation parity");
+        registerFeature("psp103_full", FeatureMaturity::Wired, false, "Full PSP103/OpenVAF equation parity is not complete; use psp103_native for the tested native subset");
+        registerFeature("psp103_full_reference", FeatureMaturity::Prototype, false, "Full PSP103/OpenVAF equation parity and arbitrary OSDI runtime loading are not yet complete");
+        registerFeature("ihp_psp103_matrix", FeatureMaturity::Tested, true, "IHP LV PSP OP/DC/AC/tran/noise, corner, temperature, geometry, and mismatch smoke coverage");
+        registerFeature("ihp_psp_rf_smoke", FeatureMaturity::Tested, true, "IHP LV PSP RF model cards route through native PSP and pass small-signal smoke coverage");
+        registerFeature("ihp_psp_rf_full", FeatureMaturity::Tested, true, "IHP LV PSP RF wrappers route natively with NG/M/DTA aliasing and RF gate-resistance stamping");
+        registerFeature("ihp_passive_wrapper_smoke", FeatureMaturity::Tested, true, "IHP passive wrappers run natively with R3 effective geometry/contact/corner/temperature terms and CMIM area/perimeter/temperature capacitance");
+        registerFeature("ihp_mosvar_cv_smoke", FeatureMaturity::Tested, true, "IHP HV svaricap routes through native voltage-dependent MOSVAR charge plus parasitic RC pieces");
+        registerFeature("ihp_passive_wrapper_full", FeatureMaturity::Tested, true, "IHP resistor, CMIM, parasitic-cap, tap, and MOSVAR wrappers route natively without user-visible compatibility warnings");
         registerFeature("c_api", FeatureMaturity::Tested, true, "C API interface (SimulatorContext)");
         registerFeature("simulator_core", FeatureMaturity::Tested, true, "Decoupled simulator context");
         registerFeature("adjoint_sensitivity", FeatureMaturity::Tested, true, "Adjoint linear solver sensitivity engine");

@@ -6,10 +6,14 @@
 #include <chrono>
 #include <ctime>
 
+#ifndef GSPICE_VERSION
+#define GSPICE_VERSION "development"
+#endif
+
 namespace gspice {
 
 struct ProvenanceInfo {
-    std::string simulatorVersion = "0.1.0-beta";
+    std::string simulatorVersion = GSPICE_VERSION;
     std::string gitCommitHash = "2026.07.23-academic-beta";
     std::string buildPlatform = "Windows / MSVC / OpenMP";
     std::string timestamp;

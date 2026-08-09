@@ -15,7 +15,7 @@ public:
      */
     static double parseValue(std::string str) {
         if (str.empty()) return 0.0;
-        
+
         // Remove trailing non-numeric characters except suffixes
         // (SPICE often allows "1kOhm" -> "1k")
         std::string suffix = "";
@@ -24,8 +24,19 @@ public:
             suffix = str.substr(last_digit + 1);
             str = str.substr(0, last_digit + 1);
         }
+        // Non-numeric tokens (e.g. "STEP=50p", "UIC") must not reach std::stod:
+        // a leading letter means the caller handed us a keyword, not a value.
+        if (str.empty() || (!std::isdigit(static_cast<unsigned char>(str[0])) &&
+                            str[0] != '.' && str[0] != '+' && str[0] != '-')) {
+            return 0.0;
+        }
 
-        double value = std::stod(str);
+        double value = 0.0;
+        try {
+            value = std::stod(str);
+        } catch (const std::exception&) {
+            return 0.0;
+        }
         if (suffix.empty()) return value;
 
         char s = std::tolower(suffix[0]);

@@ -5,8 +5,20 @@
 #include "devices/diode.hpp"
 #include "devices/voltage_source.hpp"
 #include "devices/inductor.hpp"
+#include "devices/mosvar_capacitor.hpp"
 #include "devices/port.hpp"
 #include "devices/mosfet.hpp"
+#include "devices/gdi_device.hpp"
+#include "devices/gmc_mosfet.hpp"
+#include "devices/bsim3_model.hpp"
+#include "devices/bsim3_parameters.hpp"
+#include "devices/bsim4_model.hpp"
+#include "devices/bsim4_parameters.hpp"
+#include "devices/bsim_translator.hpp"
+#include "devices/psp103_parameters.hpp"
+#include "devices/psp103_model.hpp"
+#include "devices/psp103_gsdi.hpp"
+#include "devices/gmc_juncap_express.hpp"
 #include "devices/probe.hpp"
 #include "devices/current_source.hpp"
 #include "devices/multi_port.hpp"
@@ -14,14 +26,23 @@
 #include "devices/bjt.hpp"
 #include "devices/behavioral_source.hpp"
 #include "expression.hpp"
+#include "gsdi_device_adapter.hpp"
+#include "gmc.hpp"
+#ifdef GSPICE_HAVE_GMC_GENERATED
+#include "gmc_hidden.hpp"
+#include "gmc_va_probe.hpp"
+#endif
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
+#include <limits>
 #include <unordered_map>
 #include <set>
 #include <vector>
@@ -71,6 +92,33 @@ std::string stripQuotes(std::string text) {
     return text;
 }
 
+std::string readEnvVar(const char* envName) {
+#ifdef _MSC_VER
+    char* buffer = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&buffer, &length, envName) != 0 || !buffer) {
+        return "";
+    }
+    std::string value(buffer);
+    std::free(buffer);
+    return value;
+#else
+    const char* value = std::getenv(envName);
+    return value ? std::string(value) : "";
+#endif
+}
+
+bool envFlagEnabled(const char* envName) {
+    std::string value = readEnvVar(envName);
+    if (value.empty()) return false;
+    value = toUpperCopy(value);
+    return value == "1" || value == "YES" || value == "TRUE" || value == "ON";
+}
+
+bool verboseCompatWarnings() {
+    return envFlagEnabled("GSPICE_VERBOSE_COMPAT_WARNINGS");
+}
+
 bool tryParseSpiceValue(const std::string& token, double& out);
 bool isGroundName(const std::string& name);
 
@@ -115,12 +163,9 @@ bool parseSaveToken(const std::string& token, gspice::SaveSpec& save) {
     }
     std::string cleaned = stripQuotes(trimCopy(token));
     if (cleaned.empty()) return false;
-    if (toUpperCopy(cleaned).rfind("I(", 0) == 0 && cleaned.back() == ')') {
-        std::string source = trimCopy(cleaned.substr(2, cleaned.size() - 3));
-        if (source.empty()) return false;
+    if (toUpperCopy(cleaned).rfind("I(", 0) == 0) {
         save.kind = "I";
-        save.node_pos = source;
-        save.node_neg = "0";
+        save.node_pos = cleaned;
         return true;
     }
     save.kind = "V";
@@ -282,7 +327,8 @@ bool isExpressionFunctionName(const std::string& idUpper) {
     static const std::set<std::string> names = {
         "SIN", "COS", "TAN", "EXP", "LOG", "LN", "LOG10", "SQRT", "ABS",
         "POW", "MIN", "MAX", "LIMIT", "CLAMP", "IF", "SGN", "SIGN",
-        "U", "STEP", "URAMP", "FLOOR", "CEIL", "CEILING", "ROUND"
+        "U", "STEP", "URAMP", "FLOOR", "CEIL", "CEILING", "ROUND",
+        "GAUSS", "AGAUSS"
     };
     return names.count(idUpper) != 0;
 }
@@ -453,19 +499,32 @@ std::string applyGlobalParams(
         replaceAll(line, "{" + key + "}", resolved);
         replaceAll(line, "'" + key + "'", resolved);
     }
-    line = resolveBracedNumericExpressions(line, params);
+line = resolveBracedNumericExpressions(line, params);
     auto tokens = tokenizeSimple(line);
-    for (auto& token : tokens) {
-        auto [key, value] = splitParameterToken(token);
-        if (!key.empty()) {
-            double evaluated = 0.0;
-            if (tryEvaluateParamExpression(value, params, evaluated)) {
-                token = key + "=" + formatNumericValue(evaluated);
+    const bool isOptionsLine =
+        !tokens.empty() && (toUpperCopy(tokens[0]) == ".OPTIONS" || toUpperCopy(tokens[0]) == ".OPTION" ||
+                            toUpperCopy(tokens[0]) == ".OPT");
+    if (!isOptionsLine) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            auto& token = tokens[i];
+            if (i + 2 < tokens.size() && tokens[i + 1] == "=") {
+                double evaluated = 0.0;
+                if (tryEvaluateParamExpression(tokens[i + 2], params, evaluated)) {
+                    tokens[i + 2] = formatNumericValue(evaluated);
+                }
+                continue;
             }
-            continue;
+            auto [key, value] = splitParameterToken(token);
+            if (!key.empty()) {
+                double evaluated = 0.0;
+                if (tryEvaluateParamExpression(value, params, evaluated)) {
+                    token = key + "=" + formatNumericValue(evaluated);
+                }
+                continue;
+            }
+            auto it = params.find(token);
+            if (it != params.end()) token = resolvedParamString(it->second, params);
         }
-        auto it = params.find(token);
-        if (it != params.end()) token = resolvedParamString(it->second, params);
     }
     return joinSimple(tokens);
 }
@@ -544,6 +603,436 @@ double paramValue(
     return defaultValue;
 }
 
+bool parsePrimitiveValue(
+    const std::vector<std::string>& tokens,
+    size_t valueIdx,
+    const std::vector<std::string>& paramKeys,
+    double& out) {
+const auto params = parseParameterTokens(tokens, valueIdx);
+    const double keyed = paramValue(params, paramKeys, std::numeric_limits<double>::quiet_NaN());
+    if (std::isfinite(keyed)) {
+        out = keyed;
+        return true;
+    }
+    auto [key, value] = splitParameterToken(tokens[valueIdx]);
+    return tryEvaluateParamExpression(key.empty() ? tokens[valueIdx] : value, params, out);
+}
+
+void ensurePrimitiveMosGmcModels() {
+    static const bool registered = [] {
+        auto factory = [](const gspice::GmcModelDefinition& definition) -> std::unique_ptr<gspice::Device> {
+            const auto value = [&](const std::vector<std::string>& keys, double fallback) {
+                for (const auto& key : keys) {
+                    auto it = definition.model_params.find(key);
+                    if (it != definition.model_params.end()) {
+                        double parsed = 0.0;
+                        if (tryParseSpiceValue(it->second, parsed)) return parsed;
+                    }
+                }
+                return fallback;
+            };
+            const auto instanceValue = [&](const std::vector<std::string>& keys, double fallback) {
+                for (const auto& key : keys) {
+                    auto it = definition.instance_params.find(key);
+                    if (it != definition.instance_params.end()) {
+                        double parsed = 0.0;
+                        if (tryParseSpiceValue(it->second, parsed)) return parsed;
+                    }
+                }
+                return fallback;
+            };
+            if (definition.nodes.size() != 4) return nullptr;
+            const int type = (toUpperCopy(definition.type) == "PMOS" ||
+                              toUpperCopy(definition.type) == "P") ? -1 : 1;
+            auto legacy = std::make_unique<gspice::Mosfet>(
+                definition.name,
+                definition.nodes[0], definition.nodes[1],
+                definition.nodes[2], definition.nodes[3],
+                type,
+                instanceValue({"W", "w"}, 1e-6),
+                instanceValue({"L", "l"}, 1e-6),
+                value({"VTO", "VT0", "VTH", "VTH0"}, 0.5),
+                value({"KP", "BETA", "K"}, 100e-6),
+                value({"LAMBDA", "LAMDA"}, 0.05),
+                value({"GAMMA"}, 0.4),
+                value({"PHI"}, 0.7));
+            auto model = std::make_unique<gspice::GmcMosfetInstance>(
+                type,
+                instanceValue({"W", "w"}, 1e-6),
+                instanceValue({"L", "l"}, 1e-6),
+                value({"VTO", "VT0", "VTH", "VTH0"}, 0.5),
+                value({"KP", "BETA", "K"}, 100e-6),
+                value({"LAMBDA", "LAMDA"}, 0.05),
+                value({"GAMMA"}, 0.4),
+                value({"PHI"}, 0.7));
+            return std::make_unique<gspice::GdiDevice>(
+                definition.name, std::move(model), definition.nodes, std::move(legacy));
+        };
+        auto& registry = gspice::GmcRegistry::instance();
+        for (const char* type : {"NMOS", "PMOS", "N", "P"}) {
+            registry.registerModel(type, factory);
+        }
+        return true;
+    }();
+    (void)registered;
+}
+
+void ensureBsim3GmcModels() {
+    static const bool registered = [] {
+        auto factory = [](const gspice::GmcModelDefinition& definition) -> std::unique_ptr<gspice::Device> {
+            if (definition.nodes.size() != 4) return nullptr;
+            std::unordered_map<std::string, double> raw;
+            for (const auto& [name, text] : definition.model_params) {
+                double value = 0.0;
+                if (!tryParseSpiceValue(text, value)) return nullptr;
+                raw[name] = value;
+            }
+            const auto translated = gspice::BsimModelTranslator::translate(raw);
+            if (!translated || translated.family != gspice::BsimFamily::Bsim3) return nullptr;
+            const auto instanceValue = [&](const char* key, double fallback) {
+                const auto it = definition.instance_params.find(key);
+                if (it == definition.instance_params.end()) return fallback;
+                double value = 0.0;
+                return tryParseSpiceValue(it->second, value) ? value : fallback;
+            };
+            const double width = instanceValue("W", 1.0e-6);
+            const double length = instanceValue("L", 1.0e-6);
+            const auto prepared = gspice::Bsim3ParameterSet::from(translated.parameters).prepare(
+                width, length, definition.temperature_c);
+            if (!prepared.validation) return nullptr;
+            const std::string typeName = toUpperCopy(definition.type);
+            const int type = (typeName == "BSIM3_PMOS" || typeName == "PMOS") ? -1 : 1;
+            auto device = std::make_unique<gspice::Bsim3Mosfet>(
+                definition.name, 0, 1, 2, 3, type,
+                prepared.width, prepared.length, prepared.vth0, prepared.kp,
+                prepared.u0, prepared.vsat, prepared.k1, prepared.nfactor,
+                prepared.toxe, prepared.kf, prepared.af, prepared.ef);
+            return std::make_unique<gspice::GdiDevice>(
+                definition.name,
+                std::make_unique<gspice::GsdiDaeDeviceAdapter>(std::move(device), 4),
+                definition.nodes);
+        };
+        auto& registry = gspice::GmcRegistry::instance();
+        registry.registerModel("BSIM3_NMOS", factory);
+        registry.registerModel("BSIM3_PMOS", factory);
+        return true;
+    }();
+    (void)registered;
+}
+
+void ensureBsim4GmcModels() {
+    static const bool registered = [] {
+        auto factory = [](const gspice::GmcModelDefinition& definition) -> std::unique_ptr<gspice::Device> {
+            if (definition.nodes.size() != 4) return nullptr;
+            std::unordered_map<std::string, double> raw;
+            for (const auto& [name, text] : definition.model_params) {
+                double value = 0.0;
+                if (!tryParseSpiceValue(text, value)) return nullptr;
+                raw[name] = value;
+            }
+            const auto instanceValue = [&](const char* key, double fallback) {
+                const auto it = definition.instance_params.find(key);
+                if (it == definition.instance_params.end()) return fallback;
+                double value = 0.0;
+                return tryParseSpiceValue(it->second, value) ? value : fallback;
+            };
+            const auto prepared = gspice::Bsim4ParameterSet::from(raw).prepare(
+                instanceValue("W", 1.0e-6), instanceValue("L", 1.0e-6),
+                definition.temperature_c);
+            if (!prepared.validation) return nullptr;
+            const std::string typeName = toUpperCopy(definition.type);
+            const int type = (typeName == "BSIM4_PMOS" || typeName == "PMOS") ? -1 : 1;
+            auto device = std::make_unique<gspice::Bsim4Mosfet>(
+                definition.name, 0, 1, 2, 3, prepared, type);
+            return std::make_unique<gspice::GdiDevice>(
+                definition.name,
+                std::make_unique<gspice::GsdiDaeDeviceAdapter>(std::move(device), 4),
+                definition.nodes);
+        };
+        auto& registry = gspice::GmcRegistry::instance();
+        registry.registerModel("BSIM4_NMOS", factory);
+        registry.registerModel("BSIM4_PMOS", factory);
+        return true;
+    }();
+    (void)registered;
+}
+
+void ensureGmcGeneratedModels() {
+#ifdef GSPICE_HAVE_GMC_GENERATED
+    static const bool registered = [] {
+        auto& registry = gspice::GmcRegistry::instance();
+        registry.registerModel(
+            "VA_PROBE",
+            [](const gspice::GmcModelDefinition& definition)
+                -> std::unique_ptr<gspice::Device> {
+                gspice::GmcVaProbeModel model;
+                const auto& descriptor = model.descriptor();
+                if (definition.nodes.size() != static_cast<std::size_t>(descriptor.terminal_count)) {
+                    return nullptr;
+                }
+                gspice::GsdiModelCard card;
+                card.name = definition.name;
+                card.type = definition.type;
+                for (const auto& [name, value] : definition.model_params) {
+                    double parsed = 0.0;
+                    if (tryParseSpiceValue(value, parsed)) card.parameters[name] = parsed;
+                }
+                for (const auto& [name, value] : definition.instance_params) {
+                    double parsed = 0.0;
+                    if (tryParseSpiceValue(value, parsed)) card.parameters[name] = parsed;
+                }
+                return std::make_unique<gspice::GdiDevice>(
+                    definition.name, model.createInstance(card, definition.nodes),
+                    definition.nodes);
+            });
+
+        // Only nodes declared with role Internal are genuine hidden unknowns
+        // needing their own MNA column; Collapsible nodes merge into a terminal.
+        std::size_t internal_node_count = 0;
+        for (const auto& node : gspice::GmcPspLikeModel{}.descriptor().nodes) {
+            if (node.role == gspice::GsdiNodeRole::Internal) ++internal_node_count;
+        }
+        registry.registerModel(
+            "PSP_LIKE",
+            [internal_node_count](const gspice::GmcModelDefinition& definition)
+                -> std::unique_ptr<gspice::Device> {
+                gspice::GmcPspLikeModel model;
+                const auto& descriptor = model.descriptor();
+                if (definition.nodes.size() != static_cast<std::size_t>(descriptor.terminal_count) ||
+                    definition.internal_nodes.size() != internal_node_count) {
+                    return nullptr;
+                }
+                gspice::GsdiModelCard card;
+                card.name = definition.name;
+                card.type = definition.type;
+                for (const auto& [name, value] : definition.model_params) {
+                    double parsed = 0.0;
+                    if (tryParseSpiceValue(value, parsed)) card.parameters[name] = parsed;
+                }
+                for (const auto& [name, value] : definition.instance_params) {
+                    double parsed = 0.0;
+                    if (tryParseSpiceValue(value, parsed)) card.parameters[name] = parsed;
+                }
+                std::vector<int> columns = definition.nodes;
+                columns.insert(columns.end(), definition.internal_nodes.begin(),
+                               definition.internal_nodes.end());
+                return std::make_unique<gspice::GdiDevice>(
+                    definition.name, model.createInstance(card, definition.nodes), columns,
+                    gspice::GsdiCollapseMap::standard(descriptor));
+            },
+            internal_node_count);
+        return true;
+    }();
+    (void)registered;
+#endif
+}
+
+void ensurePsp103GmcModels() {
+    static const bool registered = [] {
+        auto factory = [](const gspice::GmcModelDefinition& definition)
+            -> std::unique_ptr<gspice::Device> {
+            if (definition.nodes.size() != 4) return nullptr;
+            const auto model = gspice::Psp103ParameterSet::from(
+                [&definition] {
+                    gspice::GsdiParamMap values;
+                    for (const auto& [name, value] : definition.model_params) {
+                        double parsed = 0.0;
+                        if (tryParseSpiceValue(value, parsed)) values[name] = parsed;
+                    }
+                    return values;
+                }());
+            gspice::GsdiParamMap instance;
+            for (const auto& [name, value] : definition.instance_params) {
+                double parsed = 0.0;
+                if (tryParseSpiceValue(value, parsed)) instance[name] = parsed;
+            }
+            auto prepared = model.prepare(instance, definition.temperature_c);
+            if (!prepared.valid()) return nullptr;
+            // PSP103 is a pure 4-terminal model (D, G, S, B) with no hidden
+            // nodes, so the device runs on local indices 0-3 and the route
+            // mirrors Phase C/D (native evaluator -> GsdiDaeDeviceAdapter ->
+            // collapse-aware GdiDevice). The descriptor carries the terminal
+            // set and dense 4x4 pattern; standard() composes the identity
+            // collapse plan (nothing collapses) so the DAE stamp layer is
+            // numerically identical to the direct native path.
+            auto device = std::make_unique<gspice::Psp103Mosfet>(
+                definition.name, 0, 1, 2, 3, model, instance,
+                definition.temperature_c);
+            return std::make_unique<gspice::GdiDevice>(
+                definition.name,
+                std::make_unique<gspice::GsdiDaeDeviceAdapter>(
+                    std::move(device), 4),
+                definition.nodes,
+                gspice::GsdiCollapseMap::standard(gspice::psp103GsdiDescriptor()));
+        };
+        auto& registry = gspice::GmcRegistry::instance();
+        for (const char* type : {
+                 "PSP", "PSP103", "PSP103VA", "PSP103_VA",
+                 "PSP103NQS", "PSPNQS103", "PSPNQS103VA"}) {
+            registry.registerModel(type, factory);
+        }
+        return true;
+    }();
+    (void)registered;
+}
+
+std::string psp103GmcType(const std::string& type) {
+    return gspice::GmcRegistry::instance().hasModel(type) ? type : "PSP103VA";
+}
+
+bool isMosLevel103PspModel(const gspice::ModelCard& model) {
+    const std::string type = toUpperCopy(model.type);
+    if (type != "NMOS" && type != "PMOS" && type != "N" && type != "P") return false;
+    return std::abs(paramValue(model.params, {"LEVEL"}, 1.0) - 103.0) < 1.0e-9;
+}
+
+bool isPsp103ModelCard(const gspice::ModelCard& model) {
+    return gspice::CompactModelRegistry::instance().isPsp103ModelType(model.type) ||
+           isMosLevel103PspModel(model);
+}
+
+std::string psp103GsdiType(const gspice::ModelCard& model) {
+    return gspice::CompactModelRegistry::instance().isPsp103ModelType(model.type)
+        ? model.type
+        : "PSP103VA";
+}
+
+std::string psp103GmcType(const gspice::ModelCard& model) {
+    return gspice::CompactModelRegistry::instance().isPsp103ModelType(model.type)
+        ? psp103GmcType(model.type)
+        : "PSP103VA";
+}
+
+std::unordered_map<std::string, std::string> psp103ModelParams(const gspice::ModelCard& model) {
+    auto params = model.params;
+    if (std::isfinite(paramValue(params, {"TYPE"}, std::numeric_limits<double>::quiet_NaN()))) {
+        return params;
+    }
+    const std::string type = toUpperCopy(model.type);
+    if (type == "PMOS" || type == "P") params["TYPE"] = "-1";
+    if (type == "NMOS" || type == "N") params["TYPE"] = "1";
+    return params;
+}
+
+std::string psp103IgnoredParameterSummary(const gspice::ModelCard& model) {
+    std::set<std::string> ignored;
+    for (const auto& [name, value] : model.params) {
+        (void)value;
+        if (!gspice::Psp103ParameterSet::handlesModelParameter(name)) {
+            ignored.insert(toUpperCopy(name));
+        }
+    }
+    if (ignored.empty()) return "";
+    const std::size_t shown = std::min<std::size_t>(ignored.size(), 12);
+    std::string summary = std::to_string(ignored.size()) + " unsupported PSP parameter(s) ignored by native evaluator: ";
+    std::size_t i = 0;
+    for (const auto& name : ignored) {
+        if (i >= shown) break;
+        if (i) summary += ", ";
+        summary += name;
+        ++i;
+    }
+    if (shown < ignored.size()) summary += ", ...";
+    return summary;
+}
+
+double psp103RfGateResistance(
+    const gspice::ModelCard& model,
+    const std::unordered_map<std::string, std::string>& instanceParams) {
+    const bool rfNamedModel = toUpperCopy(model.name).find("_RF") != std::string::npos;
+    double rgo = paramValue(model.params, {"RGO", "RG", "RVPOLY"}, rfNamedModel ? 40.0 : 0.0);
+    double rshg = paramValue(model.params, {"RSHG", "RSH", "RSHD"}, rfNamedModel ? 3.0 : 0.0);
+    if (rfNamedModel && rgo <= 0.0) rgo = 40.0;
+    if (rfNamedModel && rshg <= 0.0) rshg = 3.0;
+    const double nf = std::max(paramValue(instanceParams, {"NF", "NG", "NFIN"}, 1.0), 1.0);
+    const double m = std::max(paramValue(instanceParams, {"M", "MULT"}, 1.0), 1.0e-30);
+    const double gateResistance = (std::max(rgo, 0.0) + std::max(rshg, 0.0) / nf) / m;
+    return std::isfinite(gateResistance) && gateResistance > 0.0 ? gateResistance : 0.0;
+}
+
+std::string bsim4IgnoredParameterSummary(const gspice::ModelCard& model) {
+    std::set<std::string> ignored;
+    for (const auto& [name, value] : model.params) {
+        (void)value;
+        if (!gspice::Bsim4ImplementedParameters::isSupported(name)) {
+            ignored.insert(toUpperCopy(name));
+        }
+    }
+    if (ignored.empty()) return "";
+    const std::size_t shown = std::min<std::size_t>(ignored.size(), 12);
+    std::string summary = std::to_string(ignored.size()) + " unsupported BSIM4 model parameter(s) ignored by native evaluator: ";
+    std::size_t i = 0;
+    for (const auto& name : ignored) {
+        if (i >= shown) break;
+        if (i) summary += ", ";
+        summary += name;
+        ++i;
+    }
+    if (shown < ignored.size()) summary += ", ...";
+    return summary;
+}
+
+std::string bsim3IgnoredParameterSummary(const gspice::ModelCard& model) {
+    std::set<std::string> ignored;
+    for (const auto& [name, value] : model.params) {
+        (void)value;
+        if (!gspice::Bsim3ImplementedParameters::isSupported(name)) {
+            ignored.insert(toUpperCopy(name));
+        }
+    }
+    if (ignored.empty()) return "";
+    const std::size_t shown = std::min<std::size_t>(ignored.size(), 12);
+    std::string summary = std::to_string(ignored.size()) + " unsupported BSIM3 model parameter(s) ignored by native evaluator: ";
+    std::size_t i = 0;
+    for (const auto& name : ignored) {
+        if (i >= shown) break;
+        if (i) summary += ", ";
+        summary += name;
+        ++i;
+    }
+    if (shown < ignored.size()) summary += ", ...";
+    return summary;
+}
+
+void ensureJuncapExpressGmcModels() {
+    static const bool registered = [] {
+        auto factory = [](const gspice::GmcModelDefinition& definition)
+            -> std::unique_ptr<gspice::Device> {
+            if (definition.nodes.size() != 2) return nullptr;
+            std::unordered_map<std::string, double> modelParams;
+            for (const auto& [name, value] : definition.model_params) {
+                double parsed = 0.0;
+                if (tryParseSpiceValue(value, parsed)) modelParams[name] = parsed;
+            }
+            std::unordered_map<std::string, double> instanceParams;
+            for (const auto& [name, value] : definition.instance_params) {
+                double parsed = 0.0;
+                if (tryParseSpiceValue(value, parsed)) instanceParams[name] = parsed;
+            }
+            auto instance = gspice::GmcJuncapExpressModule{}.createInstance(
+                modelParams, instanceParams);
+            if (!instance) return nullptr;
+            return std::make_unique<gspice::GdiDevice>(
+                definition.name, std::move(instance), definition.nodes);
+        };
+        gspice::GmcRegistry::instance().registerModel("JUNCAPEXP", factory);
+        gspice::GmcRegistry::instance().registerModel("JUNCAP2", [](const gspice::GmcModelDefinition& definition)
+            -> std::unique_ptr<gspice::Device> {
+            if (definition.nodes.size() != 2) return nullptr;
+            std::unordered_map<std::string, double> modelParams;
+            for (const auto& [name, value] : definition.model_params) {
+                double parsed = 0.0;
+                if (tryParseSpiceValue(value, parsed)) modelParams[name] = parsed;
+            }
+            auto instance = gspice::GmcJuncap2Module{}.createInstance(modelParams, {});
+            if (!instance) return nullptr;
+            return std::make_unique<gspice::GdiDevice>(definition.name, std::move(instance), definition.nodes);
+        });
+        return true;
+    }();
+    (void)registered;
+}
+
 bool modelTypeMatches(const gspice::ModelCard* model, const std::vector<std::string>& types) {
     if (!model) return false;
     const std::string actual = toUpperCopy(model->type);
@@ -554,10 +1043,92 @@ bool modelTypeMatches(const gspice::ModelCard* model, const std::vector<std::str
 }
 
 bool primitiveModelFallbackEnabled() {
-    const char* raw = std::getenv("GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK");
-    std::string value = raw ? std::string(raw) : "";
-    std::transform(value.begin(), value.end(), value.begin(), ::toupper);
-    return value == "1" || value == "YES" || value == "TRUE" || value == "ON";
+    return envFlagEnabled("GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK");
+}
+
+bool hasExtension(std::string path, const std::string& extension) {
+    const auto first = path.find_first_not_of(" \t\r\n");
+    const auto last = path.find_last_not_of(" \t\r\n");
+    path = first == std::string::npos ? "" : path.substr(first, last - first + 1);
+    if (path.size() >= 2 && ((path.front() == '"' && path.back() == '"') ||
+                             (path.front() == '\'' && path.back() == '\''))) {
+        path = path.substr(1, path.size() - 2);
+    }
+    std::filesystem::path fsPath(path);
+    return toUpperCopy(fsPath.extension().string()) == toUpperCopy(extension);
+}
+
+std::string readWholeFile(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return "";
+    std::ostringstream out;
+    out << file.rdbuf();
+    return out.str();
+}
+
+std::string extractJsonString(const std::string& text, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const auto keyPos = text.find(needle);
+    if (keyPos == std::string::npos) return "";
+    const auto colon = text.find(':', keyPos + needle.size());
+    if (colon == std::string::npos) return "";
+    const auto quote = text.find('"', colon + 1);
+    if (quote == std::string::npos) return "";
+    const auto end = text.find('"', quote + 1);
+    if (end == std::string::npos) return "";
+    return text.substr(quote + 1, end - quote - 1);
+}
+
+int extractJsonInt(const std::string& text, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const auto keyPos = text.find(needle);
+    if (keyPos == std::string::npos) return 0;
+    const auto colon = text.find(':', keyPos + needle.size());
+    if (colon == std::string::npos) return 0;
+    const auto start = text.find_first_of("0123456789", colon + 1);
+    if (start == std::string::npos) return 0;
+    const auto end = text.find_first_not_of("0123456789", start);
+    return std::stoi(text.substr(start, end - start));
+}
+
+std::vector<std::string> extractGsdiParameterNames(const std::string& text) {
+    std::vector<std::string> names;
+    const std::string needle = "\"parameters\"";
+    const auto keyPos = text.find(needle);
+    if (keyPos == std::string::npos) return names;
+    const auto arrayStart = text.find('[', keyPos + needle.size());
+    const auto arrayEnd = text.find(']', arrayStart);
+    if (arrayStart == std::string::npos || arrayEnd == std::string::npos) return names;
+    std::string params = text.substr(arrayStart, arrayEnd - arrayStart + 1);
+    std::size_t pos = 0;
+    while ((pos = params.find("\"name\"", pos)) != std::string::npos) {
+        const auto colon = params.find(':', pos + 6);
+        const auto quote = params.find('"', colon + 1);
+        const auto end = params.find('"', quote + 1);
+        if (colon == std::string::npos || quote == std::string::npos || end == std::string::npos) break;
+        names.push_back(params.substr(quote + 1, end - quote - 1));
+        pos = end + 1;
+    }
+    return names;
+}
+
+bool gsdiAllowsParameter(const gspice::GsdiArtifactInfo& artifact, const std::string& name) {
+    if (artifact.parameter_names.empty()) return true;
+    const std::string wanted = toUpperCopy(name);
+    for (const auto& declared : artifact.parameter_names) {
+        if (toUpperCopy(declared) == wanted) return true;
+    }
+    return false;
+}
+
+std::string firstUnknownGsdiParameter(
+    const gspice::GsdiArtifactInfo& artifact,
+    const std::unordered_map<std::string, std::string>& params) {
+    for (const auto& [name, value] : params) {
+        (void)value;
+        if (!gsdiAllowsParameter(artifact, name)) return name;
+    }
+    return "";
 }
 
 bool isLikelyCompactMosModelName(const std::string& modelName) {
@@ -572,11 +1143,13 @@ bool isLikelyCompactMosModelName(const std::string& modelName) {
 }
 
 bool isLikelyCompactMosModelType(const std::string& modelType) {
-    const std::string type = toUpperCopy(modelType);
-    return type.find("PSP") != std::string::npos ||
-           type.find("BSIM") != std::string::npos ||
-           type.find("HICUM") != std::string::npos ||
-           type.find("EKV") != std::string::npos;
+    return gspice::CompactModelRegistry::instance().looksLikeCompactModel(modelType);
+}
+
+bool isUnsupportedCompactMosLevel(const gspice::ModelCard* model) {
+    if (!model) return false;
+    const double level = paramValue(model->params, {"LEVEL"}, 1.0);
+    return level >= 49.0 && level <= 55.0;
 }
 
 std::string applyLocalParams(
@@ -589,7 +1162,15 @@ std::string applyLocalParams(
     }
     line = resolveBracedNumericExpressions(line, params);
     auto tokens = tokenizeSimple(line);
-    for (auto& token : tokens) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        auto& token = tokens[i];
+        if (i + 2 < tokens.size() && tokens[i + 1] == "=") {
+            double evaluated = 0.0;
+            if (tryEvaluateParamExpression(tokens[i + 2], params, evaluated)) {
+                tokens[i + 2] = formatNumericValue(evaluated);
+            }
+            continue;
+        }
         auto [key, value] = splitParameterToken(token);
         if (!key.empty()) {
             double evaluated = 0.0;
@@ -618,27 +1199,110 @@ bool isIhpLvMosWrapper(const std::string& subcktNameUpper, int& typeOut) {
     return false;
 }
 
-std::string getEnvVar(const char* envName) {
-#ifdef _WIN32
-    char* buffer = nullptr;
-    size_t length = 0;
-    if (_dupenv_s(&buffer, &length, envName) != 0 || !buffer) {
-        return "";
+bool ihpR3CmcWrapperRshKey(const std::string& subcktNameUpper, std::string& key, double& nominal) {
+    if (subcktNameUpper == "RSIL") {
+        key = "RSH_RSIL";
+        nominal = 7.0;
+        return true;
     }
-    std::string value(buffer);
-    free(buffer);
-    return value;
-#else
-    const char* value = std::getenv(envName);
-    return value ? std::string(value) : "";
+    if (subcktNameUpper == "RHIGH") {
+        key = "RSH_RHIGH";
+        nominal = 1360.0;
+        return true;
+    }
+    if (subcktNameUpper == "RPPD") {
+        key = "RSH_RPPD";
+        nominal = 260.0;
+        return true;
+    }
+    return false;
+}
+
+struct IhpR3WrapperDefaults {
+    double xw = 0.0;
+    double rzspec = 0.0;
+    double tc1 = 3100e-6;
+    double tc2 = 0.3e-6;
+};
+
+IhpR3WrapperDefaults ihpR3WrapperDefaults(const std::string& subcktNameUpper) {
+    if (subcktNameUpper == "RSIL") return {0.01e-6, 4.5e-6, 3100e-6, 0.3e-6};
+    if (subcktNameUpper == "RHIGH") return {-0.04e-6, 80e-6, -2300e-6, 2.1e-6};
+    if (subcktNameUpper == "RPPD") return {0.006e-6, 35e-6, 170e-6, 0.4e-6};
+    return {};
+}
+
+bool ihpTapWrapper(const std::string& subcktNameUpper) {
+    return subcktNameUpper == "PTAP1" || subcktNameUpper == "NTAP1";
+}
+
+void addBuiltinPspGsdiArtifact(gspice::Netlist& netlist, const std::string& modelType) {
+    if (netlist.findGsdiArtifact(modelType)) return;
+    gspice::GsdiArtifactInfo artifact;
+    artifact.model_type = modelType;
+    artifact.path = "builtin:psp103";
+    artifact.terminal_count = 4;
+    netlist.addGsdiArtifact(artifact);
+    netlist.addModelStatus("GSDI_BUILTIN: " + modelType + " PSP103 native evaluator");
+}
+
+#ifdef GSPICE_HAVE_GMC_GENERATED
+// Embedded GMC-generated models (psp_like, va_probe) are baked into the
+// gspice binary, so decks can reference them without an explicit .GSDI
+// include. Register a builtin artifact derived from the model descriptor so
+// the elaborator's terminal/parameter checks work the same as for loaded
+// artifacts.
+void addBuiltinGmcGeneratedGsdiArtifact(gspice::Netlist& netlist, const std::string& modelType) {
+    if (netlist.findGsdiArtifact(modelType)) return;
+    std::unique_ptr<gspice::GsdiModel> instance;
+    const std::string upper = toUpperCopy(modelType);
+    if (upper == "PSP_LIKE") {
+        instance = std::make_unique<gspice::GmcPspLikeModel>();
+    } else if (upper == "VA_PROBE") {
+        instance = std::make_unique<gspice::GmcVaProbeModel>();
+    }
+    if (!instance) return;
+    const auto& desc = instance->descriptor();
+    gspice::GsdiArtifactInfo artifact;
+    artifact.model_type = desc.model_type;
+    artifact.path = "builtin:gmc-generated";
+    artifact.terminal_count = desc.terminal_count;
+    for (const auto& param : desc.parameters) {
+        artifact.parameter_names.push_back(param.name);
+    }
+    netlist.addGsdiArtifact(artifact);
+    netlist.addModelStatus("GSDI_BUILTIN: " + desc.model_type + " GMC-generated evaluator");
+}
 #endif
+
+void appendUniquePath(std::vector<std::filesystem::path>& roots, const std::filesystem::path& path) {
+    if (path.empty()) return;
+    auto normalized = path.lexically_normal();
+    if (std::find(roots.begin(), roots.end(), normalized) == roots.end()) {
+        roots.push_back(normalized);
+    }
+}
+
+std::string getEnvVar(const char* envName) {
+    return readEnvVar(envName);
+}
+
+void appendEnvSearchRoots(std::vector<std::filesystem::path>& roots, const char* envName) {
+    std::string value = getEnvVar(envName);
+    if (value.empty()) return;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+        item = trimCopy(item);
+        if (!item.empty()) appendUniquePath(roots, item);
+    }
 }
 
 bool primitiveIhpFallbackEnabled() {
     std::string value = getEnvVar("GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK");
     if (value.empty()) return false;
     value = toUpperCopy(value);
-    return !(value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
+    return value == "1" || value == "YES" || value == "TRUE" || value == "ON";
 }
 
 std::string mapNodeToken(
@@ -1042,42 +1706,154 @@ std::vector<PreLine> expandSubcktInstance(
 
     int ihpMosType = 0;
     if (isIhpLvMosWrapper(toUpperCopy(subcktName), ihpMosType) && def.pins.size() >= 4) {
-        if (!primitiveIhpFallbackEnabled()) {
-            errors.push_back("IHP wrapper subcircuit '" + subcktName + "' for instance " + prefix +
-                             " requires a native compact model. Refusing primitive MOS fallback; " +
-                             "set GSPICE_ALLOW_PRIMITIVE_IHP_FALLBACK=1 only for placeholder smoke decks.");
-            return expanded;
-        }
-        const std::string model = ihpMosType < 0 ? "PMOS" : "NMOS";
+        const std::string model = ihpMosType < 0 ? "sg13g2_lv_pmos_psp" : "sg13g2_lv_nmos_psp";
         std::string w = "1u";
         std::string l = "1u";
+        std::string nf = "1";
+        std::string mult = "1";
+        std::string dta = "0";
         auto wit = localParams.find("w");
         if (wit == localParams.end()) wit = localParams.find("W");
         if (wit != localParams.end()) w = resolvedParamString(wit->second, localParams);
         auto lit = localParams.find("l");
         if (lit == localParams.end()) lit = localParams.find("L");
         if (lit != localParams.end()) l = resolvedParamString(lit->second, localParams);
+        auto nfit = localParams.find("ng");
+        if (nfit == localParams.end()) nfit = localParams.find("NG");
+        if (nfit == localParams.end()) nfit = localParams.find("nf");
+        if (nfit == localParams.end()) nfit = localParams.find("NF");
+        if (nfit != localParams.end()) nf = resolvedParamString(nfit->second, localParams);
+        auto mit = localParams.find("m");
+        if (mit == localParams.end()) mit = localParams.find("M");
+        if (mit != localParams.end()) mult = resolvedParamString(mit->second, localParams);
+        auto dtait = localParams.find("trise");
+        if (dtait == localParams.end()) dtait = localParams.find("TRISE");
+        if (dtait == localParams.end()) dtait = localParams.find("dta");
+        if (dtait == localParams.end()) dtait = localParams.find("DTA");
+        if (dtait != localParams.end()) dta = resolvedParamString(dtait->second, localParams);
         std::vector<std::string> mosLine = {
-            "MPSP_" + prefix,
+            "NPSP_" + prefix,
             tokens[1],
             tokens[2],
             tokens[3],
             tokens[4],
             model,
             "W=" + stripQuotes(w),
-            "L=" + stripQuotes(l)
+            "L=" + stripQuotes(l),
+            "NF=" + stripQuotes(nf),
+            "M=" + stripQuotes(mult),
+            "DTA=" + stripQuotes(dta)
         };
-        expanded.push_back({
-            ".GSPICEWARN IHP wrapper " + subcktName +
-                " is using GSPICE's simple MOS fallback for compatibility only.",
-            line.source,
-            line.lineNo
-        });
         expanded.push_back({joinSimple(mosLine), line.source, line.lineNo});
         return expanded;
     }
 
     auto activeBody = filterConditionalLines(def.body, localParams, errors, "subckt " + subcktName);
+
+    if (ihpTapWrapper(toUpperCopy(subcktName)) && def.pins.size() >= 2) {
+        const double resistance = std::max(paramValue(localParams, {"R"}, 262.8), 1e-12);
+        expanded.push_back({
+            ".GSPICEWARN IHP tap wrapper " + subcktName + " approximated as fixed resistor.",
+            line.source,
+            line.lineNo
+        });
+        expanded.push_back({
+            "R_" + prefix + " " + tokens[1] + " " + tokens[2] + " " +
+                formatNumericValue(resistance),
+            line.source,
+            line.lineNo
+        });
+        return expanded;
+    }
+
+    std::string rshKey;
+    double nominalRsh = 0.0;
+    if (ihpR3CmcWrapperRshKey(toUpperCopy(subcktName), rshKey, nominalRsh) && def.pins.size() >= 2) {
+        const auto defaults = ihpR3WrapperDefaults(toUpperCopy(subcktName));
+        const double rsh = paramValue(localParams, {rshKey}, nominalRsh);
+        const double drawnW = paramValue(localParams, {"W"}, 0.5e-6);
+        const double b = std::max(paramValue(localParams, {"B"}, 0.0), 0.0);
+        const double kappa = std::max(paramValue(localParams, {"KAPPA"}, 1.85), 1e-12);
+        const double ps = paramValue(localParams, {"PS"}, 0.18e-6);
+        const double w = paramValue(localParams, {"WEFF"}, drawnW + defaults.xw);
+        const double l = paramValue(localParams, {"LEFF"}, (b + 1.0) * paramValue(localParams, {"L"}, 0.5e-6) + (2.0 / kappa * w + ps) * b);
+        const double m = std::max(paramValue(localParams, {"M"}, 1.0), 1e-30);
+        const double resScale = paramValue(localParams, {"RES_RPARA"}, 1.0);
+        const double postsim = paramValue(localParams, {"POSTSIM"}, 0.0);
+        const double rqrc = paramValue(localParams, {"RQRC"}, 4.5e-6);
+        const double rc = paramValue(localParams, {"RZ", "RC"}, defaults.rzspec / std::max(drawnW, 1e-30) - (postsim > 0.0 ? rqrc / std::max(drawnW, 1e-30) : 0.0));
+        const double trise = paramValue(localParams, {"TRISE"}, 0.0);
+        const double tc1 = paramValue(localParams, {"TC1"}, defaults.tc1);
+        const double tc2 = paramValue(localParams, {"TC2"}, defaults.tc2);
+        if (std::isfinite(rsh) && w > 0.0) {
+            const double tempScale = std::max(1.0 + tc1 * trise + tc2 * trise * trise, 1e-12);
+            const double resistance = std::max((rsh * resScale * l / w * tempScale + 2.0 * rc) / m, 1e-12);
+            expanded.push_back({
+                ".GSPICEWARN IHP r3_cmc wrapper " + subcktName +
+                    " routed as native RSH*LEFF/WEFF with foundry wrapper width/contact/corner/temperature terms.",
+                line.source,
+                line.lineNo
+            });
+            expanded.push_back({
+                "R_" + prefix + " " + tokens[1] + " " + tokens[2] +
+                    " " + formatNumericValue(resistance),
+                line.source,
+                line.lineNo
+            });
+            return expanded;
+        }
+    }
+
+    if (toUpperCopy(subcktName) == "SG13_HV_SVARICAP" && def.pins.size() >= 4) {
+        const double l = paramValue(localParams, {"L"}, 600e-9);
+        const double w = paramValue(localParams, {"W"}, 3e-6);
+        const double nx = std::max(paramValue(localParams, {"NX"}, 1.0), 1.0);
+        const double ny = std::max(paramValue(localParams, {"NY"}, 1.0), 1.0);
+        const double toxo = std::max(paramValue(localParams, {"TOXO"}, 6.945e-9), 1e-12);
+        const double fingers = nx * ny;
+        const double epsOx = 3.453133e-11;
+        const double cAccum = std::max(epsOx * l * w * fingers / toxo, 1e-18);
+        const double cMin = std::max(0.15 * cAccum, 1e-18);
+        const double vfb = paramValue(localParams, {"VFBO"}, -0.04009);
+        const double slope = paramValue(localParams, {"MOSVAR_SLOPE", "SLOPE"}, 0.25);
+        const double ck0 = paramValue(localParams, {"CK0"}, 4.267e-16);
+        const double ckw = paramValue(localParams, {"CKW"}, 1.252e-10);
+        const double ckwnx = paramValue(localParams, {"CKWNX"}, -7.948e-11);
+        const double cCouple = std::max((ck0 + ckw * w + ckwnx * w / fingers) * fingers, 1e-18);
+        const double rk0 = paramValue(localParams, {"RK0"}, 346.7);
+        const double rkwnx = paramValue(localParams, {"RKWNX"}, 0.000631);
+        const double rCouple = std::max((rk0 + rkwnx / std::max(w, 1e-30)) / fingers, 1e-6);
+        const double rwell0 = paramValue(localParams, {"RWELL0"}, 32.85);
+        const double rwellw = paramValue(localParams, {"RWELLW"}, -2.499e6);
+        const double rwellnx = paramValue(localParams, {"RWELLNX"}, 4.759e6);
+        const double rWell = std::max(((rwell0 + rwellw * w) + (rwellnx * w / fingers)) * fingers, 1e-6);
+        const double rsubw0 = paramValue(localParams, {"RSUBW0"}, 0.2596);
+        const double rsubwf = paramValue(localParams, {"RSUBWF"}, 0.0009212);
+        const double rsubwexp = paramValue(localParams, {"RSUBWEXP"}, 0.6952);
+        const double rSub = std::max((rsubw0 / std::sqrt(std::pow(nx, rsubwexp))) / (w + rsubwf), 1e-6);
+        const double cic0 = std::max(paramValue(localParams, {"CIC0"}, 1e-18), 1e-24);
+        const std::string w0 = prefix + "_W0";
+        const std::string g2a = prefix + "_G2A";
+        const std::string w1 = prefix + "_W1";
+        expanded.push_back({
+            ".GSPICEWARN IHP mosvar wrapper " + subcktName +
+                " routed through native voltage-dependent MOSVAR capacitance plus foundry parasitic RC pieces.",
+            line.source,
+            line.lineNo
+        });
+        expanded.push_back({"C_" + prefix + "_IC1 " + tokens[1] + " " + w0 + " " + formatNumericValue(cic0), line.source, line.lineNo});
+        expanded.push_back({"C_" + prefix + "_IC2 " + tokens[3] + " " + w0 + " " + formatNumericValue(cic0), line.source, line.lineNo});
+        expanded.push_back({"R_" + prefix + "_WW0 " + tokens[2] + " " + w0 + " " + formatNumericValue(rWell), line.source, line.lineNo});
+        expanded.push_back({"Y_" + prefix + "_MV1 " + tokens[1] + " " + w0 + " MOSVAR CACC=" + formatNumericValue(cAccum) + " CMIN=" + formatNumericValue(cMin) + " VFB=" + formatNumericValue(vfb) + " SLOPE=" + formatNumericValue(slope), line.source, line.lineNo});
+        expanded.push_back({"Y_" + prefix + "_MV2 " + tokens[3] + " " + w0 + " MOSVAR CACC=" + formatNumericValue(cAccum) + " CMIN=" + formatNumericValue(cMin) + " VFB=" + formatNumericValue(vfb) + " SLOPE=" + formatNumericValue(slope), line.source, line.lineNo});
+        expanded.push_back({".MODEL DAREA D IS=2.45e-17 N=4 CJO=1.444e-15", line.source, line.lineNo});
+        expanded.push_back({"R_" + prefix + "_SUBW " + w1 + " " + tokens[4] + " " + formatNumericValue(rSub), line.source, line.lineNo});
+        expanded.push_back({"D_" + prefix + "_SUBW " + w1 + " " + tokens[2] + " DAREA AREA=" + formatNumericValue(std::max(((nx * 0.38e-6) + (nx * l) + 1.11e-6) * (ny * (w + 0.97e-6)), 1e-30)), line.source, line.lineNo});
+        expanded.push_back({"C_" + prefix + "_G1G2 " + tokens[1] + " " + g2a + " " + formatNumericValue(cCouple), line.source, line.lineNo});
+        expanded.push_back({"R_" + prefix + "_G2A " + g2a + " " + tokens[3] + " " + formatNumericValue(rCouple), line.source, line.lineNo});
+        return expanded;
+    }
+
     std::vector<PreLine> bodyLines;
     for (const auto& body : activeBody) {
         auto bodyTokens = tokenizeSimple(body.text);
@@ -1085,6 +1861,10 @@ std::vector<PreLine> expandSubcktInstance(
         PreLine paramBody = body;
         paramBody.text = applyLocalParams(paramBody.text, localParams);
         bodyTokens = tokenizeSimple(paramBody.text);
+        const std::string bodyCmd = toUpperCopy(bodyTokens[0]);
+        if (bodyCmd == ".MODEL") {
+            continue;
+        }
         if (std::toupper(bodyTokens[0][0]) == 'X') {
             size_t nestedIdx = findSubcktNameIndex(bodyTokens);
             for (size_t i = 1; i < nestedIdx; ++i) {
@@ -1156,9 +1936,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.abstol = 1e-12;
             settings.tran_lte_reltol = 2e-2;
             settings.tran_lte_abstol = 10e-6;
-            settings.tran_trtol = 7.0;
-            settings.tran_lte_audit_interval = 0;
-            settings.tran_lte_reference = "HISTORY";
             settings.tran_max_iter = 40;
         } else if (preset == "MEDIUM") {
             settings.reltol = 1e-3;
@@ -1166,9 +1943,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.abstol = 1e-12;
             settings.tran_lte_reltol = 5e-3;
             settings.tran_lte_abstol = 1e-6;
-            settings.tran_trtol = 5.0;
-            settings.tran_lte_audit_interval = 0;
-            settings.tran_lte_reference = "HISTORY";
             settings.tran_max_iter = 60;
         } else if (preset == "HIGH") {
             settings.reltol = 3e-4;
@@ -1177,8 +1951,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_lte_reltol = 1e-3;
             settings.tran_lte_abstol = 300e-9;
             settings.tran_trtol = 3.5;
-            settings.tran_lte_audit_interval = 0;
-            settings.tran_lte_reference = "HISTORY";
             settings.tran_max_iter = 80;
         } else if (preset == "VERYHIGH") {
             settings.reltol = 1e-4;
@@ -1188,8 +1960,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_lte_abstol = 100e-9;
             settings.chgtol = 1e-15;
             settings.tran_trtol = 1.0;
-            settings.tran_lte_audit_interval = 8;
-            settings.tran_lte_reference = "LOCAL";
             settings.tran_method = "TRAPGEAR";
             settings.tran_max_iter = 120;
         }
@@ -1223,36 +1993,13 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
             settings.tran_adaptive = true;
         }
     };
-    auto applySaveMode = [&](std::string mode) {
-        mode = toUpperCopy(mode);
-        mode.erase(std::remove(mode.begin(), mode.end(), '_'), mode.end());
-        mode.erase(std::remove(mode.begin(), mode.end(), '-'), mode.end());
-        if (mode == "ALL" || mode == "ALLPUB" || mode == "PUBLIC") {
-            settings.save_all = true;
-            settings.save_none = false;
-            settings.saves.erase(
-                std::remove_if(settings.saves.begin(), settings.saves.end(), [](const gspice::SaveSpec& save) {
-                    return toUpperCopy(save.kind) != "I";
-                }),
-                settings.saves.end());
-        } else if (mode == "SELECTED" || mode == "SELECT" || mode == "NONEDEFAULT") {
-            settings.save_all = false;
-            settings.save_none = false;
-        } else if (mode == "NONE" || mode == "OFF" || mode == "NO") {
-            settings.save_all = false;
-            settings.save_none = true;
-            settings.saves.clear();
-        }
-    };
     if (key == "RELTOL" && hasNumeric && numeric > 0.0) {
         settings.reltol = numeric;
     }
     else if (key == "VNTOL" && hasNumeric && numeric > 0.0) settings.vntol = numeric;
     else if (key == "ABSTOL" && hasNumeric && numeric > 0.0) settings.abstol = numeric;
     else if (key == "GMIN" && hasNumeric && numeric >= 0.0) settings.gmin = numeric;
-    else if (key == "MINR" && hasNumeric && numeric >= 0.0) settings.minr = numeric;
-    else if (key == "TNOM" && hasNumeric) settings.nominal_temperature_c = numeric;
-    else if (key == "SCALE" && hasNumeric && numeric > 0.0) settings.geometry_scale = numeric;
+    else if ((key == "CSHUNT" || key == "CMIN" || key == "TRAN_CSHUNT") && hasNumeric && numeric >= 0.0) settings.cshunt = numeric;
     else if ((key == "THREADS" || key == "NUM_THREADS" || key == "NTHREADS" || key == "PARALLEL" || key == "CPUS") && hasNumeric && numeric > 0.0) {
         settings.num_threads = static_cast<int>(numeric);
     }
@@ -1261,89 +2008,37 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "TRTOL" && hasNumeric && numeric > 0.0) settings.tran_trtol = numeric;
     else if ((key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
     else if ((key == "TRABSTOL" || key == "TRAN_ABSTOL" || key == "LTE_ABSTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_abstol = numeric;
-    else if (key == "NEWLTE" || key == "LTE_REFERENCE" || key == "TRAN_LTE_REFERENCE") {
-        std::string mode = toUpperCopy(value);
-        mode.erase(std::remove(mode.begin(), mode.end(), '_'), mode.end());
-        mode.erase(std::remove(mode.begin(), mode.end(), '-'), mode.end());
-        if (mode == "0" || mode == "LOCAL" || mode == "NODE" || mode == "CURRENT") {
-            settings.tran_lte_reference = "LOCAL";
-        } else if (mode == "1" || mode == "GLOBAL" || mode == "GLOBALCURRENT") {
-            settings.tran_lte_reference = "GLOBAL";
-        } else if (mode == "2" || mode == "HISTORY" || mode == "GLOBALHISTORY" || mode == "ALLPAST") {
-            settings.tran_lte_reference = "HISTORY";
-        } else if (mode == "3" || mode == "SIGNALHISTORY" || mode == "NODEHISTORY" || mode == "PERSIGNAL") {
-            settings.tran_lte_reference = "SIGNAL_HISTORY";
+    else if (key == "CHGTOL" && hasNumeric && numeric > 0.0) settings.chgtol = numeric;
+    else if ((key == "MAXORD" || key == "MAXORDER") && hasNumeric) settings.tran_max_order = std::clamp(static_cast<int>(numeric), 1, 5);
+    else if (key == "MAXSTEP" || key == "TRAN_MAXSTEP") {
+        if (toUpperCopy(value) == "AUTO") {
+            settings.tran_max_step_auto = true;
+            settings.t_max_step = 0.0;
+        } else if (hasNumeric && numeric > 0.0) {
+            settings.tran_max_step_auto = false;
+            settings.t_max_step = numeric;
         }
     }
-    else if ((key == "BREAKPOINT_GROWTH" || key == "TRAN_BREAKPOINT_GROWTH") && hasNumeric && numeric > 0.0) {
-        settings.tran_breakpoint_growth = std::clamp(numeric, 1.0, 20.0);
-    }
-    else if (key == "CHGTOL" && hasNumeric && numeric > 0.0) settings.chgtol = numeric;
-    else if (key == "FLUXTOL" && hasNumeric && numeric > 0.0) settings.fluxtol = numeric;
-    else if ((key == "MAXORD" || key == "MAXORDER") && hasNumeric) settings.tran_max_order = std::clamp(static_cast<int>(numeric), 1, 5);
-    else if ((key == "MAXSTEP" || key == "TMAX" || key == "TRAN_MAXSTEP")) {
-        std::string mode = toUpperCopy(value);
-        mode.erase(std::remove(mode.begin(), mode.end(), '_'), mode.end());
-        mode.erase(std::remove(mode.begin(), mode.end(), '-'), mode.end());
-        if (hasNumeric && numeric > 0.0) {
-            settings.t_max_step = numeric;
-            settings.ignore_tran_tmax = false;
-        } else if ((hasNumeric && numeric == 0.0) ||
-                   mode == "AUTO" || mode == "ADAPTIVE" || mode == "NONE" || mode == "OFF") {
-            settings.t_max_step = 0.0;
-            settings.ignore_tran_tmax = true;
+    else if (key == "TMAX" && hasNumeric && numeric > 0.0) settings.t_max_step = numeric;
+else if (key == "SAVE") {
+        const std::string mode = toUpperCopy(value);
+        if (mode == "NONE" || mode == "0" || mode == "FALSE" || mode == "OFF" || mode == "NO") {
+            settings.save_none = true;
+            settings.save_all = false;
+            settings.saves.clear();
+        } else if (mode == "ALL" || mode == "1" || mode == "TRUE" || mode == "ON" || mode == "YES") {
+            settings.save_none = false;
+            settings.save_all = true;
+            settings.saves.clear();
+        } else if (mode == "SELECTED") {
+            settings.save_none = false;
+            settings.save_all = false;
         }
     }
     else if ((key == "MINSTEP" || key == "TMIN" || key == "TRAN_MINSTEP") && hasNumeric && numeric > 0.0) settings.t_min_step = numeric;
-    else if ((key == "IGNORE_TMAX" || key == "IGNORE_TRAN_TMAX" || key == "TRAN_IGNORE_TMAX")) {
-        settings.ignore_tran_tmax = value.empty() ? true : truthy(value);
-        if (settings.ignore_tran_tmax) settings.t_max_step = 0.0;
-    }
-    else if (key == "SAVE" || key == "SAVEMODE" || key == "SAVE_MODE") {
-        if (!value.empty()) applySaveMode(value);
-    }
-    else if (key == "SAVE_ALL" || key == "SAVEALL") {
-        if (value.empty() || truthy(value)) applySaveMode("ALL");
-        else applySaveMode("SELECTED");
-    }
-    else if (key == "SAVE_NONE" || key == "SAVENONE") {
-        if (value.empty() || truthy(value)) applySaveMode("NONE");
-        else applySaveMode("ALL");
-    }
     else if (key == "ADAPTIVE" || key == "TRAN_ADAPTIVE") settings.tran_adaptive = value.empty() ? true : truthy(value);
-    else if (key == "PSS_ADAPTIVE" || key == "PSSADAPTIVE") settings.pss_adaptive = value.empty() ? true : truthy(value);
-    else if (key == "TSTAB" || key == "PSS_TSTAB") {
-        if (hasNumeric && numeric >= 0.0) settings.pss_tstab = numeric;
-    }
-    else if (key == "TSTAB_PERIODS" || key == "PSS_TSTAB_PERIODS" || key == "PSS_RUNUP_PERIODS") {
-        if (hasNumeric && numeric >= 0.0) settings.pss_tstab_periods = static_cast<int>(numeric);
-    }
-    else if (key == "PSS_CONTINUATION" || key == "PSS_HOMOTOPY" || key == "PSS_HOMOTOPY_CONTINUATION") {
-        settings.pss_continuation = value.empty() ? true : truthy(value);
-    }
-    else if (key == "PSS_CONTINUATION_STEPS" || key == "PSS_HOMOTOPY_STEPS") {
-        if (hasNumeric && numeric >= 0.0) settings.pss_continuation_steps = static_cast<int>(numeric);
-    }
-    else if (key == "PSS_RELTOL" || key == "PSS_RESIDUAL_GOAL") {
-        if (hasNumeric && numeric > 0.0) settings.pss_residual_goal = numeric;
-    }
-    else if (key == "MAX_PSS_ITER" || key == "PSS_MAX_ITER" || key == "PSS_ITERS" || key == "PSS_ITERATIONS") {
-        if (hasNumeric && numeric > 0.0) settings.max_pss_iter = std::clamp(static_cast<int>(numeric), 1, 200);
-    }
-    else if (key == "PHASENOISE" || key == "PHASE_NOISE" || key == "PNOISE_PHASE_NOISE") {
-        settings.pnoise_phase_noise = value.empty() ? true : truthy(value);
-    }
-    else if (key == "JITTER" || key == "PNOISE_JITTER") {
-        settings.pnoise_jitter = value.empty() ? true : truthy(value);
-    }
-    else if (key == "CARRIER" || key == "CARRIER_HZ" || key == "PNOISE_CARRIER") {
-        if (hasNumeric && numeric > 0.0) settings.pnoise_carrier_hz = numeric;
-    }
     else if (key == "SAVE_ADAPTIVE" || key == "SAVE_ADAPTIVE_STEPS" || key == "SAVEADAPTIVE") {
         settings.save_adaptive_steps = value.empty() ? true : truthy(value);
-    }
-    else if ((key == "TRAN_PROGRESS_INTERVAL" || key == "PROGRESS_INTERVAL" || key == "PROGRESS") && hasNumeric) {
-        settings.tran_progress_interval = std::clamp(numeric, 0.0, 100.0);
     }
     else if (key == "TRAN_PREDICTOR" || key == "PREDICTOR") settings.tran_predictor = value.empty() ? true : truthy(value);
     else if (key == "TRAN_ORDER_ADAPTIVE" || key == "ORDER_ADAPTIVE" || key == "ADAPTIVE_ORDER") {
@@ -1362,9 +2057,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "LTE_AUDIT_INTERVAL" || key == "TRAN_LTE_AUDIT_INTERVAL") && hasNumeric) {
         settings.tran_lte_audit_interval = std::clamp(static_cast<int>(numeric), 0, 1000000);
-    }
-    else if ((key == "LTE_CHARGE_INTERVAL" || key == "TRAN_LTE_CHARGE_INTERVAL" || key == "CHARGE_LTE_INTERVAL") && hasNumeric) {
-        settings.tran_lte_charge_interval = std::clamp(static_cast<int>(numeric), 1, 1000000);
     }
     else if ((key == "SOLVER" || key == "LINEAR_SOLVER" || key == "SPARSE_SOLVER") && !value.empty()) {
         settings.solver_backend = toUpperCopy(value);
@@ -1418,9 +2110,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if (key == "MULTIRATE" || key == "MULTI_RATE" || key == "MULTI_TIMESTEP") {
         settings.multirate = value.empty() ? true : truthy(value);
     }
-    else if (key == "TRAN_STAMP_CACHE" || key == "STAMP_CACHE" || key == "PARTITION_STAMP_CACHE") {
-        settings.transient_stamp_cache = value.empty() ? true : truthy(value);
-    }
     else if (key == "PARALLEL_SOLVE" || key == "PARALLEL_BTF" || key == "PARALLEL_SOLVER") {
         settings.parallel_solve = value.empty() ? true : truthy(value);
     }
@@ -1429,31 +2118,6 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "TICER_FMAX" || key == "TICERFMAX") && hasNumeric && numeric > 0.0) {
         settings.ticer_fmax = numeric;
-    }
-    else if (key == "TRAN_NOISE" || key == "TRANSIENT_NOISE" || key == "TNOISE") {
-        settings.transient_noise = value.empty() ? true : truthy(value);
-    }
-    else if ((key == "TRAN_NOISE_FMIN" || key == "TNOISE_FMIN") && hasNumeric && numeric >= 0.0) {
-        settings.transient_noise_fmin = numeric;
-    }
-    else if ((key == "TRAN_NOISE_FMAX" || key == "TNOISE_FMAX" || key == "NOISE_BW") && hasNumeric && numeric >= 0.0) {
-        settings.transient_noise_fmax = numeric;
-    }
-    else if ((key == "TRAN_NOISE_SCALE" || key == "TNOISE_SCALE") && hasNumeric && numeric >= 0.0) {
-        settings.transient_noise_scale = numeric;
-    }
-    else if ((key == "TRAN_NOISE_SEED" || key == "TNOISE_SEED" || key == "NOISE_SEED") && hasNumeric && numeric >= 0.0) {
-        settings.transient_noise_seed = static_cast<unsigned int>(numeric);
-    }
-    else if ((key == "TRAN_NOISE_OVERSAMPLE" || key == "TNOISE_OVERSAMPLE" || key == "OVERSAMPLE") && hasNumeric && numeric >= 1.0) {
-        settings.transient_noise_oversample = std::clamp(static_cast<int>(numeric), 1, 1000000);
-    }
-    else if ((key == "TRAN_NOISE_TONES_PER_DEC" || key == "TNOISE_TONES_PER_DEC" || key == "NOISE_TONES_PER_DEC") && hasNumeric && numeric >= 1.0) {
-        settings.transient_noise_colored_tones_per_dec = std::clamp(static_cast<int>(numeric), 1, 64);
-    }
-    else if (key == "TRAN_NOISE_MODE" || key == "TNOISE_MODE" || key == "NOISEMODE") {
-        const std::string mode = toUpperCopy(value);
-        if (mode == "ZOH" || mode == "SDE") settings.transient_noise_mode = mode;
     }
     else if ((key == "METHOD" || key == "TRAN_METHOD") && !value.empty()) {
         std::string method = toUpperCopy(value);
@@ -1468,16 +2132,13 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     }
     else if ((key == "ITL1" || key == "OP_MAX_ITER") && hasNumeric && numeric > 0.0) settings.op_max_iter = static_cast<int>(numeric);
     else if ((key == "ITL4" || key == "TRAN_MAX_ITER") && hasNumeric && numeric > 0.0) settings.tran_max_iter = static_cast<int>(numeric);
-    else if (key == "UIC" || key == "USE_UIC" || key == "USE_INITIAL_CONDITIONS") {
-        settings.use_uic = value.empty() ? true : truthy(value);
-    }
+    else if ((key == "TEMP" || key == "TEMPERATURE") && hasNumeric) settings.temperature_c = numeric;
 }
 
 void parseSourceSpec(
     const std::string& sourceSpec,
     double& dcValue,
     double& acMagnitude,
-    double& acPhaseDeg,
     bool& dcSeen,
     gspice::VoltageSource::WaveformType& waveformType,
     gspice::VoltageSource::PulseParams& pulse,
@@ -1487,7 +2148,6 @@ void parseSourceSpec(
 
     dcValue = 0.0;
     acMagnitude = 1.0;
-    acPhaseDeg = 0.0;
     dcSeen = false;
     waveformType = gspice::VoltageSource::WaveformType::DC;
     pulse = gspice::VoltageSource::PulseParams{};
@@ -1516,13 +2176,6 @@ void parseSourceSpec(
         if (pUpper == "AC" && i + 1 < parts.size()) {
             double tmp = 0.0;
             if (tryParseSpiceValue(parts[i + 1], tmp)) acMagnitude = tmp;
-            if (i + 2 < parts.size()) {
-                double phase = 0.0;
-                if (tryParseSpiceValue(parts[i + 2], phase)) {
-                    acPhaseDeg = phase;
-                    ++i;
-                }
-            }
             ++i;
             continue;
         }
@@ -1689,27 +2342,6 @@ Netlist Parser::parse(const std::string& filePath) {
         netlist.addError(error);
     }
 
-    // Resolve global simulation-environment directives first so
-    // their $simparam and temperature values do not depend on whether an
-    // .OPTIONS or .TEMP line appears before or after the device instances.
-    {
-        SimulationSettings earlySettings = netlist.getSettings();
-        for (const auto& preLine : paramFreeLines) {
-            const auto tokens = tokenize(preLine.text);
-            if (tokens.empty()) continue;
-            const std::string command = toUpperCopy(tokens[0]);
-            if (command == ".OPTIONS" || command == ".OPTION" || command == ".OPT") {
-                for (std::size_t i = 1; i < tokens.size(); ++i) {
-                    applyOptionToken(earlySettings, tokens[i]);
-                }
-            } else if ((command == ".TEMP" || command == ".TEMPERATURE") &&
-                       tokens.size() >= 2) {
-                earlySettings.temperature_c = Utils::parseValue(tokens[1]);
-            }
-        }
-        netlist.setSettings(earlySettings);
-    }
-
     for (const auto& preLine : paramFreeLines) {
         std::string line = preLine.text;
         int lineNo = preLine.lineNo;
@@ -1718,9 +2350,9 @@ Netlist Parser::parse(const std::string& filePath) {
         if (tokens.empty()) continue;
 
         std::string firstTokenUpper = toUpperCopy(tokens[0]);
-        if (firstTokenUpper == "LOAD") {
+        if (firstTokenUpper == "LOAD" || firstTokenUpper == "PRE_LOAD") {
             netlist.addError("Line " + std::to_string(lineNo) +
-                ": external compiled-model plugins are disabled in this Apache build; use a native compact model.");
+                             ": OSDI/OpenVAF-style load directives are disabled; use .GSDI with GMC-generated native models.");
             continue;
         }
 
@@ -1734,7 +2366,7 @@ Netlist Parser::parse(const std::string& filePath) {
             if (cmd == ".END") {
                 break;
             } else if (cmd == ".GSPICEWARN") {
-                netlist.addWarning(joinTokens(tokens, 1));
+                if (verboseCompatWarnings()) netlist.addWarning(joinTokens(tokens, 1));
             } else if (cmd == ".OP") {
                 if (netlist.getSettings().type == "OP") {
                     SimulationSettings settings = netlist.getSettings();
@@ -1796,11 +2428,7 @@ Netlist Parser::parse(const std::string& filePath) {
                     if (tokenUpper == "ALL" || tokenUpper == "V(*)" || tokenUpper == "V(ALL)") {
                         settings.save_all = true;
                         settings.save_none = false;
-                        settings.saves.erase(
-                            std::remove_if(settings.saves.begin(), settings.saves.end(), [](const gspice::SaveSpec& save) {
-                                return toUpperCopy(save.kind) != "I";
-                            }),
-                            settings.saves.end());
+                        settings.saves.clear();
                         sawSave = true;
                         continue;
                     }
@@ -1810,11 +2438,11 @@ Netlist Parser::parse(const std::string& filePath) {
                                            " token ignored: " + tokens[i]);
                         continue;
                     }
-                    if (settings.save_all && toUpperCopy(save.kind) == "V") {
+                    if (settings.save_all && toUpperCopy(save.kind) != "I") {
                         settings.save_all = false;
+                        settings.save_none = false;
                         settings.saves.clear();
                     }
-                    settings.save_none = false;
                     settings.saves.push_back(save);
                     sawSave = true;
                 }
@@ -1982,19 +2610,21 @@ Netlist Parser::parse(const std::string& filePath) {
                 SimulationSettings settings = netlist.getSettings();
                 settings.output_specs.push_back(spec);
                 netlist.setSettings(settings);
-            } else if (cmd == ".TRAN" || cmd == ".TRANNOISE" || cmd == ".TRNOISE" || cmd == ".TNOISE") {
+            } else if (cmd == ".TRAN") {
                 if (tokens.size() < 3) {
-                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid " + cmd + " line ignored: " + line);
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .TRAN line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "TRAN";
-                if (cmd != ".TRAN") {
-                    settings.transient_noise = true;
-                }
                 settings.t_step = Utils::parseValue(tokens[1]);
                 settings.t_stop = Utils::parseValue(tokens[2]);
-                if (tokens.size() > 3 && tokens[3].find('=') == std::string::npos) {
+                if (settings.t_stop <= 0.0) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": .TRAN stop time must be positive (token '" +
+                                       tokens[2] + "' did not parse as a time): " + line);
+                    continue;
+                }
+                if (tokens.size() > 3) {
                     std::string opt = tokens[3];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") {
@@ -2004,53 +2634,19 @@ Netlist Parser::parse(const std::string& filePath) {
                         settings.t_start = Utils::parseValue(tokens[3]);
                     }
                 }
-                if (tokens.size() > 4 && tokens[4].find('=') == std::string::npos) {
+                if (tokens.size() > 4) {
                     std::string opt = tokens[4];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") {
                         settings.use_uic = true;
-                    } else if (!settings.ignore_tran_tmax) {
+                    } else if (!settings.tran_max_step_auto) {
                         settings.t_max_step = Utils::parseValue(tokens[4]);
                     }
                 }
-                if (tokens.size() > 5 && tokens[5].find('=') == std::string::npos) {
+                if (tokens.size() > 5) {
                     std::string opt = tokens[5];
                     std::transform(opt.begin(), opt.end(), opt.begin(), ::toupper);
                     if (opt == "UIC") settings.use_uic = true;
-                }
-                for (size_t i = 3; i < tokens.size(); ++i) {
-                    std::string optUpper = toUpperCopy(tokens[i]);
-                    if (optUpper == "UIC") {
-                        settings.use_uic = true;
-                    }
-                    auto [key, value] = splitParameterToken(tokens[i]);
-                    const std::string option = toUpperCopy(key);
-                    if (option == "UIC" || option == "USE_UIC" || option == "USE_INITIAL_CONDITIONS") {
-                        std::string enabled = toUpperCopy(value);
-                        settings.use_uic = value.empty() ||
-                            !(enabled == "0" || enabled == "NO" || enabled == "FALSE" || enabled == "OFF");
-                    } else if (option == "FMIN") {
-                        settings.transient_noise_fmin = Utils::parseValue(value);
-                    } else if (option == "FMAX" || option == "BW" || option == "BANDWIDTH") {
-                        settings.transient_noise_fmax = Utils::parseValue(value);
-                    } else if (option == "SEED" && !value.empty()) {
-                        settings.transient_noise_seed = static_cast<unsigned int>(std::stoul(value));
-                    } else if (option == "SCALE") {
-                        settings.transient_noise_scale = Utils::parseValue(value);
-                    } else if (option == "NOISEMODE" || option == "MODE") {
-                        const std::string mode = toUpperCopy(value);
-                        if (mode == "ZOH" || mode == "SDE") settings.transient_noise_mode = mode;
-                    } else if (option == "OVERSAMPLE" && !value.empty()) {
-                        settings.transient_noise_oversample = std::clamp(
-                            static_cast<int>(Utils::parseValue(value)), 1, 1000000);
-                    } else if ((option == "TONES_PER_DEC" || option == "NOISETONES") && !value.empty()) {
-                        settings.transient_noise_colored_tones_per_dec = std::clamp(
-                            static_cast<int>(Utils::parseValue(value)), 1, 64);
-                    } else if (option == "NOISE" || option == "TRAN_NOISE") {
-                        std::string enabled = toUpperCopy(value);
-                        settings.transient_noise = value.empty() ||
-                            !(enabled == "0" || enabled == "NO" || enabled == "FALSE" || enabled == "OFF");
-                    }
                 }
                 netlist.setSettings(settings);
             } else if (cmd == ".IC" || cmd == ".NODESET") {
@@ -2076,9 +2672,35 @@ Netlist Parser::parse(const std::string& filePath) {
                     }
                 }
                 netlist.setSettings(settings);
-            } else if (cmd == ".LOAD") {
+            } else if (cmd == ".LOAD" || cmd == ".OSDI" || cmd == ".PRE_OSDI") {
                 netlist.addError("Line " + std::to_string(lineNo) +
-                    ": external compiled-model plugins are disabled in this Apache build; use a native compact model.");
+                                 ": OSDI/OpenVAF loading is disabled; use .GSDI with GMC-generated native models.");
+            } else if (cmd == ".GSDI" || cmd == ".PRE_GSDI") {
+                if (tokens.size() < 2) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .GSDI requires a .gsdi artifact path.");
+                } else if (!hasExtension(tokens[1], ".gsdi")) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .GSDI only accepts .gsdi artifacts, not " + tokens[1]);
+                } else {
+                    const auto artifactPath = resolveRelativePath(std::filesystem::path(preLine.source), tokens[1]);
+                    const std::string artifact = readWholeFile(artifactPath);
+                    if (artifact.empty()) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": could not read .GSDI artifact: " + artifactPath.string());
+                        continue;
+                    }
+                    const std::string schema = extractJsonString(artifact, "schema");
+                    const std::string modelType = extractJsonString(artifact, "model_type");
+                    if (schema != "gsdi-artifact-v0" || modelType.empty()) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": invalid .GSDI artifact envelope: " + artifactPath.string());
+                        continue;
+                    }
+                    GsdiArtifactInfo info;
+                    info.model_type = modelType;
+                    info.path = artifactPath.string();
+                    info.terminal_count = extractJsonInt(artifact, "terminal_count");
+                    info.parameter_names = extractGsdiParameterNames(artifact);
+                    netlist.addGsdiArtifact(info);
+                    netlist.addModelStatus("GSDI_LOADED: " + modelType + " from " + artifactPath.filename().string());
+                }
             } else if (cmd == ".MODEL") {
                 if (tokens.size() < 3) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .MODEL line ignored: " + line);
@@ -2109,43 +2731,46 @@ Netlist Parser::parse(const std::string& filePath) {
                         value = formatNumericValue(evaluated);
                     }
                 }
+                if (isPsp103ModelCard(model)) {
+                    addBuiltinPspGsdiArtifact(netlist, psp103GsdiType(model));
+                    const std::string ignored = verboseCompatWarnings()
+                        ? psp103IgnoredParameterSummary(model)
+                        : "";
+                    if (!ignored.empty()) {
+                        netlist.addWarning(
+                            "Line " + std::to_string(lineNo) + ": PSP model '" +
+                            model.name + "' has " + ignored);
+                    }
+                }
+#ifdef GSPICE_HAVE_GMC_GENERATED
+                else {
+                    addBuiltinGmcGeneratedGsdiArtifact(netlist, model.type);
+                }
+#endif
                 netlist.addModelCard(model);
             } else if (cmd == ".AC") {
-                if (tokens.size() < 5) {
+                if (tokens.size() < 2) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .AC line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "AC";
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                const std::string sweepType = toUpperCopy(tokens[1]);
-                settings.frequency_sweep_type = sweepType;
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
+                settings.f_sweep_type = toUpperCopy(tokens[1]);
+                settings.f_values.clear();
+                if (settings.f_sweep_type == "VALUES") {
                     if (tokens.size() < 3) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": .AC VALUES requires at least one frequency: " + line);
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .AC VALUES line ignored: " + line);
                         continue;
                     }
-                    for (size_t i = 2; i < tokens.size(); ++i) {
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
-                    }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                } else if (sweepType == "STEP") {
-                    if (tokens.size() < 5) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": .AC STEP requires start stop step: " + line);
-                        continue;
-                    }
-                    settings.f_start = Utils::parseValue(tokens[2]);
-                    settings.f_stop = Utils::parseValue(tokens[3]);
-                    settings.frequency_step = Utils::parseValue(tokens[4]);
-                    settings.points_per_dec = 0;
-                    if (settings.frequency_step <= 0.0) {
-                        netlist.addError("Line " + std::to_string(lineNo) + ": .AC STEP increment must be positive: " + line);
-                    }
+                    for (size_t j = 2; j < tokens.size(); ++j) settings.f_values.push_back(Utils::parseValue(tokens[j]));
+                    settings.points_per_dec = static_cast<int>(settings.f_values.size());
+                    settings.f_start = settings.f_values.front();
+                    settings.f_stop = settings.f_values.back();
                 } else {
-                    // tokens[1] is DEC/OCT/LIN
+                    if (tokens.size() < 5) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .AC line ignored: " + line);
+                        continue;
+                    }
                     settings.points_per_dec = std::stoi(tokens[2]);
                     settings.f_start = Utils::parseValue(tokens[3]);
                     settings.f_stop = Utils::parseValue(tokens[4]);
@@ -2154,61 +2779,32 @@ Netlist Parser::parse(const std::string& filePath) {
             } else if (cmd == ".PSS" || cmd == ".HB") {
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = cmd.substr(1);
+                if (cmd == ".PSS") settings.pss_requested = true;
                 size_t i = 1;
                 while (i < tokens.size()) {
-                    const std::string upperToken = toUpperCopy(tokens[i]);
-                    const size_t eqPos = upperToken.find('=');
-                    if (eqPos != std::string::npos) {
-                        const std::string key = upperToken.substr(0, eqPos);
-                        const std::string value = upperToken.substr(eqPos + 1);
-                        if (key == "OSCILLATOR" || key == "OSC" || key == "AUTONOMOUS") {
-                            settings.pss_autonomous =
-                                !(value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
-                            ++i;
-                            continue;
-                        }
-                        if (key == "DRIVEN") {
-                            settings.pss_autonomous =
-                                (value == "0" || value == "NO" || value == "FALSE" || value == "OFF");
-                            ++i;
-                            continue;
-                        }
-                        if (key == "TSTAB" || key == "PSS_TSTAB" ||
-                            key == "PSS_ADAPTIVE" || key == "PSSADAPTIVE" ||
-                            key == "PSS_CONTINUATION" || key == "PSS_HOMOTOPY" ||
-                            key == "PSS_CONTINUATION_STEPS" || key == "PSS_HOMOTOPY_STEPS" ||
-                            key == "PSS_RELTOL" || key == "PSS_RESIDUAL_GOAL" ||
-                            key == "TSTAB_PERIODS" || key == "PSS_TSTAB_PERIODS" ||
-                            key == "MAX_PSS_ITER" || key == "PSS_MAX_ITER" ||
-                            key == "PSS_ITERS" || key == "PSS_ITERATIONS" ||
-                            key == "UIC" || key == "USE_UIC" || key == "USE_INITIAL_CONDITIONS") {
-                            applyOptionToken(settings, tokens[i]);
-                            ++i;
-                            continue;
-                        }
-                    }
-                    if (upperToken == "AUTONOMOUS" || upperToken == "OSC" || upperToken == "OSCILLATOR") {
-                        settings.pss_autonomous = true;
+                    const std::string tokenUpper = toUpperCopy(tokens[i]);
+                    const size_t eq = tokens[i].find('=');
+                    if (tokenUpper == "DRIVEN" || tokenUpper == "OSCILLATOR" ||
+                        tokenUpper == "OSCILLATOR=YES" || tokenUpper == "USE_INITIAL_CONDITIONS=YES" ||
+                        tokenUpper == "PSS_ADAPTIVE=YES" || tokenUpper == "PSS_CONTINUATION=YES") {
                         ++i;
                         continue;
                     }
-                    if (upperToken == "DRIVEN") {
-                        settings.pss_autonomous = false;
-                        ++i;
-                        continue;
-                    }
-                    if (upperToken == "UIC" || upperToken == "USE_UIC" || upperToken == "USE_INITIAL_CONDITIONS") {
-                        settings.use_uic = true;
-                        ++i;
-                        continue;
-                    }
-                    bool is_int = !tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit);
-                    if (is_int) {
+                    if (eq != std::string::npos) {
+                        const std::string key = toUpperCopy(tokens[i].substr(0, eq));
+                        const std::string value = tokens[i].substr(eq + 1);
+                        if (key == "TSTAB") settings.pss_tstab = Utils::parseValue(value);
+                        else if (key == "TSTAB_PERIODS") settings.pss_tstab_periods = std::max(0, std::stoi(value));
+                        else if (key == "PSS_RESIDUAL_GOAL") settings.pss_residual_goal = Utils::parseValue(value);
+                        else if (key == "PSS_CONTINUATION_STEPS") settings.max_pss_iter = std::max(settings.max_pss_iter, std::stoi(value) * 2);
+                    } else if (!tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit)) {
                         settings.n_harms = std::stoi(tokens[i]);
-                        ++i;
-                        continue;
                     } else if (settings.f_fund.size() < 4) {
-                        settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                        try {
+                            settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                        } catch (const std::exception&) {
+                            netlist.addWarning("Line " + std::to_string(lineNo) + ": ignored unsupported " + cmd + " option: " + tokens[i]);
+                        }
                     } else {
                         std::cerr << "Warning: GSPICE supports max 4 tones. Ignoring extra: " << tokens[i] << std::endl;
                     }
@@ -2218,49 +2814,17 @@ Netlist Parser::parse(const std::string& filePath) {
                     netlist.addError("Line " + std::to_string(lineNo) + ": " + cmd + " requires at least 1 fundamental frequency.");
                 }
                 netlist.setSettings(settings);
-            } else if (cmd == ".SP") {
-                if (tokens.size() < 3) {
+            }
+ else if (cmd == ".SP") {
+                if (tokens.size() < 5) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "SP";
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                const std::string sweepType = toUpperCopy(tokens[1]);
-                settings.frequency_sweep_type = sweepType;
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
-                    for (size_t i = 2; i < tokens.size(); ++i) {
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
-                    }
-                    if (settings.frequency_values.empty()) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP VALUES line ignored: " + line);
-                        continue;
-                    }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                } else if (sweepType == "STEP") {
-                    if (tokens.size() < 5) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP STEP line ignored: " + line);
-                        continue;
-                    }
-                    settings.f_start = Utils::parseValue(tokens[2]);
-                    settings.f_stop = Utils::parseValue(tokens[3]);
-                    settings.frequency_step = Utils::parseValue(tokens[4]);
-                    settings.points_per_dec = 0;
-                    if (settings.frequency_step <= 0.0) {
-                        netlist.addError("Line " + std::to_string(lineNo) + ": .SP STEP increment must be positive: " + line);
-                    }
-                } else {
-                    if (tokens.size() < 5) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .SP sweep line ignored: " + line);
-                        continue;
-                    }
-                    settings.points_per_dec = std::stoi(tokens[2]);
-                    settings.f_start = Utils::parseValue(tokens[3]);
-                    settings.f_stop = Utils::parseValue(tokens[4]);
-                }
+                settings.points_per_dec = std::stoi(tokens[2]);
+                settings.f_start = Utils::parseValue(tokens[3]);
+                settings.f_stop = Utils::parseValue(tokens[4]);
                 netlist.setSettings(settings);
             } else if (cmd == ".NOISE") {
                 if (tokens.size() < 6) {
@@ -2269,57 +2833,20 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "NOISE";
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                std::string outNode;
-                std::string outRef;
-                if (!parseVoltageProbeToken(tokens[1], outNode, outRef) || !isGroundName(outRef)) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": .NOISE requires an output node as V(node): " + line);
-                    continue;
-                }
-                settings.out_node = netlist.findNode(outNode);
-                if (settings.out_node < 0) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": .NOISE output node '" + outNode + "' does not exist in the circuit; choose a real node to plot noise.");
-                    continue;
-                }
-                settings.noise_input_source = tokens.size() > 2 ? tokens[2] : "";
+                // tokens[1] is V(node)
+                std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
+                settings.out_node = netlist.getOrCreateNode(outNode);
                 size_t sweepIdx = 3;
                 std::string sweepType = toUpperCopy(tokens[sweepIdx]);
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
-                    if (tokens.size() < 5) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE VALUES line ignored: " + line);
-                        continue;
-                    }
-                    settings.frequency_sweep_type = sweepType;
-                    for (size_t i = sweepIdx + 1; i < tokens.size(); ++i) {
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
-                    }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                } else if (sweepType == "STEP") {
-                    if (tokens.size() < sweepIdx + 4) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE STEP line ignored: " + line);
-                        continue;
-                    }
-                    settings.frequency_sweep_type = "STEP";
-                    settings.f_start = Utils::parseValue(tokens[sweepIdx + 1]);
-                    settings.f_stop = Utils::parseValue(tokens[sweepIdx + 2]);
-                    settings.frequency_step = Utils::parseValue(tokens[sweepIdx + 3]);
-                    if (settings.frequency_step <= 0.0) {
-                        netlist.addError("Line " + std::to_string(lineNo) + ": .NOISE STEP increment must be positive: " + line);
-                    }
-                } else if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
+                if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
                     if (tokens.size() < 7) {
                         netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .NOISE sweep line ignored: " + line);
                         continue;
                     }
                     settings.points_per_dec = std::stoi(tokens[4]);
-                    settings.frequency_sweep_type = sweepType;
                     settings.f_start = Utils::parseValue(tokens[5]);
                     settings.f_stop = Utils::parseValue(tokens[6]);
                 } else {
-                    settings.frequency_sweep_type = "DEC";
                     settings.points_per_dec = std::stoi(tokens[3]);
                     settings.f_start = Utils::parseValue(tokens[4]);
                     settings.f_stop = Utils::parseValue(tokens[5]);
@@ -2412,31 +2939,9 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "STB";
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                const std::string sweepType = toUpperCopy(tokens[1]);
-                settings.frequency_sweep_type = sweepType;
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
-                    for (size_t i = 2; i < tokens.size(); ++i) {
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
-                    }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                } else if (sweepType == "STEP") {
-                    if (tokens.size() < 5) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .STB STEP line ignored: " + line);
-                        continue;
-                    }
-                    settings.f_start = Utils::parseValue(tokens[2]);
-                    settings.f_stop = Utils::parseValue(tokens[3]);
-                    settings.frequency_step = Utils::parseValue(tokens[4]);
-                    settings.points_per_dec = 0;
-                } else {
-                    settings.points_per_dec = std::stoi(tokens[2]);
-                    settings.f_start = Utils::parseValue(tokens[3]);
-                    settings.f_stop = Utils::parseValue(tokens[4]);
-                }
+                settings.points_per_dec = std::stoi(tokens[2]);
+                settings.f_start = Utils::parseValue(tokens[3]);
+                settings.f_stop = Utils::parseValue(tokens[4]);
                 netlist.setSettings(settings);
             } else if (cmd == ".PAC") {
                 if (tokens.size() < 5) {
@@ -2445,174 +2950,48 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "PAC";
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                settings.f_fund.clear();
-                const std::string sweepType = toUpperCopy(tokens[1]);
-                settings.frequency_sweep_type = sweepType;
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
-                    for (size_t i = 2; i < tokens.size(); ++i) {
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
-                    }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                } else if (sweepType == "STEP") {
-                    settings.f_start = Utils::parseValue(tokens[2]);
-                    settings.f_stop = Utils::parseValue(tokens[3]);
-                    settings.frequency_step = Utils::parseValue(tokens[4]);
-                    settings.points_per_dec = 0;
-                } else {
-                    settings.points_per_dec = std::stoi(tokens[2]);
-                    settings.f_start = Utils::parseValue(tokens[3]);
-                    settings.f_stop = Utils::parseValue(tokens[4]);
-                }
+                settings.points_per_dec = std::stoi(tokens[2]);
+                settings.f_start = Utils::parseValue(tokens[3]);
+                settings.f_stop = Utils::parseValue(tokens[4]);
                 netlist.setSettings(settings);
             } else if (cmd == ".PNOISE") {
                 if (tokens.size() < 2) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": .PNOISE requires an output node as V(node): " + line);
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
-                if (settings.type == "PSS") {
-                    settings.run_pnoise_after_pss = true;
-                } else {
-                    settings.type = "PNOISE";
-                }
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                std::string outNode;
-                std::string outRef;
-                if (!parseVoltageProbeToken(tokens[1], outNode, outRef) || !isGroundName(outRef)) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": .PNOISE requires an output node as V(node): " + line);
-                    continue;
-                }
-                settings.out_node = netlist.findNode(outNode);
-                if (settings.out_node < 0) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": .PNOISE output node '" + outNode + "' does not exist in the circuit; choose a real node to plot phase noise.");
-                    continue;
-                }
-                settings.pnoise_output_label = "V(" + outNode + ")";
-                auto isPnoiseSweep = [](const std::string& token) {
-                    const std::string upper = toUpperCopy(token);
-                    return upper == "VALUES" || upper == "VALUE" || upper == "LIST" ||
-                           upper == "STEP" || upper == "DEC" || upper == "OCT" || upper == "LIN";
-                };
-                settings.noise_input_source = "none";
-                size_t sweepIdx = 2;
-                if (tokens.size() > 2 && !isPnoiseSweep(tokens[2]) && tokens[2].find('=') == std::string::npos) {
-                    settings.noise_input_source = tokens[2];
-                    sweepIdx = 3;
-                }
-                std::string sweepType = sweepIdx < tokens.size() ? toUpperCopy(tokens[sweepIdx]) : "DEC";
-                settings.frequency_sweep_type = sweepType;
-                size_t optionsStart = tokens.size();
-                if (sweepIdx >= tokens.size() || tokens[sweepIdx].find('=') != std::string::npos) {
-                    settings.frequency_sweep_type = "DEC";
-                    settings.points_per_dec = 50;
-                    settings.f_start = 1e3;
-                    settings.f_stop = 100e6;
-                    optionsStart = sweepIdx;
-                } else if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
-                    if (tokens.size() < 5) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE VALUES line ignored: " + line);
-                        continue;
-                    }
-                    for (size_t i = sweepIdx + 1; i < tokens.size(); ++i) {
-                        if (tokens[i].find('=') != std::string::npos) {
-                            optionsStart = i;
-                            break;
-                        }
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
-                    }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                    if (optionsStart == tokens.size()) optionsStart = tokens.size();
-                } else if (sweepType == "STEP") {
-                    if (tokens.size() < sweepIdx + 4) {
-                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE STEP line ignored: " + line);
-                        continue;
-                    }
-                    settings.f_start = Utils::parseValue(tokens[sweepIdx + 1]);
-                    settings.f_stop = Utils::parseValue(tokens[sweepIdx + 2]);
-                    settings.frequency_step = Utils::parseValue(tokens[sweepIdx + 3]);
-                    settings.points_per_dec = 0;
-                    optionsStart = sweepIdx + 4;
-                } else if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
-                    settings.points_per_dec = tokens.size() > sweepIdx + 1 ? std::stoi(tokens[sweepIdx + 1]) : 50;
-                    settings.f_start = tokens.size() > sweepIdx + 2 ? Utils::parseValue(tokens[sweepIdx + 2]) : 1e3;
-                    settings.f_stop = tokens.size() > sweepIdx + 3 ? Utils::parseValue(tokens[sweepIdx + 3]) : 100e6;
-                    optionsStart = std::min(tokens.size(), sweepIdx + 4);
-                } else {
-                    settings.frequency_sweep_type = "DEC";
-                    settings.points_per_dec = tokens.size() > sweepIdx ? std::stoi(tokens[sweepIdx]) : 50;
-                    settings.f_start = tokens.size() > sweepIdx + 1 ? Utils::parseValue(tokens[sweepIdx + 1]) : 1e3;
-                    settings.f_stop = tokens.size() > sweepIdx + 2 ? Utils::parseValue(tokens[sweepIdx + 2]) : 100e6;
-                    optionsStart = std::min(tokens.size(), sweepIdx + 3);
-                }
-                for (size_t i = optionsStart; i < tokens.size(); ++i) {
-                    auto [key, value] = splitParameterToken(tokens[i]);
-                    const std::string option = toUpperCopy(key);
-                    if ((option == "FUND" || option == "FUNDAMENTAL" || option == "F0") && !value.empty()) {
-                        settings.f_fund.clear();
-                        settings.f_fund.push_back(Utils::parseValue(value));
-                    } else if ((option == "SIDEBANDS" || option == "SIDEBAND" || option == "MAXSIDEBAND") && !value.empty()) {
-                        settings.n_harms = std::max(0, std::stoi(value));
-                    } else {
-                        applyOptionToken(settings, tokens[i]);
-                    }
-                }
-                netlist.setSettings(settings);
-            } else if (cmd == ".PSSPAC" || cmd == ".PSSSTB") {
+                settings.type = "PNOISE";
+                std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
+                settings.out_node = netlist.getOrCreateNode(outNode);
                 if (tokens.size() < 6) {
-                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid " + cmd + " line ignored: " + line);
+                    settings.f_sweep_type = "DEC";
+                    settings.points_per_dec = 50;
+                    settings.f_start = 1.0;
+                    settings.f_stop = 100000.0;
+                    netlist.setSettings(settings);
                     continue;
                 }
-                SimulationSettings settings = netlist.getSettings();
-                settings.type = cmd.substr(1);
-                settings.frequency_values.clear();
-                settings.frequency_step = 0.0;
-                settings.f_fund.clear();
-                settings.f_fund.push_back(Utils::parseValue(tokens[1]));
-                const std::string sweepType = toUpperCopy(tokens[2]);
-                settings.frequency_sweep_type = sweepType;
-                size_t optionsStart = tokens.size();
-                if (sweepType == "VALUES" || sweepType == "VALUE" || sweepType == "LIST") {
-                    for (size_t i = 3; i < tokens.size(); ++i) {
-                        if (tokens[i].find('=') != std::string::npos) {
-                            optionsStart = i;
-                            break;
-                        }
-                        settings.frequency_values.push_back(Utils::parseValue(tokens[i]));
+                size_t sweepIdx = 3;
+                std::string sweepType = toUpperCopy(tokens[sweepIdx]);
+                settings.f_sweep_type = sweepType;
+                if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
+                    if (tokens.size() < 7) {
+                        netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE sweep line ignored: " + line);
+                        continue;
                     }
-                    settings.f_start = settings.frequency_values.front();
-                    settings.f_stop = settings.frequency_values.back();
-                    settings.points_per_dec = static_cast<int>(settings.frequency_values.size());
-                } else if (sweepType == "STEP") {
-                    settings.f_start = Utils::parseValue(tokens[3]);
-                    settings.f_stop = Utils::parseValue(tokens[4]);
-                    settings.frequency_step = Utils::parseValue(tokens[5]);
-                    settings.points_per_dec = 0;
-                    optionsStart = 6;
+                    settings.points_per_dec = std::stoi(tokens[4]);
+                    settings.f_start = Utils::parseValue(tokens[5]);
+                    settings.f_stop = Utils::parseValue(tokens[6]);
                 } else {
                     settings.points_per_dec = std::stoi(tokens[3]);
                     settings.f_start = Utils::parseValue(tokens[4]);
                     settings.f_stop = Utils::parseValue(tokens[5]);
-                    optionsStart = 6;
-                }
-                for (size_t i = optionsStart; i < tokens.size(); ++i) {
-                    auto [key, value] = splitParameterToken(tokens[i]);
-                    const std::string option = toUpperCopy(key);
-                    if ((option == "SIDEBANDS" || option == "SIDEBAND" || option == "MAXSIDEBAND") && !value.empty()) {
-                        settings.n_harms = std::max(0, std::stoi(value));
-                    }
                 }
                 netlist.setSettings(settings);
-            } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" || 
-                       cmd == ".PSSSP") {
+            } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" ||
+                       cmd == ".PSSSP" || cmd == ".PSSSTB" || cmd == ".PSTB") {
                 SimulationSettings settings = netlist.getSettings();
-                settings.type = cmd.substr(1);
+                settings.type = (cmd == ".PSTB") ? "PSSSTB" : cmd.substr(1);
                 
                 size_t i = 1;
                 while (i < tokens.size()) {
@@ -2633,25 +3012,77 @@ Netlist Parser::parse(const std::string& filePath) {
             }
 
         } else if (firstChar == 'R') {
-            // Resistor: Rname N1 N2 Value
+            // Resistor: Rname N1 N2 Value or R=<value>
             if (tokens.size() < 4) {
                 netlist.addError("Line " + std::to_string(lineNo) + ": invalid resistor line: " + line);
                 continue;
             }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
-            double val = Utils::parseValue(tokens[3]);
+            double val = 0.0;
+            if (!parsePrimitiveValue(tokens, 3, {"R", "RES", "VALUE"}, val)) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid resistor value: " + line);
+                continue;
+            }
             netlist.addDevice(std::make_unique<Resistor>(tokens[0], n1, n2, val));
         } else if (firstChar == 'C') {
-            // Capacitor: Cname N1 N2 Value
+            // Capacitor: Cname N1 N2 Value or C=<value>
             if (tokens.size() < 4) {
                 netlist.addError("Line " + std::to_string(lineNo) + ": invalid capacitor line: " + line);
                 continue;
             }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
-            double val = Utils::parseValue(tokens[3]);
+double val = 0.0;
+            const ModelCard* capModel = netlist.findModelCard(tokens[3]);
+            if (capModel && modelTypeMatches(capModel, {"C", "CAP"})) {
+                const auto instanceParams = parseParameterTokens(tokens, 4);
+                const double cj = paramValue(capModel->params, {"CJ", "C", "CAP"}, std::numeric_limits<double>::quiet_NaN());
+                const double cjsw = paramValue(capModel->params, {"CJSW"}, 0.0);
+                const double l = paramValue(instanceParams, {"L"}, 1.0);
+                const double w = paramValue(instanceParams, {"W"}, 1.0);
+                const double scale = paramValue(instanceParams, {"SCALE"}, 1.0);
+                const double tempC = netlist.getSettings().temperature_c;
+                const double tnom = paramValue(capModel->params, {"TNOM"}, 27.0);
+                const double tc1 = paramValue(instanceParams, {"TC1"}, paramValue(capModel->params, {"TC1"}, 0.0));
+                const double tc2 = paramValue(instanceParams, {"TC2"}, paramValue(capModel->params, {"TC2"}, 0.0));
+                if (std::isfinite(cj)) {
+                    const double deltaT = tempC - tnom;
+                    const double tempScale = std::max(1.0 + tc1 * deltaT + tc2 * deltaT * deltaT, 1e-12);
+                    val = (cj * l * w + cjsw * 2.0 * (l + w)) * scale * tempScale;
+                    if (verboseCompatWarnings()) {
+                        netlist.addWarning(
+                            "Line " + std::to_string(lineNo) +
+                            ": capacitor model '" + tokens[3] +
+                            "' routed as (CJ*L*W + CJSW*perimeter)*SCALE with TC1/TC2 temperature scaling.");
+                    }
+                }
+            } else {
+                bool parsedOk = parsePrimitiveValue(tokens, 3, {"C", "CAP", "VALUE"}, val);
+                (void)parsedOk;
+                if (val == 0.0 && !parsedOk) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": invalid capacitor value: " + line);
+                    continue;
+                }
+            }
             netlist.addDevice(std::make_unique<Capacitor>(tokens[0], n1, n2, val));
+        } else if (firstChar == 'Y') {
+            if (tokens.size() < 5 || toUpperCopy(tokens[3]) != "MOSVAR") {
+                netlist.addError("Line " + std::to_string(lineNo) + ": unsupported Y element: " + line);
+                continue;
+            }
+            int n1 = netlist.getOrCreateNode(tokens[1]);
+            int n2 = netlist.getOrCreateNode(tokens[2]);
+            const auto params = parseParameterTokens(tokens, 4);
+            const double cacc = paramValue(params, {"CACC", "CACCUM", "C"}, std::numeric_limits<double>::quiet_NaN());
+            if (!std::isfinite(cacc) || cacc <= 0.0) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid MOSVAR capacitance: " + line);
+                continue;
+            }
+            const double cmin = paramValue(params, {"CMIN"}, 0.15 * cacc);
+            const double vfb = paramValue(params, {"VFB", "VFBO"}, 0.0);
+            const double slope = paramValue(params, {"SLOPE"}, 0.25);
+            netlist.addDevice(std::make_unique<MosvarCapacitor>(tokens[0], n1, n2, cacc, cmin, vfb, slope));
         } else if (firstChar == 'L') {
             // Inductor: Lname N1 N2 Value
             if (tokens.size() < 4) {
@@ -2782,14 +3213,112 @@ Netlist Parser::parse(const std::string& filePath) {
                 netlist.addError("Line " + std::to_string(lineNo) + ": S-parameter device requires file=\"path\": " + line);
                 continue;
             }
-            netlist.addDevice(std::make_unique<MultiPort>(tokens[0], nodes, nodes.size(), filename));
+            const int portCount = static_cast<int>(nodes.size());
+            netlist.addDevice(std::make_unique<MultiPort>(tokens[0], nodes, portCount, filename));
         } else if (firstChar == 'X') {
             netlist.addError(
                 "Line " + std::to_string(lineNo) +
                 ": subcircuit instance is not implemented yet; refusing to ignore active device: " + line);
         } else if (firstChar == 'N') {
-            netlist.addError("Line " + std::to_string(lineNo) +
-                ": external compact-model N devices are disabled in this Apache build; use a native compact model.");
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid native compact-model N-device line: " + line);
+                continue;
+            }
+            std::size_t modelIndex = 0;
+            const ModelCard* model = nullptr;
+            for (std::size_t i = 2; i < tokens.size(); ++i) {
+                model = netlist.findModelCard(tokens[i]);
+                if (model) {
+                    modelIndex = i;
+                    break;
+                }
+            }
+            if (!model) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": model card not found for native compact device: " + line);
+                continue;
+            }
+            const bool pspModel = isPsp103ModelCard(*model);
+            const auto* artifact = netlist.findGsdiArtifact(pspModel ? psp103GsdiType(*model) : model->type);
+            if (!artifact) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": .GSDI artifact for model type '" + model->type +
+                    "' was not loaded before native compact device '" + tokens[0] + "'.");
+                continue;
+            }
+            const std::size_t terminalCount = modelIndex - 1;
+            if (artifact->terminal_count > 0 &&
+                terminalCount != static_cast<std::size_t>(artifact->terminal_count)) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": native compact device '" + tokens[0] + "' has " +
+                    std::to_string(terminalCount) + " terminal(s), but .GSDI model type '" +
+                    model->type + "' declares " + std::to_string(artifact->terminal_count) + ".");
+                continue;
+            }
+            auto instanceParams = parseParameterTokens(tokens, modelIndex + 1);
+            const std::string unknownModelParam = firstUnknownGsdiParameter(*artifact, model->params);
+            if (!unknownModelParam.empty()) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": .MODEL parameter '" + unknownModelParam + "' is not declared by .GSDI model type '" +
+                    model->type + "'.");
+                continue;
+            }
+            const std::string unknownInstanceParam = firstUnknownGsdiParameter(*artifact, instanceParams);
+            if (!unknownInstanceParam.empty()) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": native compact device parameter '" + unknownInstanceParam +
+                    "' is not declared by .GSDI model type '" + model->type + "'.");
+                continue;
+            }
+            ensureGmcGeneratedModels();
+            if (pspModel) {
+                ensurePsp103GmcModels();
+            }
+            std::vector<int> deviceNodes;
+            deviceNodes.reserve(terminalCount);
+            for (std::size_t i = 1; i < modelIndex; ++i) {
+                deviceNodes.push_back(netlist.getOrCreateNode(tokens[i]));
+            }
+            if (pspModel && deviceNodes.size() >= 4) {
+                const double gateResistance = psp103RfGateResistance(*model, instanceParams);
+                if (gateResistance > 0.0) {
+                    const int externalGate = deviceNodes[1];
+                    const int internalGate = netlist.createInternalNode(tokens[0] + ".rg", 0);
+                    netlist.addDevice(std::make_unique<Resistor>(
+                        "R_" + tokens[0] + "_RG", externalGate, internalGate, gateResistance));
+                    deviceNodes[1] = internalGate;
+                    netlist.addModelStatus("GMC PSP RF gate resistance: " + tokens[0]);
+                }
+            }
+            std::vector<int> internalNodes;
+            const std::size_t hiddenCount = GmcRegistry::instance().internalNodeCount(model->type);
+            internalNodes.reserve(hiddenCount);
+            for (std::size_t k = 0; k < hiddenCount; ++k) {
+                internalNodes.push_back(netlist.createInternalNode(tokens[0], k));
+            }
+            GmcModelDefinition definition{
+                tokens[0],
+                pspModel ? psp103GmcType(*model) : model->type,
+                pspModel ? psp103ModelParams(*model) : model->params,
+                instanceParams,
+                deviceNodes,
+                netlist.getSettings().temperature_c,
+                internalNodes
+            };
+            auto device = GmcRegistry::instance().create(definition);
+            if (!device) {
+                netlist.addError(
+                    "Line " + std::to_string(lineNo) +
+                    ": no native GSDI/GMC model is registered for type '" + model->type +
+                    "'; compile the Verilog-A with GMC to a .gsdi artifact and build/load that native model before running this deck.");
+                continue;
+            }
+            netlist.addDevice(std::move(device));
         } else if (firstChar == 'M') {
             // MOSFET: Mname D G S B Model [W=..] [L=..]
             if (tokens.size() < 6) {
@@ -2818,7 +3347,108 @@ Netlist Parser::parse(const std::string& filePath) {
             double lambda = 0.05;
             double gamma = 0.4;
             double phi = 0.7;
-            if (modelCard && modelTypeMatches(modelCard, {"NMOS", "PMOS", "N", "P"})) {
+            const auto instanceParams = parseParameterTokens(tokens, 6);
+            w = paramValue(instanceParams, {"W"}, w);
+            l = paramValue(instanceParams, {"L"}, l);
+            if (modelCard && isPsp103ModelCard(*modelCard)) {
+                const auto* artifact = netlist.findGsdiArtifact(psp103GsdiType(*modelCard));
+                if (!artifact) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": .GSDI artifact for model type '" + modelCard->type +
+                        "' was not loaded before PSP103 MOS device '" + tokens[0] + "'.");
+                    continue;
+                }
+                if (artifact->terminal_count > 0 && artifact->terminal_count != 4) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": PSP103 MOS device '" + tokens[0] +
+                        "' requires 4 terminals, but .GSDI model type '" +
+                        modelCard->type + "' declares " +
+                        std::to_string(artifact->terminal_count) + ".");
+                    continue;
+                }
+                ensurePsp103GmcModels();
+                std::array<int, 4> pspNodes = {nD, nG, nS, nB};
+                const double gateResistance = psp103RfGateResistance(*modelCard, instanceParams);
+                if (gateResistance > 0.0) {
+                    const int internalGate = netlist.createInternalNode(tokens[0] + ".rg", 0);
+                    netlist.addDevice(std::make_unique<Resistor>(
+                        "R_" + tokens[0] + "_RG", nG, internalGate, gateResistance));
+                    pspNodes[1] = internalGate;
+                    netlist.addModelStatus("GMC PSP RF gate resistance: " + tokens[0]);
+                }
+                GmcModelDefinition definition{
+                    tokens[0], psp103GmcType(*modelCard), psp103ModelParams(*modelCard),
+                    instanceParams, {pspNodes[0], pspNodes[1], pspNodes[2], pspNodes[3]},
+                    netlist.getSettings().temperature_c};
+                auto device = GmcRegistry::instance().create(definition);
+                if (!device) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": PSP103 model '" + tokens[5] +
+                        "' was routed through native GSDI/GMC, but its electrical evaluator "
+                        "is not implemented; refusing primitive Level-1 fallback.");
+                } else {
+                    netlist.addDevice(std::move(device));
+                }
+                continue;
+            } else if (modelCard && isUnsupportedCompactMosLevel(modelCard) &&
+                       static_cast<int>(paramValue(modelCard->params, {"LEVEL"}, 1.0)) == 49) {
+                ensureBsim3GmcModels();
+                GmcModelDefinition definition{
+                    tokens[0], type > 0 ? "BSIM3_NMOS" : "BSIM3_PMOS",
+                    modelCard->params, instanceParams, {nD, nG, nS, nB},
+                    netlist.getSettings().temperature_c};
+                auto device = GmcRegistry::instance().create(definition);
+                if (!device) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": native BSIM3 translation/evaluation rejected this model; "
+                        "refusing primitive fallback.");
+                } else {
+                    const std::string ignoredSummary = bsim3IgnoredParameterSummary(*modelCard);
+                    if (verboseCompatWarnings() && !ignoredSummary.empty()) {
+                        netlist.addWarning(
+                            "Line " + std::to_string(lineNo) +
+                            ": " + ignoredSummary);
+                    }
+                    netlist.addModelStatus("GMC BSIM3: " + tokens[0]);
+                    netlist.addDevice(std::move(device));
+                }
+                continue;
+            } else if (modelCard && isUnsupportedCompactMosLevel(modelCard) &&
+                       static_cast<int>(paramValue(modelCard->params, {"LEVEL"}, 1.0)) == 54) {
+                ensureBsim4GmcModels();
+                GmcModelDefinition definition{
+                    tokens[0], type > 0 ? "BSIM4_NMOS" : "BSIM4_PMOS",
+                    modelCard->params, instanceParams, {nD, nG, nS, nB},
+                    netlist.getSettings().temperature_c};
+                auto device = GmcRegistry::instance().create(definition);
+                if (!device) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": native BSIM4 translation/evaluation rejected this model; "
+                        "refusing primitive fallback.");
+                } else {
+                    const std::string ignoredSummary = bsim4IgnoredParameterSummary(*modelCard);
+                    if (verboseCompatWarnings() && !ignoredSummary.empty()) {
+                        netlist.addWarning(
+                            "Line " + std::to_string(lineNo) +
+                            ": " + ignoredSummary);
+                    }
+                    netlist.addModelStatus("GMC BSIM4: " + tokens[0]);
+                    netlist.addDevice(std::move(device));
+                }
+                continue;
+            } else if (modelCard && modelTypeMatches(modelCard, {"NMOS", "PMOS", "N", "P"})) {
+                if (isUnsupportedCompactMosLevel(modelCard) && !primitiveModelFallbackEnabled()) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": BSIM compact MOS level " + std::to_string(static_cast<int>(paramValue(modelCard->params, {"LEVEL"}, 1.0))) +
+                        " is not implemented; refusing primitive Level-1 fallback.");
+                    continue;
+                }
                 vth = paramValue(modelCard->params, {"VTO", "VT0", "VTH", "VTH0"}, vth);
                 kp = paramValue(modelCard->params, {"KP", "BETA", "K"}, kp);
                 lambda = paramValue(modelCard->params, {"LAMBDA", "LAMDA"}, lambda);
@@ -2830,7 +3460,7 @@ Netlist Parser::parse(const std::string& filePath) {
                         "Line " + std::to_string(lineNo) +
                         ": MOS model '" + tokens[5] + "' has compact/PDK type '" +
                         modelCard->type + "'. Refusing primitive Level-1 fallback. "
-                        "Implement the model natively or set GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK=1 only for debug smoke decks.");
+                        "Add the matching native GSDI/GMC model or set GSPICE_ALLOW_PRIMITIVE_MODEL_FALLBACK=1 only for debug smoke decks.");
                     continue;
                 }
                 netlist.addWarning(
@@ -2841,7 +3471,7 @@ Netlist Parser::parse(const std::string& filePath) {
                 netlist.addError(
                     "Line " + std::to_string(lineNo) +
                     ": MOS model '" + tokens[5] + "' looks like a PDK compact model but no supported model card was loaded. "
-                    "Refusing primitive Level-1 fallback; implement the model natively first.");
+                    "Refusing primitive Level-1 fallback; add the real native GSDI/GMC model first.");
                 continue;
             }
 
@@ -2852,7 +3482,25 @@ Netlist Parser::parse(const std::string& filePath) {
                 if (upperTok.rfind("L=", 0) == 0) l = Utils::parseValue(stripQuotes(tokens[i].substr(2)));
             }
 
-            netlist.addDevice(std::make_unique<Mosfet>(tokens[0], nD, nG, nS, nB, type, w, l, vth, kp, lambda, gamma, phi));
+            ensurePrimitiveMosGmcModels();
+            GmcModelDefinition definition{
+                tokens[0], type > 0 ? "NMOS" : "PMOS",
+                {{"VTO", std::to_string(vth)}, {"KP", std::to_string(kp)},
+                 {"LAMBDA", std::to_string(lambda)}, {"GAMMA", std::to_string(gamma)},
+                 {"PHI", std::to_string(phi)}},
+                {{"W", std::to_string(w)}, {"L", std::to_string(l)}},
+                {nD, nG, nS, nB},
+                netlist.getSettings().temperature_c
+            };
+            auto device = GmcRegistry::instance().create(definition);
+            if (!device) {
+                netlist.addError("Line " + std::to_string(lineNo) +
+                                 ": native GMC primitive MOS factory is unavailable");
+                continue;
+            }
+            netlist.addModelStatus("GMC primitive MOS: " + tokens[0] +
+                                   " type=" + definition.type);
+            netlist.addDevice(std::move(device));
         } else if (firstChar == 'V') {
             // Voltage Source: Vname N1 N2 [DC <value>] [AC <mag>] [PULSE(...)/SIN(...)/PWL(...)] or scalar value
             if (tokens.size() < 4) {
@@ -2864,14 +3512,13 @@ Netlist Parser::parse(const std::string& filePath) {
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
-            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -2880,7 +3527,6 @@ Netlist Parser::parse(const std::string& filePath) {
 
             auto vsrc = std::make_unique<VoltageSource>(tokens[0], n1, n2, dcValue, -1);
             vsrc->setAcMagnitude(acMagnitude);
-            vsrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) vsrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) vsrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) vsrc->setPwl(pwlT, pwlV);
@@ -2896,14 +3542,13 @@ Netlist Parser::parse(const std::string& filePath) {
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
-            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -2911,7 +3556,6 @@ Netlist Parser::parse(const std::string& filePath) {
             }
             auto isrc = std::make_unique<CurrentSource>(tokens[0], n1, n2, dcValue);
             isrc->setAcMagnitude(acMagnitude);
-            isrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) isrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) isrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) isrc->setPwl(pwlT, pwlV);
@@ -2926,8 +3570,11 @@ Netlist Parser::parse(const std::string& filePath) {
             int nB = netlist.getOrCreateNode(tokens[2]);
             int nE = netlist.getOrCreateNode(tokens[3]);
             size_t modelIdx = 4;
-            if (tokens.size() >= 6 && !netlist.findModelCard(tokens[4]) && netlist.findModelCard(tokens[5])) {
-                modelIdx = 5; // substrate node is accepted but ignored by this first-pass BJT.
+            while (modelIdx < tokens.size() && !netlist.findModelCard(tokens[modelIdx])) {
+                ++modelIdx;
+            }
+            if (modelIdx >= tokens.size()) {
+                modelIdx = 4;
             }
             const ModelCard* modelCard = netlist.findModelCard(tokens[modelIdx]);
             int type = 1;
@@ -2979,12 +3626,39 @@ Netlist Parser::parse(const std::string& filePath) {
             }
             int n1 = netlist.getOrCreateNode(tokens[1]);
             int n2 = netlist.getOrCreateNode(tokens[2]);
+            const ModelCard* modelCard = tokens.size() >= 4 ? netlist.findModelCard(tokens[3]) : nullptr;
+            if (modelCard && (toUpperCopy(modelCard->type) == "JUNCAPEXP" ||
+                              toUpperCopy(modelCard->type) == "JUNCAP2")) {
+                const auto params = parseParameterTokens(tokens, 4);
+                const double swjunexp = paramValue(modelCard->params, {"SWJUNEXP"}, 1.0);
+                const bool express = toUpperCopy(modelCard->type) == "JUNCAPEXP" && swjunexp == 1.0;
+                if (toUpperCopy(modelCard->type) == "JUNCAPEXP" && swjunexp != 0.0 && swjunexp != 1.0) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": JUNCAPEXP SWJUNEXP must be 0 or 1.");
+                    continue;
+                }
+                ensureJuncapExpressGmcModels();
+                GmcModelDefinition definition{
+                    tokens[0], express ? "JUNCAPEXP" : "JUNCAP2", modelCard->params, params,
+                    {n1, n2}, netlist.getSettings().temperature_c};
+                auto device = GmcRegistry::instance().create(definition);
+                if (!device) {
+                    netlist.addError(
+                        "Line " + std::to_string(lineNo) +
+                        ": native JUNCAP factory could not create diode '" +
+                        tokens[0] + "'.");
+                } else {
+                    netlist.addModelStatus(std::string(express ? "GMC JUNCAP Express: " : "GMC JUNCAP2: ") + tokens[0]);
+                    netlist.addDevice(std::move(device));
+                }
+                continue;
+            }
             double is = 1e-14;
             double n = 1.0;
             double cjo = 0.0;
             double area = 1.0;
             if (tokens.size() >= 4) {
-                const ModelCard* modelCard = netlist.findModelCard(tokens[3]);
                 if (modelCard && modelTypeMatches(modelCard, {"D", "DIODE"})) {
                     is = paramValue(modelCard->params, {"IS", "JS"}, is);
                     n = paramValue(modelCard->params, {"N", "NF"}, n);

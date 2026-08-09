@@ -214,6 +214,7 @@ def main():
                         default="", help="Forward waveform save mode to remote gspice")
     parser.add_argument("--adaptive-maxstep", action="store_true",
                         help="Forward --adaptive-maxstep to remote gspice")
+    parser.add_argument("--threads", type=int, default=1, help="Forward thread count to remote gspice")
     parser.add_argument("--local-binary", default="", help="Local GSPICE binary path to deploy to remote host")
     parser.add_argument("--deploy-binary", action="store_true", help="Upload local GSPICE binary to remote host")
     parser.add_argument("--keep-remote", action="store_true", default=True, help="Retain results on remote machine B")
@@ -283,6 +284,7 @@ def main():
         cmd += ["--save", args.save.lower()]
     if args.adaptive_maxstep:
         cmd += ["--adaptive-maxstep"]
+    cmd += ["--threads", str(max(1, min(16, int(args.threads or 1))))]
     out_path = args.output if args.output else os.path.basename(args.input) + ".raw"
 
     returncode = run_remote_simulation_with_periodic_sync(

@@ -68,36 +68,29 @@ struct SimulationSettings {
     double t_step = 0.0;
     double t_start = 0.0;
     double t_max_step = 0.0;
+    bool tran_max_step_auto = false;
     double t_min_step = 0.0;
-    bool ignore_tran_tmax = false;
     bool tran_adaptive = true;
     bool tran_predictor = true;
     std::string tran_method = "AUTO";
     std::string tran_lte_mode = "PREDICTOR";
     int tran_lte_audit_interval = 0;
-    int tran_lte_charge_interval = 16;
-    std::string tran_lte_reference = "HISTORY";
-    double tran_breakpoint_growth = 4.0;
     bool tran_order_adaptive = true;
     bool tran_trap_ringing = true;
     double tran_lte_reltol = 5e-3;
     double tran_lte_abstol = 1e-6;
     double tran_trtol = 1.0;
     double chgtol = 1e-14;
-    double fluxtol = 1e-12;
+    double cshunt = -1.0;  // <0 means AUTO; 0 explicitly disables the shunt floor.
     int tran_max_order = 2;
     bool save_adaptive_steps = false;
-    double tran_progress_interval = 1.0;
     double f_start = 0.0;
     double f_stop = 0.0;
     int points_per_dec = 0;
-    std::string frequency_sweep_type = "DEC";
-    double frequency_step = 0.0;
-    std::vector<double> frequency_values;
+    std::string f_sweep_type = "DEC";
+    std::vector<double> f_values;
     bool use_uic = false;
     double temperature_c = 27.0;
-    double nominal_temperature_c = 27.0;
-    double geometry_scale = 1.0;
 
     // DC sweep parameters
     std::string dc_sweep_source;
@@ -135,7 +128,6 @@ struct SimulationSettings {
     double vntol = 1e-6;
     double abstol = 1e-12;
     double gmin = 1e-12;
-    double minr = 1e-12;
     int op_max_iter = 100;
     int tran_max_iter = 50;
     std::string solver_backend = "AUTO";
@@ -153,9 +145,9 @@ struct SimulationSettings {
     double nodeset_conductance = 1e6;
     bool dae_audit = false;
     double dae_audit_tolerance = 2e-4;
+    bool tran_verbose_debug = false;
     bool fastspice = false;
     bool multirate = false;
-    bool transient_stamp_cache = true;
     bool parallel_solve = false;
     bool ticer = false;
     double ticer_fmax = 1e9;
@@ -165,30 +157,13 @@ struct SimulationSettings {
     std::vector<double> f_fund; // List of fundamental frequencies (e.g., f1, f2, f3, f4)
     int n_harms = 0;             // Number of harmonics per tone
     int max_pss_iter = 10;       // Max shooting iterations
-    bool pss_autonomous = false; // Solve period as an unknown with a phase condition
-    double pss_tstab = 0.0;      // Stabilization/runup time before shooting
-    int pss_tstab_periods = 0;   // Stabilization/runup periods before shooting
-    bool pss_adaptive = false;   // Use adaptive transient substeps inside each PSS sample interval
-    bool pss_continuation = true;
-    int pss_continuation_steps = 3;
+    bool pss_requested = false;
+    double pss_tstab = 0.0;
+    int pss_tstab_periods = 0;
     double pss_residual_goal = 1.0;
-    bool pnoise_phase_noise = false;
-    bool pnoise_jitter = false;
-    bool run_pnoise_after_pss = false;
-    double pnoise_carrier_hz = 0.0;
-    std::string pnoise_output_label;
 
     // Noise Parameters
     int out_node = -1;
-    std::string noise_input_source;
-    bool transient_noise = false;
-    double transient_noise_fmin = 0.0;
-    double transient_noise_fmax = 0.0;
-    double transient_noise_scale = 1.0;
-    unsigned int transient_noise_seed = 1;
-    std::string transient_noise_mode = "ZOH";
-    int transient_noise_oversample = 6;
-    int transient_noise_colored_tones_per_dec = 4;
 
     // Measurements
     std::vector<MeasureSpec> measures;
@@ -206,6 +181,14 @@ struct ModelCard {
     std::string name;
     std::string type;
     std::unordered_map<std::string, std::string> params;
+    CompactModelInfo compact;
+};
+
+struct GsdiArtifactInfo {
+    std::string model_type;
+    std::string path;
+    int terminal_count = 0;
+    std::vector<std::string> parameter_names;
 };
 
 class Netlist {
@@ -230,6 +213,14 @@ public:
     }
 
     int getNumNodes() const { return next_node_id_; }
+
+    // Allocates a hidden model-internal node (e.g. series-resistance node of a
+    // compact model). The column participates in the MNA matrix like any other
+    // node; the generated name is namespaced so it cannot collide with user
+    // node names and stays probeable by name for debugging.
+    int createInternalNode(const std::string& device_name, std::size_t index) {
+        return getOrCreateNode("%internal." + device_name + "." + std::to_string(index));
+    }
 
     std::string getNodeName(int index) const {
         auto it = node_names_.find(index);
@@ -262,30 +253,29 @@ public:
     }
 
     void addModelCard(const ModelCard& model) {
-        model_cards_[model.name] = model;
-        model_cards_[normalizeKey(model.name)] = model;
-        std::string upper = model.name;
-        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
-            return static_cast<char>(std::toupper(c));
-        });
-        model_cards_[upper] = model;
+        ModelCard cached = model;
+        cached.compact = CompactModelRegistry::instance().classify(model.type);
+        model_cards_[normalizeKey(model.name)] = cached;
     }
 
     const ModelCard* findModelCard(const std::string& name) const {
-        auto it = model_cards_.find(name);
-        if (it != model_cards_.end()) return &it->second;
-        it = model_cards_.find(normalizeKey(name));
-        if (it != model_cards_.end()) return &it->second;
-        std::string upper = name;
-        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
-            return static_cast<char>(std::toupper(c));
-        });
-        it = model_cards_.find(upper);
+        auto it = model_cards_.find(normalizeKey(name));
         if (it != model_cards_.end()) return &it->second;
         return nullptr;
     }
 
+    void addGsdiArtifact(const GsdiArtifactInfo& artifact) {
+        gsdi_artifacts_[normalizeKey(artifact.model_type)] = artifact;
+    }
+
+    const GsdiArtifactInfo* findGsdiArtifact(const std::string& modelType) const {
+        auto it = gsdi_artifacts_.find(normalizeKey(modelType));
+        if (it != gsdi_artifacts_.end()) return &it->second;
+        return nullptr;
+    }
+
     void addWarning(const std::string& message) {
+        if (std::find(warnings_.begin(), warnings_.end(), message) != warnings_.end()) return;
         warnings_.push_back(message);
     }
 
@@ -314,6 +304,7 @@ private:
     std::unordered_map<std::string, int> node_map_;
     std::map<int, std::string> node_names_;
     std::unordered_map<std::string, ModelCard> model_cards_;
+    std::unordered_map<std::string, GsdiArtifactInfo> gsdi_artifacts_;
     std::vector<std::string> model_status_;
     std::vector<std::string> warnings_;
     std::vector<std::string> errors_;

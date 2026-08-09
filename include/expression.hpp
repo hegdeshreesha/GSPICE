@@ -426,6 +426,7 @@ private:
             if (name == "FLOOR") return std::floor(arg(args, 0, name));
             if (name == "CEIL" || name == "CEILING") return std::ceil(arg(args, 0, name));
             if (name == "ROUND") return std::round(arg(args, 0, name));
+            if (name == "GAUSS" || name == "AGAUSS") return arg(args, 0, name);
             throw std::runtime_error("Unsupported expression function '" + name + "'");
         }
     };
