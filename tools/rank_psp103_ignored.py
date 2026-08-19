@@ -3,7 +3,7 @@
 
 The tool is intentionally conservative.  It does not claim numerical error;
 it tells us which unsupported official PSP parameters are most likely to
-explain a speed/fidelity difference versus an OSDI/OpenVAF PSP103 run.
+explain a speed/fidelity difference versus an external PSP103 reference run.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
-MODEL_BLOCK = re.compile(r"(?m)^\s*\.model\s+(\S+)\s+(\S+)[\s\S]*?(?=^\s*\.|\Z)")
+MODEL_BLOCK = re.compile(r"(?im)^\s*\.model\s+(\S+)\s+(\S+)(?:[^\n]*(?:\n\s*\+.*)*)")
 PARAM_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=")
 INCLUDE_TOKEN = re.compile(r"(?im)^\s*\.(?:include|lib)\s+\"?([^\"\s]+)\"?")
 

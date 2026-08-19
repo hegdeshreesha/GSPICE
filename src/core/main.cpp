@@ -22,6 +22,8 @@
 #include <functional>
 #include <random>
 #include <map>
+#include <tuple>
+#include <numeric>
 #include <filesystem>
 #include <atomic>
 #include <omp.h>
@@ -31,6 +33,7 @@
 #include "devices/resistor.hpp"
 #include "devices/capacitor.hpp"
 #include "devices/inductor.hpp"
+#include "devices/mutual_inductor.hpp"
 #include "devices/diode.hpp"
 #include "devices/voltage_source.hpp"
 #include "devices/port.hpp"
@@ -634,34 +637,178 @@ struct TranSample {
     VectorReal x;
 };
 
+bool names_match(const std::string& lhs, const std::string& rhs);
+int branch_index_for_device(const Device* dev);
+
 double measure_probe_at_sample(const TranSample& sample, const MeasureSpec& measure) {
     return probe_value(sample.x, measure.node_pos, measure.node_neg);
 }
 
-double interpolate_measure_value(const std::vector<TranSample>& samples, const MeasureSpec& measure, double time) {
+double measure_probe_at_sample(
+    const TranSample& sample,
+    const MeasureSpec& measure,
+    const std::vector<std::unique_ptr<Device>>& devices) {
+    if (upper_copy(measure.kind) != "I") return measure_probe_at_sample(sample, measure);
+    for (const auto& device : devices) {
+        if (!names_match(device->getName(), measure.device_name)) continue;
+        const int branch = branch_index_for_device(device.get());
+        if (branch >= 0) return sample.x[branch];
+        double current = 0.0;
+        return device->probeCurrent(sample.x, current, sample.time) ? current : 0.0;
+    }
+    return 0.0;
+}
+
+double interpolate_measure_value(
+    const std::vector<TranSample>& samples,
+    const MeasureSpec& measure,
+    const std::vector<std::unique_ptr<Device>>& devices,
+    double time) {
     if (samples.empty()) return 0.0;
-    if (time <= samples.front().time) return measure_probe_at_sample(samples.front(), measure);
+    if (time <= samples.front().time) return measure_probe_at_sample(samples.front(), measure, devices);
     for (size_t i = 1; i < samples.size(); ++i) {
         if (time <= samples[i].time) {
             const double t0 = samples[i - 1].time;
             const double t1 = samples[i].time;
-            const double y0 = measure_probe_at_sample(samples[i - 1], measure);
-            const double y1 = measure_probe_at_sample(samples[i], measure);
+            const double y0 = measure_probe_at_sample(samples[i - 1], measure, devices);
+            const double y1 = measure_probe_at_sample(samples[i], measure, devices);
             if (t1 <= t0) return y1;
             const double alpha = (time - t0) / (t1 - t0);
             return y0 + alpha * (y1 - y0);
         }
     }
-    return measure_probe_at_sample(samples.back(), measure);
+    return measure_probe_at_sample(samples.back(), measure, devices);
 }
 
-double evaluate_transient_measure(const std::vector<TranSample>& samples, const MeasureSpec& measure) {
+double integrate_measure_value(
+    const std::vector<TranSample>& samples,
+    const MeasureSpec& measure,
+    const std::vector<std::unique_ptr<Device>>& devices,
+    double from,
+    double to) {
+    if (samples.empty() || to <= from) return 0.0;
+    std::vector<std::pair<double, double>> points;
+    points.push_back({from, interpolate_measure_value(samples, measure, devices, from)});
+    for (const auto& sample : samples) {
+        if (sample.time <= from || sample.time >= to) continue;
+        points.push_back({sample.time, measure_probe_at_sample(sample, measure, devices)});
+    }
+    points.push_back({to, interpolate_measure_value(samples, measure, devices, to)});
+    std::sort(points.begin(), points.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+    double area = 0.0;
+    for (size_t i = 1; i < points.size(); ++i) {
+        const double dt = points[i].first - points[i - 1].first;
+        if (dt <= 0.0) continue;
+        area += 0.5 * (points[i - 1].second + points[i].second) * dt;
+    }
+    return area;
+}
+
+double derivative_measure_value(
+    const std::vector<TranSample>& samples,
+    const MeasureSpec& measure,
+    const std::vector<std::unique_ptr<Device>>& devices,
+    double time) {
+    if (samples.size() < 2) return 0.0;
+    if (time <= samples.front().time) {
+        const double dt = samples[1].time - samples[0].time;
+        if (dt <= 0.0) return 0.0;
+        return (measure_probe_at_sample(samples[1], measure, devices) -
+                measure_probe_at_sample(samples[0], measure, devices)) / dt;
+    }
+    for (size_t i = 1; i < samples.size(); ++i) {
+        if (time <= samples[i].time) {
+            const double dt = samples[i].time - samples[i - 1].time;
+            if (dt <= 0.0) return 0.0;
+            return (measure_probe_at_sample(samples[i], measure, devices) -
+                    measure_probe_at_sample(samples[i - 1], measure, devices)) / dt;
+        }
+    }
+    const size_t last = samples.size() - 1;
+    const double dt = samples[last].time - samples[last - 1].time;
+    if (dt <= 0.0) return 0.0;
+    return (measure_probe_at_sample(samples[last], measure, devices) -
+            measure_probe_at_sample(samples[last - 1], measure, devices)) / dt;
+}
+
+double crossing_measure_time(
+    const std::vector<TranSample>& samples,
+    const MeasureSpec& measure,
+    const std::vector<std::unique_ptr<Device>>& devices,
+    double from,
+    double to) {
+    if (samples.size() < 2 || !measure.has_when_value) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const std::string mode = upper_copy(measure.crossing);
+    int found = 0;
+    double prev_t = from;
+    double prev_y = interpolate_measure_value(samples, measure, devices, from) - measure.when_value;
+    for (size_t i = 1; i < samples.size(); ++i) {
+        const double sample_t = samples[i].time;
+        if (sample_t <= from) continue;
+        const double curr_t = std::min(sample_t, to);
+        if (curr_t < prev_t) continue;
+        const double curr_y = interpolate_measure_value(samples, measure, devices, curr_t) - measure.when_value;
+        const bool crosses = (prev_y <= 0.0 && curr_y >= 0.0) || (prev_y >= 0.0 && curr_y <= 0.0);
+        const bool rises = prev_y < curr_y;
+        if (crosses && prev_y != curr_y &&
+            (mode == "ANY" || mode == "CROSS" || (mode == "RISE" && rises) || (mode == "FALL" && !rises))) {
+            ++found;
+            if (found >= measure.crossing_count) {
+                const double alpha = std::abs(prev_y) / (std::abs(prev_y) + std::abs(curr_y));
+                return prev_t + alpha * (curr_t - prev_t);
+            }
+        }
+        if (sample_t >= to) break;
+        prev_t = sample_t;
+        prev_y = measure_probe_at_sample(samples[i], measure, devices) - measure.when_value;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+double evaluate_transient_measure(
+    const std::vector<TranSample>& samples,
+    const MeasureSpec& measure,
+    const std::vector<std::unique_ptr<Device>>& devices) {
     if (samples.empty()) return 0.0;
     const double from = measure.has_from ? measure.from : samples.front().time;
     const double to = measure.has_to ? measure.to : samples.back().time;
     const std::string op = upper_copy(measure.op);
     if (op == "FIND") {
-        return interpolate_measure_value(samples, measure, measure.has_at ? measure.at : to);
+        return interpolate_measure_value(samples, measure, devices, measure.has_at ? measure.at : to);
+    }
+    if (op == "INTEG" || op == "INTEGRAL") {
+        return integrate_measure_value(samples, measure, devices, from, to);
+    }
+    if (op == "DERIV" || op == "DERIVATIVE") {
+        if (measure.has_from && measure.has_to && to > from) {
+            const double y0 = interpolate_measure_value(samples, measure, devices, from);
+            const double y1 = interpolate_measure_value(samples, measure, devices, to);
+            return (y1 - y0) / (to - from);
+        }
+        return derivative_measure_value(samples, measure, devices, measure.has_at ? measure.at : to);
+    }
+    if (op == "WHEN") {
+        return crossing_measure_time(samples, measure, devices, from, to);
+    }
+    if (op == "DELAY" && measure.has_target) {
+        const double trigger_time = crossing_measure_time(samples, measure, devices, from, to);
+        if (!std::isfinite(trigger_time)) return std::numeric_limits<double>::quiet_NaN();
+        MeasureSpec target = measure;
+        target.kind = measure.target_kind;
+        target.device_name = measure.target_device_name;
+        target.node_pos = measure.target_node_pos;
+        target.node_neg = measure.target_node_neg;
+        target.has_when_value = measure.target_has_when_value;
+        target.when_value = measure.target_when_value;
+        target.crossing = measure.target_crossing;
+        target.crossing_count = measure.target_crossing_count;
+        const double target_time = crossing_measure_time(samples, target, devices, trigger_time, to);
+        if (!std::isfinite(target_time)) return std::numeric_limits<double>::quiet_NaN();
+        return target_time - trigger_time;
     }
 
     bool have = false;
@@ -672,7 +819,7 @@ double evaluate_transient_measure(const std::vector<TranSample>& samples, const 
     long long count = 0;
     for (const auto& sample : samples) {
         if (sample.time + 1e-30 < from || sample.time - 1e-30 > to) continue;
-        const double value = measure_probe_at_sample(sample, measure);
+        const double value = measure_probe_at_sample(sample, measure, devices);
         min_v = std::min(min_v, value);
         max_v = std::max(max_v, value);
         sum += value;
@@ -682,14 +829,82 @@ double evaluate_transient_measure(const std::vector<TranSample>& samples, const 
     }
     if (!have) {
         const double mid = 0.5 * (from + to);
-        return interpolate_measure_value(samples, measure, mid);
+        return interpolate_measure_value(samples, measure, devices, mid);
     }
     if (op == "MAX") return max_v;
     if (op == "MIN") return min_v;
     if (op == "PP" || op == "PEAKTOPEAK") return max_v - min_v;
     if (op == "RMS") return std::sqrt(sum_sq / static_cast<double>(count));
     if (op == "AVG" || op == "AVERAGE" || op == "MEAN") return sum / static_cast<double>(count);
-    return interpolate_measure_value(samples, measure, measure.has_at ? measure.at : to);
+    return interpolate_measure_value(samples, measure, devices, measure.has_at ? measure.at : to);
+}
+
+double interpolate_probe_value(
+    const std::vector<TranSample>& samples,
+    const FourSpec& four,
+    double time) {
+    MeasureSpec probe;
+    probe.kind = "V";
+    probe.node_pos = four.node_pos;
+    probe.node_neg = four.node_neg;
+    static const std::vector<std::unique_ptr<Device>> no_devices;
+    return interpolate_measure_value(samples, probe, no_devices, time);
+}
+
+void report_fourier_analysis(
+    const std::vector<TranSample>& samples,
+    const FourSpec& four,
+    const Netlist& netlist) {
+    if (samples.size() < 2 || four.frequency <= 0.0) return;
+    const double period = 1.0 / four.frequency;
+    const double stop = samples.back().time;
+    const double start = std::max(samples.front().time, stop - period);
+    const double window = stop - start;
+    if (window <= 0.0) return;
+    const int integration_steps = std::max(256, four.harmonics * 64);
+    const double dt = window / static_cast<double>(integration_steps);
+    std::vector<double> a(static_cast<std::size_t>(four.harmonics + 1), 0.0);
+    std::vector<double> b(static_cast<std::size_t>(four.harmonics + 1), 0.0);
+    double dc = 0.0;
+    for (int i = 0; i <= integration_steps; ++i) {
+        const double t = start + dt * static_cast<double>(i);
+        const double weight = (i == 0 || i == integration_steps) ? 0.5 : 1.0;
+        const double y = interpolate_probe_value(samples, four, t);
+        dc += weight * y;
+        const double tau = t - start;
+        for (int h = 1; h <= four.harmonics; ++h) {
+            const double angle = 2.0 * M_PI * static_cast<double>(h) * four.frequency * tau;
+            a[static_cast<std::size_t>(h)] += weight * y * std::cos(angle);
+            b[static_cast<std::size_t>(h)] += weight * y * std::sin(angle);
+        }
+    }
+    dc *= dt / window;
+    std::vector<double> magnitude(static_cast<std::size_t>(four.harmonics + 1), 0.0);
+    double distortion_sq = 0.0;
+    for (int h = 1; h <= four.harmonics; ++h) {
+        a[static_cast<std::size_t>(h)] *= 2.0 * dt / window;
+        b[static_cast<std::size_t>(h)] *= 2.0 * dt / window;
+        magnitude[static_cast<std::size_t>(h)] = std::hypot(a[static_cast<std::size_t>(h)], b[static_cast<std::size_t>(h)]);
+        if (h > 1) distortion_sq += magnitude[static_cast<std::size_t>(h)] * magnitude[static_cast<std::size_t>(h)];
+    }
+    const double fundamental = magnitude.size() > 1 ? magnitude[1] : 0.0;
+    const double thd = fundamental > 0.0 ? 100.0 * std::sqrt(distortion_sq) / fundamental : 0.0;
+    std::cout << std::scientific << std::setprecision(9)
+              << "FOUR " << voltage_probe_label(netlist, four.node_pos, four.node_neg)
+              << " fundamental=" << four.frequency
+              << " dc=" << dc
+              << " thd_percent=" << thd << std::endl;
+    std::cout << "harmonic frequency magnitude phase_deg normalized" << std::endl;
+    for (int h = 1; h <= four.harmonics; ++h) {
+        const double phase = std::atan2(-b[static_cast<std::size_t>(h)], a[static_cast<std::size_t>(h)]) * 180.0 / M_PI;
+        const double normalized = fundamental > 0.0 ? magnitude[static_cast<std::size_t>(h)] / fundamental : 0.0;
+        std::cout << std::scientific << std::setprecision(9)
+                  << h << " "
+                  << four.frequency * static_cast<double>(h) << " "
+                  << magnitude[static_cast<std::size_t>(h)] << " "
+                  << phase << " "
+                  << normalized << std::endl;
+    }
 }
 
 struct TransientStepResult {
@@ -1237,11 +1452,523 @@ struct SimulationRuntimeStats {
 
 struct PssOperatingPoint {
     VectorReal state;
+    std::vector<VectorReal> samples;
     double period = 0.0;
     double residual = std::numeric_limits<double>::infinity();
     int periods = 0;
     bool converged = false;
 };
+
+struct PeriodicLinearization {
+    int harmonics = 0;
+    int sidebands = 1;
+    int matrix_size = 0;
+    double f0 = 0.0;
+    std::map<std::tuple<int, int, int>, std::complex<double>> static_terms;
+    std::map<std::tuple<int, int, int>, std::complex<double>> dynamic_terms;
+};
+
+void accumulate_fourier_term(
+    std::map<std::tuple<int, int, int>, std::complex<double>>& terms,
+    int harmonic,
+    int row,
+    int col,
+    std::complex<double> value) {
+    if (row < 0 || col < 0 || std::abs(value) <= 0.0) return;
+    terms[{harmonic, row, col}] += value;
+}
+
+DaeEvaluation small_signal_dae_terms(Device& device, const VectorReal& operating_point) {
+    DaeRequest request;
+    request.analysis = DaeAnalysis::SmallSignal;
+    request.staticResidual = false;
+    request.dynamicResidual = false;
+    request.staticJacobian = true;
+    request.dynamicJacobian = true;
+    DaeEvaluation evaluation;
+    if (!device.evaluateDae(operating_point, request, evaluation)) {
+        evaluation.clear();
+    }
+    return evaluation;
+}
+
+PeriodicLinearization build_periodic_linearization(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    const std::vector<VectorReal>& samples,
+    int matrix_size,
+    double f0,
+    int requested_harmonics) {
+    if (samples.empty()) {
+        throw std::runtime_error("periodic small-signal analysis requires saved PSS orbit samples");
+    }
+    PeriodicLinearization model;
+    model.harmonics = std::max(1, std::min(requested_harmonics, (static_cast<int>(samples.size()) - 1) / 2));
+    model.sidebands = 2 * model.harmonics + 1;
+    model.matrix_size = matrix_size;
+    model.f0 = f0;
+    const int sample_count = static_cast<int>(samples.size());
+    constexpr double two_pi = 2.0 * M_PI;
+
+    for (int sample = 0; sample < sample_count; ++sample) {
+        const double phase = two_pi * static_cast<double>(sample) / static_cast<double>(sample_count);
+        for (const auto& device : devices) {
+            const DaeEvaluation evaluation = small_signal_dae_terms(*device, samples[static_cast<std::size_t>(sample)]);
+            for (const auto& term : evaluation.staticJacobian) {
+                for (int h = -model.harmonics; h <= model.harmonics; ++h) {
+                    const std::complex<double> weight =
+                        std::polar(1.0 / static_cast<double>(sample_count), -static_cast<double>(h) * phase);
+                    accumulate_fourier_term(model.static_terms, h, term.equation, term.unknown, term.value * weight);
+                }
+            }
+            for (const auto& term : evaluation.dynamicJacobian) {
+                for (int h = -model.harmonics; h <= model.harmonics; ++h) {
+                    const std::complex<double> weight =
+                        std::polar(1.0 / static_cast<double>(sample_count), -static_cast<double>(h) * phase);
+                    accumulate_fourier_term(model.dynamic_terms, h, term.equation, term.unknown, term.value * weight);
+                }
+            }
+        }
+    }
+    return model;
+}
+
+void assemble_periodic_conversion_matrix(
+    const PeriodicLinearization& model,
+    double f_offset,
+    int num_nodes,
+    double gmin,
+    SparseMatrixComplex& J) {
+    const int H = model.harmonics;
+    for (int row_h = -H; row_h <= H; ++row_h) {
+        const int row_block = row_h + H;
+        for (int col_h = -H; col_h <= H; ++col_h) {
+            const int col_block = col_h + H;
+            const int coeff_h = row_h - col_h;
+            const double omega_col = 2.0 * M_PI * (f_offset + static_cast<double>(col_h) * model.f0);
+            for (const auto& [key, value] : model.static_terms) {
+                const auto [h, row, col] = key;
+                if (h != coeff_h) continue;
+                J.add(row_block * model.matrix_size + row, col_block * model.matrix_size + col, value);
+            }
+            for (const auto& [key, value] : model.dynamic_terms) {
+                const auto [h, row, col] = key;
+                if (h != coeff_h) continue;
+                J.add(row_block * model.matrix_size + row,
+                      col_block * model.matrix_size + col,
+                      std::complex<double>(0.0, omega_col) * value);
+            }
+        }
+    }
+    if (gmin > 0.0) {
+        const int n = std::min(num_nodes, model.matrix_size);
+        for (int block = 0; block < model.sidebands; ++block) {
+            for (int node = 0; node < n; ++node) {
+                J.add(block * model.matrix_size + node, block * model.matrix_size + node, {gmin, 0.0});
+            }
+        }
+    }
+}
+
+void stamp_legacy_periodic_diagonal(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    const VectorReal& operating_point,
+    const PeriodicLinearization& model,
+    double f_offset,
+    SparseMatrixComplex& J) {
+    for (const auto& device : devices) {
+        const DaeEvaluation dae = small_signal_dae_terms(*device, operating_point);
+        if (!dae.staticJacobian.empty() || !dae.dynamicJacobian.empty()) continue;
+        for (int sideband = -model.harmonics; sideband <= model.harmonics; ++sideband) {
+            SparseMatrixComplex local(model.matrix_size);
+            VectorComplex ignored(model.matrix_size);
+            const double omega = 2.0 * M_PI * (f_offset + static_cast<double>(sideband) * model.f0);
+            device->acStamp(local, ignored, omega, operating_point);
+            const int block = sideband + model.harmonics;
+            for (const auto& entry : local.getEntries()) {
+                J.add(block * model.matrix_size + entry.row,
+                      block * model.matrix_size + entry.col,
+                      entry.value);
+            }
+        }
+    }
+}
+
+void stamp_periodic_stb_rhs(
+    const StabilityProbe& probe,
+    const PeriodicLinearization& model,
+    int pass,
+    VectorComplex& rhs) {
+    const int block = model.harmonics;
+    const int offset = block * model.matrix_size;
+    if (pass == 1) {
+        rhs.add(offset + probe.getBranchIndex(), {1.0, 0.0});
+    } else {
+        rhs.add(offset + probe.getNodePos(), {-1.0, 0.0});
+        rhs.add(offset + probe.getNodeNeg(), {1.0, 0.0});
+    }
+}
+
+VectorComplex central_sideband_source_rhs(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    const VectorReal& operating_point,
+    const PeriodicLinearization& model,
+    double f_offset) {
+    VectorComplex source_rhs(model.matrix_size);
+    SparseMatrixComplex ignored(model.matrix_size);
+    for (const auto& device : devices) {
+        stamp_device_ac(*device, ignored, source_rhs, 2.0 * M_PI * f_offset, operating_point);
+    }
+    VectorComplex rhs(model.matrix_size * model.sidebands);
+    const int central = model.harmonics;
+    for (int i = 0; i < model.matrix_size; ++i) {
+        rhs.add(central * model.matrix_size + i, source_rhs[i]);
+    }
+    return rhs;
+}
+
+std::complex<double> periodic_solution_node(
+    const VectorComplex& solution,
+    const PeriodicLinearization& model,
+    int node,
+    int sideband = 0) {
+    if (node < 0 || node >= model.matrix_size) return {0.0, 0.0};
+    const int block = std::clamp(sideband + model.harmonics, 0, model.sidebands - 1);
+    return solution[block * model.matrix_size + node];
+}
+
+std::complex<double> periodic_solution_branch(
+    const VectorComplex& solution,
+    const PeriodicLinearization& model,
+    int branch,
+    int sideband = 0) {
+    return periodic_solution_node(solution, model, branch, sideband);
+}
+
+std::vector<std::complex<double>> fourier_coefficients(
+    const std::vector<VectorReal>& samples,
+    int unknown,
+    int harmonics) {
+    std::vector<std::complex<double>> coeffs(static_cast<std::size_t>(harmonics + 1), {0.0, 0.0});
+    if (samples.empty()) return coeffs;
+    const int sample_count = static_cast<int>(samples.size());
+    for (int h = 0; h <= harmonics; ++h) {
+        std::complex<double> sum{0.0, 0.0};
+        for (int sample = 0; sample < sample_count; ++sample) {
+            const double value = (unknown >= 0 && unknown < samples[static_cast<std::size_t>(sample)].getSize())
+                ? samples[static_cast<std::size_t>(sample)][unknown]
+                : 0.0;
+            const double phase = -2.0 * M_PI * static_cast<double>(h) *
+                static_cast<double>(sample) / static_cast<double>(sample_count);
+            sum += value * std::polar(1.0, phase);
+        }
+        coeffs[static_cast<std::size_t>(h)] = sum / static_cast<double>(sample_count);
+    }
+    return coeffs;
+}
+
+double commensurate_base_frequency(const std::vector<double>& frequencies) {
+    if (frequencies.empty()) return 0.0;
+    constexpr double scale = 1.0e6;
+    long long base = 0;
+    std::vector<long long> quantized;
+    quantized.reserve(frequencies.size());
+    for (double f : frequencies) {
+        if (!(f > 0.0) || !std::isfinite(f) || f > 9.0e12) {
+            throw std::runtime_error(".HB requires positive finite tone frequencies");
+        }
+        const long long q = static_cast<long long>(std::llround(f * scale));
+        if (q <= 0) throw std::runtime_error(".HB tone is too small for commensurability test");
+        quantized.push_back(q);
+        base = base == 0 ? q : std::gcd(base, q);
+    }
+    if (base <= 0) throw std::runtime_error(".HB could not determine a common tone period");
+    for (std::size_t i = 0; i < frequencies.size(); ++i) {
+        const double reconstructed = static_cast<double>(quantized[i]) / scale;
+        const double err = std::abs(reconstructed - frequencies[i]) / std::max(frequencies[i], 1.0);
+        if (err > 1.0e-9 || quantized[i] % base != 0) {
+            throw std::runtime_error(".HB tones must be commensurate for multi-tone shooting");
+        }
+    }
+    return static_cast<double>(base) / scale;
+}
+
+int max_tone_multiple(const std::vector<double>& frequencies, double base_frequency) {
+    int multiple = 1;
+    if (!(base_frequency > 0.0)) return multiple;
+    for (double f : frequencies) {
+        multiple = std::max(multiple, static_cast<int>(std::llround(f / base_frequency)));
+    }
+    return multiple;
+}
+
+double periodic_carrier_magnitude(
+    const std::vector<VectorReal>& samples,
+    int unknown,
+    double base_frequency,
+    double carrier_frequency) {
+    if (samples.empty() || unknown < 0 || !(base_frequency > 0.0)) return 0.0;
+    const int harmonic = std::max(1, static_cast<int>(std::llround(
+        std::max(carrier_frequency, base_frequency) / base_frequency)));
+    const auto coeffs = fourier_coefficients(samples, unknown, harmonic);
+    return std::abs(coeffs[static_cast<std::size_t>(harmonic)]);
+}
+
+struct NativeHbResult {
+    bool converged = false;
+    int iterations = 0;
+    double residual = std::numeric_limits<double>::infinity();
+    double raw_residual = std::numeric_limits<double>::infinity();
+    std::vector<VectorReal> samples;
+};
+
+std::vector<double> spectral_derivative_matrix(int sample_count, double period) {
+    std::vector<double> D(static_cast<std::size_t>(sample_count * sample_count), 0.0);
+    if (sample_count <= 1 || !(period > 0.0)) return D;
+    const double w0 = 2.0 * M_PI / period;
+    const bool even = (sample_count % 2) == 0;
+    for (int row = 0; row < sample_count; ++row) {
+        for (int col = 0; col < sample_count; ++col) {
+            if (row == col) continue;
+            const int diff = row - col;
+            const double angle = M_PI * static_cast<double>(diff) / static_cast<double>(sample_count);
+            const double sign = (std::abs(diff) % 2) == 0 ? 1.0 : -1.0;
+            const double theta_derivative = even
+                ? 0.5 * sign / std::tan(angle)
+                : 0.5 * sign / std::sin(angle);
+            D[static_cast<std::size_t>(row * sample_count + col)] = w0 * theta_derivative;
+        }
+    }
+    return D;
+}
+
+NativeHbResult run_native_hb_collocation(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    const std::vector<VectorReal>& initial_samples,
+    int matrix_size,
+    int num_nodes,
+    double period,
+    const SimulationSettings& settings,
+    LinearSolveContextReal* solver_context) {
+    NativeHbResult result;
+    result.samples = initial_samples;
+    if (result.samples.empty() || matrix_size <= 0 || !(period > 0.0)) return result;
+
+    struct DynamicJacTerm {
+        int sample = 0;
+        int row = -1;
+        int col = -1;
+        double value = 0.0;
+    };
+    struct HbResidualNorm {
+        double normalized = 0.0;
+        double raw = 0.0;
+    };
+
+    const int K = static_cast<int>(result.samples.size());
+    const int total_size = K * matrix_size;
+    const std::vector<double> derivative = spectral_derivative_matrix(K, period);
+    const double residual_goal = std::max(settings.pss_residual_goal * 1.0e-9, 1.0e-9);
+    const double raw_residual_goal = std::max(settings.abstol, settings.vntol * 1.0e-6);
+    const int max_iterations = std::max(settings.max_pss_iter, 1);
+
+    auto flat_index = [matrix_size](int sample, int unknown) {
+        return sample * matrix_size + unknown;
+    };
+
+    auto assemble = [&](const std::vector<VectorReal>& samples,
+                        SparseMatrixReal* jacobian,
+                        VectorReal* rhs) -> HbResidualNorm {
+        std::vector<std::vector<double>> residual(
+            static_cast<std::size_t>(K),
+            std::vector<double>(static_cast<std::size_t>(matrix_size), 0.0));
+        std::vector<std::vector<double>> activity(
+            static_cast<std::size_t>(K),
+            std::vector<double>(static_cast<std::size_t>(matrix_size), 0.0));
+        std::vector<std::vector<double>> q_values(
+            static_cast<std::size_t>(K),
+            std::vector<double>(static_cast<std::size_t>(matrix_size), 0.0));
+        std::vector<DynamicJacTerm> dynamic_jacobian;
+
+        for (int sample = 0; sample < K; ++sample) {
+            const double time = period * static_cast<double>(sample) / static_cast<double>(K);
+            const VectorReal& x = samples[static_cast<std::size_t>(sample)];
+            for (const auto& device : devices) {
+                DaeRequest request;
+                request.analysis = DaeAnalysis::HarmonicBalance;
+                request.time = time;
+                request.staticResidual = true;
+                request.dynamicResidual = true;
+                request.staticJacobian = true;
+                request.dynamicJacobian = true;
+                DaeEvaluation evaluation;
+                if (device->evaluateDae(x, request, evaluation)) {
+                    if (!evaluation.finite()) {
+                        throw std::runtime_error("non-finite value in native HB DAE evaluation");
+                    }
+                    for (const auto& term : evaluation.staticResidual) {
+                        if (term.equation >= 0 && term.equation < matrix_size) {
+                            residual[static_cast<std::size_t>(sample)]
+                                    [static_cast<std::size_t>(term.equation)] += term.value;
+                            activity[static_cast<std::size_t>(sample)]
+                                    [static_cast<std::size_t>(term.equation)] += std::abs(term.value);
+                        }
+                    }
+                    for (const auto& term : evaluation.dynamicResidual) {
+                        if (term.equation >= 0 && term.equation < matrix_size) {
+                            q_values[static_cast<std::size_t>(sample)]
+                                    [static_cast<std::size_t>(term.equation)] += term.value;
+                        }
+                    }
+                    if (jacobian) {
+                        for (const auto& term : evaluation.staticJacobian) {
+                            jacobian->add(
+                                flat_index(sample, term.equation),
+                                flat_index(sample, term.unknown),
+                                term.value);
+                        }
+                        for (const auto& term : evaluation.dynamicJacobian) {
+                            dynamic_jacobian.push_back({sample, term.equation, term.unknown, term.value});
+                        }
+                    }
+                    continue;
+                }
+
+                SparseMatrixReal local_j(matrix_size);
+                VectorReal local_b(matrix_size);
+                device->dcStamp(local_j, local_b, x, 0.0, time, {});
+                for (const auto& entry : local_j.getEntries()) {
+                    if (entry.row < 0 || entry.row >= matrix_size ||
+                        entry.col < 0 || entry.col >= matrix_size) {
+                        continue;
+                    }
+                    residual[static_cast<std::size_t>(sample)]
+                            [static_cast<std::size_t>(entry.row)] += entry.value * x[entry.col];
+                    activity[static_cast<std::size_t>(sample)]
+                            [static_cast<std::size_t>(entry.row)] += std::abs(entry.value * x[entry.col]);
+                    if (jacobian) {
+                        jacobian->add(
+                            flat_index(sample, entry.row),
+                            flat_index(sample, entry.col),
+                            entry.value);
+                    }
+                }
+                for (int row = 0; row < matrix_size; ++row) {
+                    residual[static_cast<std::size_t>(sample)]
+                            [static_cast<std::size_t>(row)] -= local_b[row];
+                    activity[static_cast<std::size_t>(sample)]
+                            [static_cast<std::size_t>(row)] += std::abs(local_b[row]);
+                }
+            }
+        }
+
+        for (int row_sample = 0; row_sample < K; ++row_sample) {
+            for (int col_sample = 0; col_sample < K; ++col_sample) {
+                const double coeff = derivative[static_cast<std::size_t>(row_sample * K + col_sample)];
+                if (coeff == 0.0) continue;
+                for (int row = 0; row < matrix_size; ++row) {
+                    residual[static_cast<std::size_t>(row_sample)]
+                            [static_cast<std::size_t>(row)] +=
+                        coeff * q_values[static_cast<std::size_t>(col_sample)]
+                                        [static_cast<std::size_t>(row)];
+                    activity[static_cast<std::size_t>(row_sample)]
+                            [static_cast<std::size_t>(row)] +=
+                        std::abs(coeff * q_values[static_cast<std::size_t>(col_sample)]
+                                                [static_cast<std::size_t>(row)]);
+                }
+                if (jacobian) {
+                    for (const auto& term : dynamic_jacobian) {
+                        if (term.sample != col_sample) continue;
+                        jacobian->add(
+                            flat_index(row_sample, term.row),
+                            flat_index(col_sample, term.col),
+                            coeff * term.value);
+                    }
+                }
+            }
+        }
+
+        HbResidualNorm norm;
+        for (int sample = 0; sample < K; ++sample) {
+            for (int row = 0; row < matrix_size; ++row) {
+                const double value = residual[static_cast<std::size_t>(sample)]
+                                             [static_cast<std::size_t>(row)];
+                const double abs_tol = row < num_nodes ? settings.abstol : settings.vntol;
+                const double scale = abs_tol +
+                    settings.reltol * activity[static_cast<std::size_t>(sample)]
+                                               [static_cast<std::size_t>(row)];
+                norm.raw = std::max(norm.raw, std::abs(value));
+                norm.normalized = std::max(norm.normalized, std::abs(value) / std::max(scale, 1e-30));
+                if (rhs) rhs->add(flat_index(sample, row), -value);
+            }
+        }
+        return norm;
+    };
+
+    for (int iter = 0; iter <= max_iterations; ++iter) {
+        SparseMatrixReal jacobian(total_size);
+        VectorReal rhs(total_size);
+        const HbResidualNorm current_norm = assemble(result.samples, &jacobian, &rhs);
+        result.residual = current_norm.normalized;
+        result.raw_residual = current_norm.raw;
+        std::cout << std::scientific << std::setprecision(9)
+                  << "Native HB iteration " << iter
+                  << ": residual=" << result.residual
+                  << " raw=" << result.raw_residual
+                  << std::endl;
+        if (result.residual <= residual_goal || result.raw_residual <= raw_residual_goal) {
+            result.converged = true;
+            result.iterations = iter;
+            return result;
+        }
+        if (iter == max_iterations) break;
+
+        VectorReal delta = KluSolverReal::solve(jacobian, rhs, solver_context);
+        double max_delta = 0.0;
+        for (int i = 0; i < delta.getSize(); ++i) {
+            if (!std::isfinite(delta[i])) {
+                throw std::runtime_error("native HB Newton produced a non-finite update");
+            }
+            max_delta = std::max(max_delta, std::abs(delta[i]));
+        }
+        double alpha = max_delta > 10.0 ? 10.0 / max_delta : 1.0;
+        bool accepted = false;
+        std::vector<VectorReal> trial_samples = result.samples;
+        HbResidualNorm trial_norm;
+        for (int ls = 0; ls < 12; ++ls) {
+            trial_samples = result.samples;
+            for (int sample = 0; sample < K; ++sample) {
+                for (int unknown = 0; unknown < matrix_size; ++unknown) {
+                    trial_samples[static_cast<std::size_t>(sample)][unknown] +=
+                        alpha * delta[flat_index(sample, unknown)];
+                }
+                for (const auto& device : devices) {
+                    device->limitTransientNewton(
+                        result.samples[static_cast<std::size_t>(sample)],
+                        trial_samples[static_cast<std::size_t>(sample)]);
+                }
+            }
+            trial_norm = assemble(trial_samples, nullptr, nullptr);
+            if (std::isfinite(trial_norm.normalized) &&
+                (trial_norm.normalized < current_norm.normalized ||
+                 trial_norm.raw <= raw_residual_goal)) {
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if (!accepted) {
+            throw std::runtime_error("native HB Newton line search failed to reduce residual");
+        }
+        std::cout << std::scientific << std::setprecision(9)
+                  << "Native HB line search: alpha=" << alpha
+                  << " trial_residual=" << trial_norm.normalized
+                  << " raw=" << trial_norm.raw
+                  << std::endl;
+        result.samples = trial_samples;
+    }
+    result.iterations = max_iterations;
+    return result;
+}
 
 std::string normalized_method_key(const SimulationSettings& settings) {
     std::string method = settings.tran_method;
@@ -1796,10 +2523,17 @@ struct SavedOutputSignal {
     std::string label;
     int node_pos = -1;
     int node_neg = -1;
+    int branch = -1;
+    const Device* device = nullptr;
     std::string type = "voltage";
 };
 
-std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int num_nodes) {
+int branch_index_for_device(const Device* dev);
+
+std::vector<SavedOutputSignal> resolve_saved_outputs(
+    const Netlist& netlist,
+    const std::vector<std::unique_ptr<Device>>& devices,
+    int num_nodes) {
     const auto& settings = netlist.getSettings();
     std::vector<SavedOutputSignal> signals;
     if (settings.save_none) {
@@ -1808,7 +2542,7 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
     if (settings.save_all) {
         signals.reserve(static_cast<size_t>(num_nodes));
         for (int i = 0; i < num_nodes; ++i) {
-            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1, "voltage"});
+            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1, -1, nullptr, "voltage"});
         }
     }
     if (!settings.save_all && settings.saves.empty()) {
@@ -1817,7 +2551,23 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
 
     for (const auto& save : settings.saves) {
         if (upper_copy(save.kind) == "I") {
-            signals.push_back({save.node_pos, -1, -1, "current"});
+            std::string dev_name = save.node_pos;
+            if (dev_name.size() > 2 && (dev_name[0] == 'i' || dev_name[0] == 'I') && dev_name[1] == '(') {
+                dev_name = dev_name.substr(2, dev_name.size() - 3);
+            }
+            const Device* device = nullptr;
+            int branch = -1;
+            for (const auto& candidate : devices) {
+                if (!names_match(candidate->getName(), dev_name)) continue;
+                device = candidate.get();
+                branch = branch_index_for_device(device);
+                break;
+            }
+            if (!device) {
+                std::cout << "WARNING: save skipped unknown current device I(" << dev_name << ")" << std::endl;
+                continue;
+            }
+            signals.push_back({"I(" + dev_name + ")", -1, -1, branch, device, "current"});
             continue;
         }
         const int pos = netlist.findNode(save.node_pos);
@@ -1831,12 +2581,12 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
         std::string label = "V(" + save.node_pos;
         if (!is_ground_name(save.node_neg)) label += "," + save.node_neg;
         label += ")";
-        signals.push_back({label, pos, neg, "voltage"});
+        signals.push_back({label, pos, neg, -1, nullptr, "voltage"});
     }
     if (signals.empty() && settings.save_all) {
         std::cout << "WARNING: no valid .SAVE voltage signals were resolved; writing all node voltages." << std::endl;
         for (int i = 0; i < num_nodes; ++i) {
-            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1, "voltage"});
+            signals.push_back({"V(" + netlist.getNodeName(i) + ")", i, -1, -1, nullptr, "voltage"});
         }
     }
     return signals;
@@ -1844,9 +2594,14 @@ std::vector<SavedOutputSignal> resolve_saved_outputs(const Netlist& netlist, int
 
 class TransientOutput {
 public:
-    TransientOutput(const std::string& path, const std::string& format, const Netlist& netlist, int num_nodes)
+    TransientOutput(
+        const std::string& path,
+        const std::string& format,
+        const Netlist& netlist,
+        const std::vector<std::unique_ptr<Device>>& devices,
+        int num_nodes)
         : to_file_(!path.empty()), csv_(upper_copy(format) == "CSV"),
-          signals_(resolve_saved_outputs(netlist, num_nodes)) {
+          signals_(resolve_saved_outputs(netlist, devices, num_nodes)) {
         if (to_file_) {
             file_.open(path, std::ios::out | std::ios::trunc);
             if (!file_.is_open()) {
@@ -1888,8 +2643,16 @@ public:
         }
         file_ << std::scientific << std::setprecision(12) << t;
         for (const auto& signal : signals_) {
+            double current = 0.0;
+            if (signal.type == "current") {
+                if (signal.branch >= 0) {
+                    current = x[signal.branch];
+                } else if (signal.device) {
+                    signal.device->probeCurrent(x, current, t);
+                }
+            }
             file_ << (csv_ ? "," : " ")
-                  << (signal.type == "current" ? 0.0 : probe_value(x, signal.node_pos, signal.node_neg));
+                  << (signal.type == "current" ? current : probe_value(x, signal.node_pos, signal.node_neg));
         }
         file_ << "\n";
         ++point_count_;
@@ -2018,6 +2781,51 @@ bool get_source_dc_value(
     return false;
 }
 
+void apply_initial_voltage_source_constraints(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    VectorReal& x,
+    int num_nodes,
+    double time) {
+    const int n = std::min(num_nodes, x.getSize());
+    if (n <= 0) return;
+
+    std::vector<bool> known(static_cast<std::size_t>(n), false);
+    auto node_known = [&](int node) {
+        return node < 0 || (node < n && known[static_cast<std::size_t>(node)]);
+    };
+    auto node_value = [&](int node) {
+        return node < 0 ? 0.0 : x[node];
+    };
+    auto set_node = [&](int node, double value) {
+        if (node < 0 || node >= n || !std::isfinite(value)) return false;
+        x[node] = value;
+        known[static_cast<std::size_t>(node)] = true;
+        return true;
+    };
+
+    bool changed = true;
+    for (int pass = 0; changed && pass < n + 1; ++pass) {
+        changed = false;
+        for (const auto& dev : devices) {
+            const auto* vsrc = dynamic_cast<const VoltageSource*>(dev.get());
+            if (!vsrc) continue;
+
+            const int pos = vsrc->getNodePos();
+            const int neg = vsrc->getNodeNeg();
+            const double value = vsrc->evaluateAt(time);
+            if (!std::isfinite(value)) continue;
+
+            const bool pos_known = node_known(pos);
+            const bool neg_known = node_known(neg);
+            if (!pos_known && neg_known) {
+                changed = set_node(pos, node_value(neg) + value) || changed;
+            } else if (pos_known && !neg_known) {
+                changed = set_node(neg, node_value(pos) - value) || changed;
+            }
+        }
+    }
+}
+
 struct SourceState {
     Device* device = nullptr;
     double dc_value = 0.0;
@@ -2069,6 +2877,16 @@ int find_branch_index_by_name(
     return -1;
 }
 
+Inductor* find_inductor_by_name(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    const std::string& device_name) {
+    for (const auto& dev : devices) {
+        if (!names_match(dev->getName(), device_name)) continue;
+        return dynamic_cast<Inductor*>(dev.get());
+    }
+    return nullptr;
+}
+
 bool configure_transfer_input_source(
     const std::vector<std::unique_ptr<Device>>& devices,
     const std::string& source_name) {
@@ -2106,25 +2924,15 @@ void run_simulation(
     }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
-        "TRAN", "AC", "NOISE", "STB", "HB", "PSS", "PAC", "PNOISE", "PSSSTB"
+        "TRAN", "AC", "ACXF", "DCXF", "DCINC", "SP", "NOISE", "STB",
+        "HB", "PSS", "PAC", "PNOISE", "PSSSP", "PSSSTB",
+        "HBAC", "HBNOISE", "HBSP", "HBSTB"
     };
     if (std::find(implemented_analyses.begin(), implemented_analyses.end(), requested_settings.type) ==
         implemented_analyses.end()) {
         if (requested_settings.type == "PSS") {
             throw std::runtime_error(
                 "analysis .PSS has no validated execution engine; refusing to report convergence without a PSS operating point");
-        }
-        if (requested_settings.type == "PAC" || requested_settings.type == "PNOISE" ||
-            requested_settings.type == "PSSSP" || requested_settings.type == "PSSSTB") {
-            throw std::runtime_error(
-                "analysis ." + requested_settings.type +
-                " requires a validated PSS operating point; current GSPICE has no PSS state database");
-        }
-        if (requested_settings.type == "HBAC" || requested_settings.type == "HBNOISE" ||
-            requested_settings.type == "HBSP" || requested_settings.type == "HBSTB") {
-            throw std::runtime_error(
-                "analysis ." + requested_settings.type +
-                " requires a validated HB/PSS periodic operating point; refusing to linearize from DC data");
         }
         throw std::runtime_error(
             "analysis ." + requested_settings.type +
@@ -2146,6 +2954,29 @@ void run_simulation(
         if (ccvs) ccvs->setBranchIndex(netlist.getNextBranchId(num_nodes));
         auto* bsrc = dynamic_cast<BehavioralSource*>(dev.get());
         if (bsrc && bsrc->isVoltageMode()) bsrc->setBranchIndex(netlist.getNextBranchId(num_nodes));
+    }
+    for (auto& dev : devices) {
+        auto* mutual = dynamic_cast<MutualInductor*>(dev.get());
+        if (!mutual) continue;
+        Inductor* primary = find_inductor_by_name(devices, mutual->primaryName());
+        Inductor* secondary = find_inductor_by_name(devices, mutual->secondaryName());
+        if (!primary || !secondary) {
+            throw std::runtime_error(
+                "mutual inductor '" + mutual->getName() + "' references missing inductor '" +
+                (!primary ? mutual->primaryName() : mutual->secondaryName()) + "'");
+        }
+        if (std::abs(mutual->coupling()) > 1.0) {
+            throw std::runtime_error(
+                "mutual inductor '" + mutual->getName() + "' coupling coefficient must be between -1 and 1");
+        }
+        if (primary->getInductance() <= 0.0 || secondary->getInductance() <= 0.0) {
+            throw std::runtime_error(
+                "mutual inductor '" + mutual->getName() + "' requires positive referenced inductances");
+        }
+        mutual->setResolvedBranches(
+            primary->getBranchIndex(),
+            secondary->getBranchIndex(),
+            mutual->coupling() * std::sqrt(primary->getInductance() * secondary->getInductance()));
     }
     int matrix_size = num_nodes + netlist.getNumBranches();
     for (auto& dev : devices) {
@@ -2509,12 +3340,19 @@ void run_simulation(
         if (settings.f_fund.empty() || settings.f_fund[0] <= 0.0) {
             throw std::runtime_error(".PSS requires a positive fundamental frequency");
         }
-        if (settings.f_fund.size() > 1) {
+        const bool hb_shooting_family = settings.type.rfind("HB", 0) == 0;
+        if (settings.f_fund.size() > 1 && !hb_shooting_family) {
             throw std::runtime_error(".PSS transient shooting currently supports one fundamental; use .HB for multi-tone");
         }
-        const double period = 1.0 / settings.f_fund[0];
+        const double shooting_f0 = (hb_shooting_family && settings.f_fund.size() > 1)
+            ? commensurate_base_frequency(settings.f_fund)
+            : settings.f_fund[0];
+        const double period = 1.0 / shooting_f0;
         const int harmonics = std::max(settings.n_harms, 1);
-        int samples_per_period = std::max(64, harmonics * 16);
+        const int tone_multiple = hb_shooting_family
+            ? max_tone_multiple(settings.f_fund, shooting_f0)
+            : 1;
+        int samples_per_period = std::max(64, harmonics * tone_multiple * 16);
         if (settings.t_step > 0.0) {
             samples_per_period = std::max(samples_per_period, static_cast<int>(std::ceil(period / settings.t_step)));
         }
@@ -2547,7 +3385,8 @@ VectorReal x = x_dc;
         result.period = period;
         double t = 0.0;
         std::cout << std::scientific << std::setprecision(9)
-                  << "Starting PSS shooting: f0=" << settings.f_fund[0]
+                  << "Starting " << (hb_shooting_family ? "HB" : "PSS")
+                  << " shooting: f0=" << shooting_f0
                   << " period=" << period
                   << " samples_per_period=" << samples_per_period
 << " warmup_periods=" << warmup_periods
@@ -2557,6 +3396,8 @@ VectorReal x = x_dc;
 
         for (int period_index = 1; period_index <= max_periods; ++period_index) {
             const VectorReal period_start = x;
+            std::vector<VectorReal> current_period_samples;
+            current_period_samples.reserve(static_cast<std::size_t>(samples_per_period));
             for (int sample = 0; sample < samples_per_period; ++sample) {
                 const double target_time = t + fixed_step;
                 const TransientIntegrationMethod method = TransientIntegrationMethod::BackwardEuler;
@@ -2581,8 +3422,9 @@ accept_device_transient_step(devices, step_result.x, target_time, ctx);
                     x_hist.erase(x_hist.begin(), x_hist.begin() + 1);
                     t_hist.erase(t_hist.begin(), t_hist.begin() + 1);
                 }
-last_period_samples.push_back(x);
+                current_period_samples.push_back(x);
             }
+            last_period_samples = current_period_samples;
 result.residual = pss_residual(period_start, x);
             result.periods = period_index;
             if (period_index <= 2) {
@@ -2608,6 +3450,7 @@ result.residual = pss_residual(period_start, x);
             if (period_index > warmup_periods && result.residual <= residual_goal) {
                 result.converged = true;
                 result.state = x;
+                result.samples = current_period_samples;
                 break;
             }
         }
@@ -2784,6 +3627,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                     if (final_residual <= result_goal) {
                         result.converged = true;
                         result.state = x0;
+                        result.samples = last_period_samples;
                         result.period = T_ref;
                         result.residual = final_residual;
                         std::cout << std::scientific << std::setprecision(9)
@@ -2808,24 +3652,71 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             throw std::runtime_error(
                 ".PSS did not converge: residual_goal=" + std::to_string(residual_goal) +
                 " final_residual=" + std::to_string(result.residual) +
-                " (shooting at f0=" + std::to_string(settings.f_fund[0]) + " Hz)");
+                " (shooting at f0=" + std::to_string(shooting_f0) + " Hz)");
         }
         std::cout << std::scientific << std::setprecision(9)
                   << "PSS Converged: periods=" << result.periods
                   << " residual=" << result.residual
                   << std::endl;
+        if (result.samples.empty()) {
+            result.samples = last_period_samples.empty()
+                ? std::vector<VectorReal>{result.state}
+                : last_period_samples;
+        }
         return result;
     };
 
     std::optional<PssOperatingPoint> pss_op;
+    bool native_hb_refined = false;
     const bool pss_dependent =
-        settings.type == "PAC" || settings.type == "PNOISE" || settings.type == "PSSSTB";
+        settings.type == "HB" ||
+        settings.type == "PAC" || settings.type == "PNOISE" ||
+        settings.type == "PSSSP" || settings.type == "PSSSTB" ||
+        settings.type == "HBAC" || settings.type == "HBNOISE" ||
+        settings.type == "HBSP" || settings.type == "HBSTB";
     if (settings.type == "PSS" || pss_dependent) {
-        if (settings.type != "PSS" && !settings.pss_requested) {
+        if (settings.type != "PSS" && settings.type != "HB" && !settings.pss_requested) {
             throw std::runtime_error("." + settings.type + " requires a preceding .PSS analysis in the deck");
         }
         pss_op = solve_pss_operating_point();
-        if (settings.type == "PSS") {
+        if (settings.type.rfind("HB", 0) == 0) {
+            try {
+                NativeHbResult native_hb = run_native_hb_collocation(
+                    devices, pss_op->samples, matrix_size, num_nodes,
+                    pss_op->period, settings, &real_solver_context);
+                if (native_hb.converged) {
+                    pss_op->samples = native_hb.samples;
+                    pss_op->state = native_hb.samples.empty() ? pss_op->state : native_hb.samples.back();
+                    pss_op->residual = native_hb.residual;
+                    native_hb_refined = true;
+                    std::cout << std::scientific << std::setprecision(9)
+                              << "Native HB Converged: iterations=" << native_hb.iterations
+                              << " residual=" << native_hb.residual
+                              << std::endl;
+                } else {
+                    if (settings.hb_native_required) {
+                        throw std::runtime_error(
+                            "Native HB did not converge in required/signoff mode");
+                    }
+                    std::cout << std::scientific << std::setprecision(9)
+                              << "Native HB did not converge: iterations=" << native_hb.iterations
+                              << " residual=" << native_hb.residual
+                              << "; continuing with shooting orbit"
+                              << std::endl;
+                }
+            } catch (const std::exception& hb_error) {
+                if (settings.hb_native_required) {
+                    throw std::runtime_error(
+                        std::string("Native HB required/signoff mode failed: ") + hb_error.what());
+                }
+                std::cout << "Native HB unavailable for this deck: "
+                          << hb_error.what()
+                          << "; continuing with shooting orbit"
+                          << std::endl;
+            }
+        }
+        if (settings.type == "PSS" || settings.type == "HB" ||
+            settings.type == "PSSSP" || settings.type == "HBSP") {
             x_dc = pss_op->state;
         }
     }
@@ -3219,6 +4110,140 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                   << " magnitude=" << std::abs(gain)
                   << " phase_deg=" << std::arg(gain) * 180.0 / 3.14159265358979323846
                   << std::endl;
+    } else if (settings.type == "ACXF" || settings.type == "DCXF" || settings.type == "DCINC") {
+        std::cout << "Starting " << settings.type << " Small-Signal Analysis..." << std::endl;
+        std::vector<double> frequencies;
+        const std::string sweep_type = upper_copy(settings.f_sweep_type);
+        if (!settings.f_values.empty()) {
+            frequencies = settings.f_values;
+        } else if (settings.type == "DCXF" || settings.type == "DCINC") {
+            frequencies.push_back(0.0);
+        } else if (sweep_type == "LIN") {
+            const int points = std::max(settings.points_per_dec, 1);
+            for (int k = 0; k < points; ++k) {
+                const double alpha = points == 1 ? 0.0 : static_cast<double>(k) / static_cast<double>(points - 1);
+                frequencies.push_back(settings.f_start + alpha * (settings.f_stop - settings.f_start));
+            }
+        } else {
+            double f = std::max(settings.f_start, 1e-30);
+            const double dec_mult = std::pow(sweep_type == "OCT" ? 2.0 : 10.0, 1.0 / std::max(settings.points_per_dec, 1));
+            while (f <= settings.f_stop * 1.01) {
+                frequencies.push_back(f);
+                f *= dec_mult;
+            }
+        }
+        const int out_pos = settings.xf_out_pos >= 0 ? settings.xf_out_pos : (num_nodes > 0 ? 0 : -1);
+        const int out_neg = settings.xf_out_neg;
+        std::cout << "freq | " << voltage_probe_label(netlist, out_pos, out_neg) << " ";
+        if (settings.type != "DCINC") std::cout << "mag phase_deg ";
+        std::cout << std::endl;
+        for (double f : frequencies) {
+            const double omega = 2.0 * 3.14159265358979323846 * f;
+            SparseMatrixComplex J_sparse(matrix_size);
+            VectorComplex b_ac(matrix_size);
+            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
+            #pragma omp parallel for if(use_parallel_stamp)
+            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_ac, omega, x_dc);
+            VectorComplex x_ac = KluSolverComplex::solve(J_sparse, b_ac, &complex_solver_context);
+            const auto value = complex_probe_value(x_ac, out_pos, out_neg);
+            std::cout << std::scientific << std::setprecision(9)
+                      << f << " | (" << value.real() << "," << value.imag() << ") ";
+            if (settings.type != "DCINC") {
+                std::cout << std::abs(value) << " "
+                          << std::arg(value) * 180.0 / 3.14159265358979323846 << " ";
+            }
+            std::cout << std::endl;
+        }
+    } else if (settings.type == "SP" || settings.type == "PSSSP" || settings.type == "HBSP") {
+        std::cout << "Starting " << settings.type << " S-Parameter Analysis..." << std::endl;
+        if (ports.empty()) {
+            throw std::runtime_error("." + settings.type + " requires at least one P port");
+        }
+        std::sort(ports.begin(), ports.end(), [](const Port* a, const Port* b) {
+            return a->getPortNum() < b->getPortNum();
+        });
+        const bool periodic_sp = settings.type == "PSSSP" || settings.type == "HBSP";
+        PeriodicLinearization sp_periodic_model;
+        if (periodic_sp) {
+            sp_periodic_model = build_periodic_linearization(
+                devices, pss_op->samples, matrix_size, 1.0 / pss_op->period, settings.n_harms);
+            std::cout << settings.type << " conversion matrix: sidebands="
+                      << sp_periodic_model.sidebands << " samples=" << pss_op->samples.size()
+                      << std::endl;
+        }
+        std::vector<double> frequencies;
+        const std::string sweep_type = upper_copy(settings.f_sweep_type);
+        if (sweep_type == "LIN") {
+            const int points = std::max(settings.points_per_dec, 1);
+            for (int k = 0; k < points; ++k) {
+                const double alpha = points == 1 ? 0.0 : static_cast<double>(k) / static_cast<double>(points - 1);
+                frequencies.push_back(settings.f_start + alpha * (settings.f_stop - settings.f_start));
+            }
+        } else {
+            double f = std::max(settings.f_start, 1e-30);
+            const double dec_mult = std::pow(sweep_type == "OCT" ? 2.0 : 10.0, 1.0 / std::max(settings.points_per_dec, 1));
+            while (f <= settings.f_stop * 1.01) {
+                frequencies.push_back(f);
+                f *= dec_mult;
+            }
+        }
+        std::cout << "freq |";
+        for (std::size_t row = 0; row < ports.size(); ++row) {
+            for (std::size_t col = 0; col < ports.size(); ++col) {
+                std::cout << " S" << (row + 1) << (col + 1) << ".real S" << (row + 1) << (col + 1) << ".imag";
+            }
+        }
+        std::cout << std::endl;
+        int sp_points = 0;
+        for (double f : frequencies) {
+            const double omega = 2.0 * 3.14159265358979323846 * f;
+            std::vector<std::vector<std::complex<double>>> s(
+                ports.size(), std::vector<std::complex<double>>(ports.size(), {0.0, 0.0}));
+            for (std::size_t drive = 0; drive < ports.size(); ++drive) {
+                const double drive_scale = 2.0 * std::sqrt(std::max(ports[drive]->getZ0(), 1e-30));
+                if (periodic_sp) {
+                    SparseMatrixComplex J_sparse(sp_periodic_model.matrix_size * sp_periodic_model.sidebands);
+                    VectorComplex b_sp(sp_periodic_model.matrix_size * sp_periodic_model.sidebands);
+                    assemble_periodic_conversion_matrix(sp_periodic_model, f, num_nodes, settings.gmin, J_sparse);
+                    stamp_legacy_periodic_diagonal(devices, pss_op->state, sp_periodic_model, f, J_sparse);
+                    const int central = sp_periodic_model.harmonics;
+                    b_sp.add(central * sp_periodic_model.matrix_size + ports[drive]->getBranchIndex(),
+                             {drive_scale, 0.0});
+                    VectorComplex x_sp = KluSolverComplex::solve(J_sparse, b_sp, &complex_solver_context);
+                    for (std::size_t observe = 0; observe < ports.size(); ++observe) {
+                        const auto v = periodic_solution_node(x_sp, sp_periodic_model, ports[observe]->getNodePos()) -
+                                       periodic_solution_node(x_sp, sp_periodic_model, ports[observe]->getNodeNeg());
+                        s[observe][drive] = v / std::sqrt(std::max(ports[observe]->getZ0(), 1e-30));
+                        if (observe == drive) s[observe][drive] -= std::complex<double>{1.0, 0.0};
+                    }
+                } else {
+                    SparseMatrixComplex J_sparse(matrix_size);
+                    VectorComplex b_sp(matrix_size);
+                    stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+                    for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_sp, omega, x_dc);
+                    b_sp.add(ports[drive]->getBranchIndex(), {drive_scale, 0.0});
+                    VectorComplex x_sp = KluSolverComplex::solve(J_sparse, b_sp, &complex_solver_context);
+                    for (std::size_t observe = 0; observe < ports.size(); ++observe) {
+                        const auto v = complex_probe_value(
+                            x_sp, ports[observe]->getNodePos(), ports[observe]->getNodeNeg());
+                        s[observe][drive] = v / std::sqrt(std::max(ports[observe]->getZ0(), 1e-30));
+                        if (observe == drive) s[observe][drive] -= std::complex<double>{1.0, 0.0};
+                    }
+                }
+            }
+            std::cout << std::scientific << std::setprecision(9) << f << " |";
+            for (const auto& row : s) {
+                for (const auto& value : row) {
+                    std::cout << " " << value.real() << " " << value.imag();
+                }
+            }
+            std::cout << std::endl;
+            ++sp_points;
+        }
+        std::cout << "SP summary: points=" << sp_points
+                  << " ports=" << ports.size()
+                  << " method=multiport-y-to-s" << std::endl;
     } else if (settings.type == "TRAN") {
         std::cout << "Starting Transient Analysis..." << std::endl;
         const double output_step = settings.t_step > 0.0
@@ -3258,6 +4283,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             }
             step = std::min(step, 1e-12);
         }
+        apply_initial_voltage_source_constraints(devices, x, num_nodes, 0.0);
         step = std::max(step, min_step);
         std::vector<VectorReal> x_hist; x_hist.push_back(x);
         std::vector<double> t_hist; t_hist.push_back(0.0);
@@ -3267,11 +4293,11 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         bool auto_use_trapezoidal = auto_method_controller.useTrapezoidal();
         int selected_order = 1;
         transient_state_arena.restoreCurrent();
-        TransientOutput tran_out(output_file, output_format, netlist, num_nodes);
+        TransientOutput tran_out(output_file, output_format, netlist, devices, num_nodes);
         TransientStats tran_stats;
         std::vector<TranSample> measure_samples;
         auto record_measure_sample = [&](double sample_time, const VectorReal& sample_x) {
-            if (!settings.measures.empty()) {
+            if (!settings.measures.empty() || !settings.fours.empty()) {
                 measure_samples.push_back({sample_time, sample_x});
             }
         };
@@ -3280,6 +4306,24 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         std::cout << "Transient breakpoints: " << breakpoints.size() << std::endl;
         if (tran_out.toFile()) {
             std::cout << "Waveform output: " << output_file << std::endl;
+        }
+        std::mt19937 transient_noise_rng(settings.transient_noise_seed);
+        std::normal_distribution<double> transient_noise_dist(0.0, settings.transient_noise_scale);
+        auto noisy_transient_sample = [&](const VectorReal& sample_x) {
+            VectorReal out = sample_x;
+            if (!settings.transient_noise || settings.transient_noise_scale <= 0.0) return out;
+            // ponytail: output-only white-noise approximation; replace with device-noise SDE stamping for signoff transient noise.
+            for (int i = 0; i < num_nodes; ++i) {
+                out[i] += transient_noise_dist(transient_noise_rng);
+            }
+            return out;
+        };
+        if (settings.transient_noise) {
+            std::cout << "Transient noise: mode=" << settings.transient_noise_mode
+                      << " scale=" << settings.transient_noise_scale
+                      << " fmax=" << settings.transient_noise_fmax
+                      << " seed=" << settings.transient_noise_seed
+                      << " (output approximation)" << std::endl;
         }
         std::cout << std::scientific << std::setprecision(9)
                   << "Transient controls: output step=" << output_step
@@ -3337,7 +4381,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                     next_output <= settings.t_stop + output_tol) {
                     const double alpha = (next_output - from_t) / (to_t - from_t);
                     VectorReal sample = interpolate_state(from_x, to_x, alpha);
-                    tran_out.write(next_output, sample, num_nodes);
+                    tran_out.write(next_output, noisy_transient_sample(sample), num_nodes);
                     ++tran_stats.output_points;
                     last_printed_time = next_output;
                 }
@@ -3351,13 +4395,13 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             if (last_printed_time >= 0.0 && std::abs(sample_t - last_printed_time) <= duplicate_tol) {
                 return false;
             }
-            tran_out.write(sample_t, sample_x, num_nodes);
+            tran_out.write(sample_t, noisy_transient_sample(sample_x), num_nodes);
             ++tran_stats.output_points;
             last_printed_time = sample_t;
             return true;
         };
         if (next_output <= 1e-30) {
-            tran_out.write(0.0, x, num_nodes);
+            tran_out.write(0.0, noisy_transient_sample(x), num_nodes);
             record_measure_sample(0.0, x);
             ++tran_stats.output_points;
             last_printed_time = 0.0;
@@ -3374,7 +4418,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             const double remaining = settings.t_stop - t;
             if (remaining <= stop_tol) break;
             if (next_output > t && next_output - t <= stop_tol) {
-                tran_out.write(next_output, x, num_nodes);
+                tran_out.write(next_output, noisy_transient_sample(x), num_nodes);
                 ++tran_stats.output_points;
                 last_printed_time = next_output;
                 t = next_output;
@@ -3766,7 +4810,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         }
         const double output_tol = std::max(1e-30, output_step * 1e-9);
         if (settings.t_stop >= save_start && last_printed_time < settings.t_stop - output_tol) {
-            tran_out.write(settings.t_stop, x, num_nodes);
+            tran_out.write(settings.t_stop, noisy_transient_sample(x), num_nodes);
             ++tran_stats.output_points;
         }
         const double min_used_step = std::isfinite(tran_stats.min_step) ? tran_stats.min_step : 0.0;
@@ -3821,9 +4865,12 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         for (const auto& measure : settings.measures) {
             const std::string analysis = upper_copy(measure.analysis);
             if (analysis != "TRAN" && analysis != "TRANSIENT" && analysis != "ALL") continue;
-            const double value = evaluate_transient_measure(measure_samples, measure);
+            const double value = evaluate_transient_measure(measure_samples, measure, devices);
             std::cout << std::scientific << std::setprecision(9)
                       << "MEASURE " << measure.name << " = " << value << std::endl;
+        }
+        for (const auto& four : settings.fours) {
+            report_fourier_analysis(measure_samples, four, netlist);
         }
     } else if (settings.type == "AC") {
         std::cout << "Starting AC Analysis..." << std::endl;
@@ -3948,205 +4995,190 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         }
         std::cout << std::endl;
     } else if (settings.type == "HB") {
-        std::cout << "Starting Harmonic Balance Analysis (Multi-Tone, FFT-accelerated)..." << std::endl;
-        // ----------------------------------------------------------------
-        // Pillar 3: Correct HB using IFFT → time-domain stamp → FFT → Newton.
-        // The prior implementation stamped directly in the frequency domain,
-        // which is only correct for linear devices. Nonlinear devices (diodes,
-        // MOSFETs, modelDevice models) must be evaluated at each time-domain sample
-        // point and their contributions transformed back to frequency domain.
-        //
-        // The Fourier class now uses a radix-2 Cooley-Tukey FFT (O(N log N))
-        // replacing the original O(N²) DFT.
-        // ----------------------------------------------------------------
-        const int n_tones = static_cast<int>(settings.f_fund.size());
-        const int H = settings.n_harms;
-        int K = 1;
-        for (int t = 0; t < n_tones; ++t) K *= (2 * H + 1);
-        // Pad K to next power of two for the FFT.
-        const int K_fft = Fourier::nextPow2(K);
-        const int n_vars = matrix_size * K;
-        std::cout << "  Tones: " << n_tones
-                  << " | Harmonics/Tone: " << H
-                  << " | HB samples: " << K
-                  << " | FFT size: " << K_fft << std::endl;
-        if (K > 1000) {
-            std::cout << "HB warning: " << K
-                      << " samples. Consider .PSS for multi-tone circuits." << std::endl;
-        }
-        // Initialise flat time-domain state: X_time[node * K_fft + sample].
-        std::vector<double> X_time(static_cast<std::size_t>(matrix_size * K_fft), 0.0);
-        for (int n = 0; n < matrix_size; ++n) {
-            const double dc_val = x_dc[n];
-            for (int s = 0; s < K_fft; ++s) {
-                X_time[static_cast<std::size_t>(n * K_fft + s)] = dc_val;
+            if (!pss_op) throw std::runtime_error(".HB requires a converged periodic operating point");
+            const int H = std::max(settings.n_harms, 1);
+            const double base_f0 = 1.0 / pss_op->period;
+            const int tone_multiple = max_tone_multiple(settings.f_fund, base_f0);
+            const int report_harmonics = std::max(H, H * tone_multiple);
+            std::cout << "Starting Harmonic Balance Analysis ("
+                      << (settings.f_fund.size() > 1 ? "multi-tone" : "single-tone")
+                      << " shooting/Fourier)..." << std::endl;
+            std::cout << std::scientific << std::setprecision(9)
+                      << "HB Converged: f0=" << base_f0
+                      << " period=" << pss_op->period
+                      << " tones=" << settings.f_fund.size()
+                      << " samples=" << pss_op->samples.size()
+                      << " residual=" << pss_op->residual
+                      << " native_hb=" << (native_hb_refined ? "yes" : "no")
+                      << std::endl;
+            std::cout << "harmonic freq_hz";
+            std::vector<std::vector<std::complex<double>>> node_coeffs;
+            node_coeffs.reserve(static_cast<std::size_t>(num_nodes));
+            for (int i = 0; i < num_nodes; ++i) {
+                node_coeffs.push_back(fourier_coefficients(pss_op->samples, i, report_harmonics));
+                std::cout << " | V(" << netlist.getNodeName(i) << ").mag V("
+                          << netlist.getNodeName(i) << ").phase_deg";
             }
-        }
-        const double omega0 = (n_tones > 0) ? 2.0 * M_PI * settings.f_fund[0] : 0.0;
-        bool hb_converged = false;
-        for (int hb_iter = 0; hb_iter < settings.n_harms * 10 + 30; ++hb_iter) {
-            const auto stamp_start = std::chrono::steady_clock::now();
-            // ----- IFFT X̂ → time domain (per node, FFT across K_fft samples) -----
-            // For each node, take its K_fft frequency-domain harmonics,
-            // IFFT them to get the time-domain waveform at K_fft sample points.
-            std::vector<std::complex<double>> freq_buf(static_cast<std::size_t>(K_fft));
-            for (int n = 0; n < matrix_size; ++n) {
-                for (int s = 0; s < K_fft; ++s) {
-                    freq_buf[static_cast<std::size_t>(s)] = {
-                        X_time[static_cast<std::size_t>(n * K_fft + s)], 0.0};
+            std::cout << std::endl;
+            for (int h = 0; h <= report_harmonics; ++h) {
+                std::cout << h << " " << std::scientific << std::setprecision(9)
+                          << (static_cast<double>(h) * base_f0);
+                for (int i = 0; i < num_nodes; ++i) {
+                    const auto value = node_coeffs[static_cast<std::size_t>(i)][static_cast<std::size_t>(h)];
+                    std::cout << std::scientific << std::setprecision(9)
+                              << " | " << std::abs(value)
+                              << " " << std::arg(value) * 180.0 / M_PI;
                 }
-                Fourier::inverseFull(freq_buf); // in-place IFFT
-                for (int s = 0; s < K_fft; ++s) {
-                    X_time[static_cast<std::size_t>(n * K_fft + s)] = freq_buf[static_cast<std::size_t>(s)].real();
-                }
+                std::cout << std::endl;
             }
-            // ----- Stamp each time sample in the time domain -------------------
-            SparseMatrixReal J_hb(n_vars); VectorReal b_hb(n_vars);
-            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, n_vars);
-            for (int s = 0; s < K; ++s) {
-                // Extract the solution vector at sample point s.
-                VectorReal x_s(matrix_size);
-                for (int n = 0; n < matrix_size; ++n) {
-                    x_s[n] = X_time[static_cast<std::size_t>(n * K_fft + s)];
-                }
-                // Per-sample time-domain stamp: build per-sample solution vector
-                // and call hbStamp with it. The device hbStamp interface expects
-                // (J, b, f_fund, n_harms, x_hb) where x_hb is the solution at
-                // this sample point (already in time domain after the IFFT).
-                const double f_fund_hz = (omega0 > 0.0) ? omega0 / (2.0 * M_PI) : 0.0;
-                #pragma omp parallel for if(use_parallel_stamp)
-                for (int i = 0; i < num_devs; ++i) {
-                    devices[i]->hbStamp(J_hb, b_hb, f_fund_hz, H, x_s);
-                }
-            }
-            // ----- FFT residual b_hb back to frequency domain & add Ω·Q̂ operator -----
-            // Apply forward FFT to b_hb for each node to transform time-domain stamps into frequency bins
-            for (int n = 0; n < matrix_size; ++n) {
-                std::vector<std::complex<double>> time_res(static_cast<std::size_t>(K_fft), 0.0);
-                for (int s = 0; s < K && s < K_fft; ++s) {
-                    time_res[static_cast<std::size_t>(s)] = b_hb[n * K + s];
-                }
-                Fourier::forwardFull(time_res);
-                for (int s = 0; s < K && s < K_fft; ++s) {
-                    b_hb[n * K + s] = time_res[static_cast<std::size_t>(s)].real();
-                }
-                // Add frequency-domain derivative operator Ω = j * k * ω₀ to Jacobian diagonal blocks
-                if (omega0 > 0.0) {
-                    for (int k = 0; k < H; ++k) {
-                        const double omega_k = (k + 1) * omega0;
-                        const int row_idx = n * K + k;
-                        J_hb.add(row_idx, row_idx, omega_k * 1e-12); // reactive operator block
-                    }
-                }
-            }
-            const auto stamp_end = std::chrono::steady_clock::now();
-            const auto solve_start = std::chrono::steady_clock::now();
-            VectorReal dx = KluSolverReal::solve(J_hb, b_hb, &real_solver_context);
-            const auto solve_end = std::chrono::steady_clock::now();
-            runtime_stats.hb_stamp_seconds += elapsed_seconds(stamp_start, stamp_end);
-            runtime_stats.hb_solve_seconds += elapsed_seconds(solve_start, solve_end);
-            double max_dx = 0.0;
-            for (int i = 0; i < n_vars; ++i) {
-                X_time[static_cast<std::size_t>(i)] -= dx[i];
-                max_dx = std::max(max_dx, std::abs(dx[i]));
-            }
-            if (max_dx < 1e-6) { hb_converged = true; break; }
-        }
-        if (!hb_converged) {
-            throw std::runtime_error(".HB did not converge; try increasing N_HARMS or using .PSS");
-        }
-        std::cout << "HB Converged (FFT-accelerated; validate against reference simulator)." << std::endl;
-    } else if (settings.type == "PAC") {
-        if (!pss_op) throw std::runtime_error(".PAC requires a converged PSS operating point");
-        std::cout << "Starting PAC from converged PSS operating point..." << std::endl;
+    } else if (settings.type == "PAC" || settings.type == "HBAC") {
+        if (!pss_op) throw std::runtime_error("." + settings.type + " requires a converged PSS operating point");
+        std::cout << "Starting " << settings.type << " from converged PSS operating point..." << std::endl;
+        const PeriodicLinearization periodic_model = build_periodic_linearization(
+            devices, pss_op->samples, matrix_size, 1.0 / pss_op->period, settings.n_harms);
+        std::cout << settings.type << " conversion matrix: sidebands="
+                  << periodic_model.sidebands << " samples=" << pss_op->samples.size()
+                  << std::endl;
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
         while (f <= settings.f_stop * 1.01) {
-            const double omega = 2.0 * 3.14159265358979323846 * f;
-            SparseMatrixComplex J_sparse(matrix_size);
-            VectorComplex b_ac(matrix_size);
-            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
-            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
-            #pragma omp parallel for if(use_parallel_stamp)
-            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_ac, omega, pss_op->state);
+            SparseMatrixComplex J_sparse(periodic_model.matrix_size * periodic_model.sidebands);
+            assemble_periodic_conversion_matrix(periodic_model, f, num_nodes, settings.gmin, J_sparse);
+            stamp_legacy_periodic_diagonal(devices, pss_op->state, periodic_model, f, J_sparse);
+            VectorComplex b_ac = central_sideband_source_rhs(devices, pss_op->state, periodic_model, f);
             VectorComplex x_ac = KluSolverComplex::solve(J_sparse, b_ac, &complex_solver_context);
             std::cout << std::scientific << std::setprecision(9)
                       << f << " | ";
             for (int i = 0; i < num_nodes; ++i) {
                 std::cout << "V(" << netlist.getNodeName(i) << ")="
-                          << std::abs(x_ac[i]) << " ";
+                          << std::abs(periodic_solution_node(x_ac, periodic_model, i)) << " ";
             }
             std::cout << std::endl;
             f *= dec_mult;
         }
-    } else if (settings.type == "PNOISE") {
-        if (!pss_op) throw std::runtime_error(".PNOISE requires a converged PSS operating point");
-        std::cout << "Starting PNoise from converged PSS operating point..." << std::endl;
-        if (settings.out_node < 0) throw std::runtime_error(".PNOISE requires an output node");
+    } else if (settings.type == "PNOISE" || settings.type == "HBNOISE") {
+        if (!pss_op) throw std::runtime_error("." + settings.type + " requires a converged PSS operating point");
+        std::cout << "Starting " << settings.type << " from converged PSS operating point..." << std::endl;
+        if (settings.out_node < 0) throw std::runtime_error("." + settings.type + " requires an output node");
+        const PeriodicLinearization periodic_model = build_periodic_linearization(
+            devices, pss_op->samples, matrix_size, 1.0 / pss_op->period, settings.n_harms);
+        std::cout << settings.type << " conversion matrix: sidebands="
+                  << periodic_model.sidebands << " samples=" << pss_op->samples.size()
+                  << std::endl;
+        const double carrier_frequency = settings.pnoise_carrier > 0.0
+            ? settings.pnoise_carrier
+            : 1.0 / pss_op->period;
+        const double carrier_magnitude = (settings.pnoise_phase_noise || settings.pnoise_jitter)
+            ? periodic_carrier_magnitude(
+                  pss_op->samples, settings.out_node, 1.0 / pss_op->period, carrier_frequency)
+            : 0.0;
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
         int pnoise_offsets = 0;
-        std::cout << "freq | pnoise_sqrt(V/rtHz) pnoise_psd(V^2/Hz) noise_sources" << std::endl;
+        std::cout << "freq | pnoise_sqrt(V/rtHz) pnoise_psd(V^2/Hz) noise_sources";
+        if (settings.pnoise_phase_noise) std::cout << " phase_noise_dbc_per_hz";
+        if (settings.pnoise_jitter) std::cout << " jitter_s_per_rtHz";
+        std::cout << std::endl;
         while (f <= settings.f_stop * 1.01) {
-            const double omega = 2.0 * 3.14159265358979323846 * f;
-            SparseMatrixComplex J_sparse(matrix_size);
-            VectorComplex b_zero(matrix_size);
-            stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
-            const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
-            #pragma omp parallel for if(use_parallel_stamp)
-            for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_zero, omega, pss_op->state);
-            std::vector<NoiseSource> noise_sources;
-            for (const auto& dev : devices) dev->collectNoiseSources(omega, pss_op->state, noise_sources);
+            SparseMatrixComplex J_sparse(periodic_model.matrix_size * periodic_model.sidebands);
+            assemble_periodic_conversion_matrix(periodic_model, f, num_nodes, settings.gmin, J_sparse);
+            stamp_legacy_periodic_diagonal(devices, pss_op->state, periodic_model, f, J_sparse);
+            std::map<std::tuple<std::string, int, int>, double> averaged_noise;
+            int raw_noise_sources = 0;
+            for (const auto& sample : pss_op->samples) {
+                std::vector<NoiseSource> sample_sources;
+                for (const auto& dev : devices) {
+                    dev->collectNoiseSources(2.0 * M_PI * f, sample, sample_sources);
+                }
+                raw_noise_sources += static_cast<int>(sample_sources.size());
+                for (const auto& source : sample_sources) {
+                    if (source.currentPsd <= 0.0) continue;
+                    averaged_noise[{source.name, source.nodePos, source.nodeNeg}] +=
+                        source.currentPsd / static_cast<double>(pss_op->samples.size());
+                }
+            }
             double output_psd = 0.0;
-            for (const auto& source : noise_sources) {
-                if (source.currentPsd <= 0.0) continue;
-                VectorComplex b_noise(matrix_size);
-                b_noise.add(source.nodePos, {-1.0, 0.0});
-                b_noise.add(source.nodeNeg, {1.0, 0.0});
-                VectorComplex transfer = KluSolverComplex::solve(J_sparse, b_noise, &complex_solver_context);
-                output_psd += std::norm(transfer[settings.out_node]) * source.currentPsd;
+            for (const auto& [key, psd] : averaged_noise) {
+                const auto& [name, node_pos, node_neg] = key;
+                (void)name;
+                if (psd <= 0.0) continue;
+                for (int sideband = -periodic_model.harmonics;
+                     sideband <= periodic_model.harmonics; ++sideband) {
+                    VectorComplex b_noise(periodic_model.matrix_size * periodic_model.sidebands);
+                    const int block = sideband + periodic_model.harmonics;
+                    b_noise.add(block * periodic_model.matrix_size + node_pos, {-1.0, 0.0});
+                    b_noise.add(block * periodic_model.matrix_size + node_neg, {1.0, 0.0});
+                    VectorComplex transfer = KluSolverComplex::solve(J_sparse, b_noise, &complex_solver_context);
+                    output_psd += std::norm(periodic_solution_node(
+                        transfer, periodic_model, settings.out_node)) * psd;
+                }
             }
             std::cout << std::scientific << std::setprecision(9)
                       << f << " | " << std::sqrt(std::max(output_psd, 0.0))
                       << " " << output_psd
-                      << " " << noise_sources.size()
-                      << std::endl;
+                      << " " << raw_noise_sources;
+            const double phase_noise_linear =
+                (carrier_magnitude > 0.0) ? output_psd / (2.0 * carrier_magnitude * carrier_magnitude) : 0.0;
+            if (settings.pnoise_phase_noise) {
+                const double dbc_per_hz = phase_noise_linear > 0.0
+                    ? 10.0 * std::log10(phase_noise_linear)
+                    : -std::numeric_limits<double>::infinity();
+                std::cout << " " << dbc_per_hz;
+            }
+            if (settings.pnoise_jitter) {
+                const double jitter_density = (carrier_frequency > 0.0)
+                    ? std::sqrt(std::max(phase_noise_linear, 0.0)) / (2.0 * M_PI * carrier_frequency)
+                    : 0.0;
+                std::cout << " " << jitter_density;
+            }
+            std::cout << std::endl;
             f *= dec_mult;
             ++pnoise_offsets;
         }
-        std::cout << "PNOISE summary: offsets=" << pnoise_offsets << std::endl;
-    } else if (settings.type == "PSSSTB") {
-        if (!pss_op) throw std::runtime_error(".PSSSTB requires a converged PSS operating point");
-        std::cout << "Starting PSTB from converged PSS operating point..." << std::endl;
-        if (probes.empty()) {
-            throw std::runtime_error(".PSSSTB requires a stability probe");
+        std::cout << "PNOISE summary: offsets=" << pnoise_offsets;
+        if (!settings.pnoise_input_source.empty()) {
+            std::cout << " input=" << settings.pnoise_input_source;
         }
+        if (settings.pnoise_phase_noise || settings.pnoise_jitter) {
+            std::cout << " carrier=" << std::scientific << std::setprecision(9)
+                      << carrier_frequency << " carrier_mag=" << carrier_magnitude;
+        }
+        std::cout << std::endl;
+    } else if (settings.type == "PSSSTB" || settings.type == "HBSTB") {
+        if (!pss_op) throw std::runtime_error("." + settings.type + " requires a converged PSS operating point");
+        std::cout << "Starting " << settings.type << " from converged PSS operating point..." << std::endl;
+        if (probes.empty()) {
+            throw std::runtime_error("." + settings.type + " requires a stability probe");
+        }
+        const PeriodicLinearization periodic_model = build_periodic_linearization(
+            devices, pss_op->samples, matrix_size, 1.0 / pss_op->period, settings.n_harms);
+        std::cout << settings.type << " conversion matrix: sidebands="
+                  << periodic_model.sidebands << " samples=" << pss_op->samples.size()
+                  << std::endl;
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
         while (f <= settings.f_stop * 1.01) {
-            double omega = 2.0 * 3.14159265358979 * f;
-            SparseMatrixComplex Jv(matrix_size); VectorComplex bv(matrix_size);
-            for (const auto& dev : devices) {
-                auto* p = dynamic_cast<StabilityProbe*>(dev.get());
-                if (p) p->stbStamp(Jv, bv, 1); else stamp_device_ac(*dev, Jv, bv, omega, pss_op->state);
-            }
+            SparseMatrixComplex Jv(periodic_model.matrix_size * periodic_model.sidebands);
+            VectorComplex bv(periodic_model.matrix_size * periodic_model.sidebands);
+            assemble_periodic_conversion_matrix(periodic_model, f, num_nodes, settings.gmin, Jv);
+            stamp_legacy_periodic_diagonal(devices, pss_op->state, periodic_model, f, Jv);
+            stamp_periodic_stb_rhs(*probes[0], periodic_model, 1, bv);
             VectorComplex xv = KluSolverComplex::solve(Jv, bv, &complex_solver_context);
-            std::complex<double> Tv = -xv[probes[0]->getNodeNeg()] / xv[probes[0]->getNodePos()];
-            SparseMatrixComplex Ji(matrix_size); VectorComplex bi(matrix_size);
-            for (const auto& dev : devices) {
-                auto* p = dynamic_cast<StabilityProbe*>(dev.get());
-                if (p) p->stbStamp(Ji, bi, 2); else stamp_device_ac(*dev, Ji, bi, omega, pss_op->state);
-            }
+            std::complex<double> Tv =
+                -periodic_solution_node(xv, periodic_model, probes[0]->getNodeNeg()) /
+                periodic_solution_node(xv, periodic_model, probes[0]->getNodePos());
+            SparseMatrixComplex Ji(periodic_model.matrix_size * periodic_model.sidebands);
+            VectorComplex bi(periodic_model.matrix_size * periodic_model.sidebands);
+            assemble_periodic_conversion_matrix(periodic_model, f, num_nodes, settings.gmin, Ji);
+            stamp_legacy_periodic_diagonal(devices, pss_op->state, periodic_model, f, Ji);
+            stamp_periodic_stb_rhs(*probes[0], periodic_model, 2, bi);
             VectorComplex xi = KluSolverComplex::solve(Ji, bi, &complex_solver_context);
-            std::complex<double> Ti = xi[probes[0]->getBranchIndex()];
+            std::complex<double> Ti = periodic_solution_branch(xi, periodic_model, probes[0]->getBranchIndex());
             std::complex<double> T = (Tv * Ti - std::complex<double>(1,0)) / (Tv + Ti + std::complex<double>(2,0));
             std::cout << std::scientific << f << " | Mag: " << std::abs(T)
                       << " Phase: " << std::arg(T)*180/3.1415 << std::endl;
             f *= dec_mult;
         }
-    } else if (settings.type == "HBAC" || settings.type == "HBNOISE" ||
-               settings.type == "HBSP" || settings.type == "HBSTB") {
-        throw std::runtime_error("." + settings.type + " requires a validated HB/PSS periodic operating point; refusing to linearize from DC data");
     } else {
         std::cout << "DC Operating Point Converged: ";
         for(int i=0; i<num_nodes; ++i) {

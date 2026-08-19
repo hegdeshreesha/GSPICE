@@ -108,6 +108,12 @@ public:
         dcStamp(J, b, x, 0.0, ctx.currentTime, empty_history);
     }
 
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)time;
+        current = terminalCurrents(x)[0];
+        return true;
+    }
+
 private:
     std::array<double, 4> terminalCurrents(const VectorReal& x) const {
         double Vd = (nodeD_ >= 0) ? x[nodeD_] : 0.0;

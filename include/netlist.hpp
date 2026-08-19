@@ -26,14 +26,36 @@ struct MeasureSpec {
     std::string analysis = "TRAN";
     std::string name;
     std::string op;
+    std::string kind = "V";
+    std::string device_name;
     int node_pos = -1;
     int node_neg = -1;
     bool has_at = false;
     bool has_from = false;
     bool has_to = false;
+    bool has_when_value = false;
     double at = 0.0;
     double from = 0.0;
     double to = 0.0;
+    double when_value = 0.0;
+    std::string crossing = "ANY";
+    int crossing_count = 1;
+    bool has_target = false;
+    std::string target_kind = "V";
+    std::string target_device_name;
+    int target_node_pos = -1;
+    int target_node_neg = -1;
+    bool target_has_when_value = false;
+    double target_when_value = 0.0;
+    std::string target_crossing = "ANY";
+    int target_crossing_count = 1;
+};
+
+struct FourSpec {
+    double frequency = 0.0;
+    int harmonics = 9;
+    int node_pos = -1;
+    int node_neg = -1;
 };
 
 struct CornerSpec {
@@ -84,6 +106,11 @@ struct SimulationSettings {
     double cshunt = -1.0;  // <0 means AUTO; 0 explicitly disables the shunt floor.
     int tran_max_order = 2;
     bool save_adaptive_steps = false;
+    bool transient_noise = false;
+    unsigned int transient_noise_seed = 1;
+    double transient_noise_scale = 0.0;
+    double transient_noise_fmax = 0.0;
+    std::string transient_noise_mode = "WHITE";
     double f_start = 0.0;
     double f_stop = 0.0;
     int points_per_dec = 0;
@@ -161,12 +188,22 @@ struct SimulationSettings {
     double pss_tstab = 0.0;
     int pss_tstab_periods = 0;
     double pss_residual_goal = 1.0;
+    bool hb_native_required = false;
 
     // Noise Parameters
     int out_node = -1;
+    std::string pnoise_input_source;
+    bool pnoise_phase_noise = false;
+    bool pnoise_jitter = false;
+    double pnoise_carrier = 0.0;
+
+    // Small-signal transfer output for EXTERNAL_ORACLE-style ACXF/DCXF aliases.
+    int xf_out_pos = -1;
+    int xf_out_neg = -1;
 
     // Measurements
     std::vector<MeasureSpec> measures;
+    std::vector<FourSpec> fours;
     std::vector<InitialConditionSpec> initial_conditions;
     std::vector<InitialConditionSpec> nodesets;
     bool save_all = true;

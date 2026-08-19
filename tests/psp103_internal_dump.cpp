@@ -1,5 +1,5 @@
 // Debug dump: compare GSPICE PSP103 prepare internals @ T=21C against the
-// VACASK reference psp103v4 OP capture (Vg=0.75 Vd=0.1; op1.raw, 73 vars).
+// EXTERNAL_ORACLE reference psp103v4 OP capture (Vg=0.75 Vd=0.1; op1.raw, 73 vars).
 // Optional bias arguments feed the native DC-core pass and print the SP-stage
 // quantities (sp_ x rows) that the Python oracle transcription is diffed
 // against by tools/compare_psp103_sp.py.
@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     const auto prepared = model.prepare({{"W", 1e-6}, {"L", 0.1e-6}}, 21.0);
     const Psp103DeviceSetup s = psp103PrepareDevice(model, prepared, 21.0);
 
-    printf("== my internals @ T=21C, W=1u L=0.1u (VACASK ref from op1.raw) ==\n");
+    printf("== my internals @ T=21C, W=1u L=0.1u (EXTERNAL_ORACLE ref from op1.raw) ==\n");
     cmp("vfb_t", s.vfb_t, -1.103000000000000e+00, 1e-6);
     cmp("neff_i", s.neff, 7.744023323615161e+23, 1e-6);
     cmp("neffac_i", s.neffac, 6.195218658892129e+23, 1e-6);

@@ -19,14 +19,22 @@ public:
         int nodeNeg,
         double Is = 1e-14,
         double emissionCoeff = 1.0,
-        double cjo = 0.0)
+        double cjo = 0.0,
+        double rs = 0.0,
+        double bv = 0.0,
+        double ibv = 1e-10,
+        double nbv = 1.0)
         : Device(name),
           nodePos_(nodePos),
           nodeNeg_(nodeNeg),
           Is_(Is),
           emissionCoeff_(std::max(emissionCoeff, 1e-6)),
           Vt_(emissionCoeff_ * thermalVoltage_),
-          cjo_(std::max(cjo, 0.0)) {}
+          cjo_(std::max(cjo, 0.0)),
+          rs_(std::max(rs, 0.0)),
+          bv_(std::max(bv, 0.0)),
+          ibv_(std::max(ibv, 0.0)),
+          nbv_(std::max(nbv, 1e-6)) {}
 
     bool evaluateDae(
         const VectorReal& x,
@@ -35,8 +43,9 @@ public:
         evaluation.clear();
         const double rawVoltage = terminalVoltage(x);
         const double limited = std::clamp(rawVoltage, -2.0, 0.8);
-        double current = diodeCurrentFromLimitedVoltage(limited) + 1e-12 * limited;
-        const double conductance = diodeConductanceFromLimitedVoltage(limited) + 1e-12;
+        auto diode = diodeAtVoltage(limited);
+        double current = diode.current + 1e-12 * limited;
+        const double conductance = diode.conductance + 1e-12;
         // Preserve a consistent Newton linearization when the exponential is
         // evaluated at a limited voltage but the global solution still holds
         // the raw proposal.
@@ -69,8 +78,9 @@ public:
 
     void dcStamp(SparseMatrixReal& J, VectorReal& b, const VectorReal& x, double timeStep, double currentTime, const std::vector<VectorReal>& x_hist) override {
         double Vd = limitedVoltage(x);
-        double Id = diodeCurrentFromLimitedVoltage(Vd);
-        double gd = diodeConductanceFromLimitedVoltage(Vd);
+        auto diode = diodeAtVoltage(Vd);
+        double Id = diode.current;
+        double gd = diode.conductance;
         double gmin = 1e-12; gd += gmin; Id += gmin * Vd;
         double Ieq = Id - gd * Vd;
         J.add(nodePos_, nodePos_, gd);
@@ -137,7 +147,7 @@ public:
 
     void acStamp(SparseMatrixComplex& J, VectorComplex& b, double omega, const VectorReal& x_dc) override {
         double Vd = limitedVoltage(x_dc);
-        double gd = diodeConductanceFromLimitedVoltage(Vd);
+        double gd = diodeAtVoltage(Vd).conductance;
         std::complex<double> y = {gd, omega * cjo_};
         J.add(nodePos_, nodePos_, y);
         J.add(nodeNeg_, nodeNeg_, y);
@@ -148,11 +158,17 @@ public:
     void collectNoiseSources(double omega, const VectorReal& x_dc, std::vector<NoiseSource>& sources) const override {
         (void)omega;
         const double q = 1.602176634e-19;
-        const double current = std::abs(diodeCurrentFromLimitedVoltage(limitedVoltage(x_dc)));
+        const double current = std::abs(diodeAtVoltage(limitedVoltage(x_dc)).current);
         const double psd = 2.0 * q * current;
         if (psd > 0.0) {
             sources.push_back({name_ + ".shot", nodePos_, nodeNeg_, psd});
         }
+    }
+
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)time;
+        current = diodeAtVoltage(limitedVoltage(x)).current;
+        return true;
     }
 
     double transientChargeError(
@@ -196,8 +212,9 @@ public:
             double vd = Vd_time[i];
             if (vd > 0.8) vd = 0.8;
             double expV = std::exp(vd / Vt_);
-            Id_time[i] = Is_ * (expV - 1.0);
-            gd_time[i] = (Is_ / Vt_) * expV;
+            const auto diode = diodeAtVoltage(vd);
+            Id_time[i] = diode.current;
+            gd_time[i] = diode.conductance;
         }
 
         // 4. DFT back to frequency domain
@@ -228,12 +245,42 @@ private:
         return Vd;
     }
 
-    double diodeCurrentFromLimitedVoltage(double Vd) const {
-        return Is_ * (std::exp(Vd / Vt_) - 1.0);
+    struct DiodePoint {
+        double current = 0.0;
+        double conductance = 0.0;
+    };
+
+    static double limitedExp(double arg) {
+        return std::exp(std::clamp(arg, -80.0, 40.0));
     }
 
-    double diodeConductanceFromLimitedVoltage(double Vd) const {
-        return (Is_ / Vt_) * std::exp(Vd / Vt_);
+    DiodePoint junctionAtVoltage(double vj) const {
+        const double ev = limitedExp(vj / Vt_);
+        double current = Is_ * (ev - 1.0);
+        double conductance = (Is_ / Vt_) * ev;
+        if (bv_ > 0.0 && ibv_ > 0.0 && vj < -bv_) {
+            const double vtbr = nbv_ * thermalVoltage_;
+            const double eb = limitedExp((-vj - bv_) / std::max(vtbr, 1e-12));
+            current -= ibv_ * (eb - 1.0);
+            conductance += (ibv_ / std::max(vtbr, 1e-12)) * eb;
+        }
+        return {current, conductance};
+    }
+
+    DiodePoint diodeAtVoltage(double voltage) const {
+        if (rs_ <= 0.0) return junctionAtVoltage(voltage);
+        double vj = std::clamp(voltage, -100.0, 0.9);
+        for (int i = 0; i < 20; ++i) {
+            const auto point = junctionAtVoltage(vj);
+            const double f = vj + rs_ * point.current - voltage;
+            const double df = 1.0 + rs_ * point.conductance;
+            const double step = f / std::max(df, 1e-30);
+            vj -= std::clamp(step, -0.2, 0.2);
+            if (std::abs(step) < 1e-12) break;
+        }
+        const auto point = junctionAtVoltage(vj);
+        const double denom = 1.0 + rs_ * point.conductance;
+        return {point.current, point.conductance / std::max(denom, 1e-30)};
     }
 
     double terminalVoltage(const VectorReal& x) const {
@@ -317,6 +364,10 @@ private:
     double emissionCoeff_;
     double Vt_;
     double cjo_;
+    double rs_;
+    double bv_;
+    double ibv_;
+    double nbv_;
     double prevCapCurrent_ = 0.0;
     bool prevCapCurrentValid_ = false;
 };

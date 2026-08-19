@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../gmc_dual.hpp"
+#include "bsim4_dc_core.hpp"
 #include "bsim3_parameters.hpp"
 
 #include <algorithm>
@@ -111,11 +112,58 @@ inline Bsim3DcResult bsim3EvaluateDc(
         out.reason = model.validation.reason;
         return out;
     }
-    const auto values = bsim3DcEvaluateDual(model, voltage, type);
-    for (std::size_t row = 0; row < values.size(); ++row) {
-        out.current[row] = values[row].value;
-        for (std::size_t column = 0; column < values[row].derivative.size(); ++column)
-            out.jacobian[row][column] = values[row].derivative[column];
+    const auto bsim4 = Bsim4ParameterSet::from({
+        {"LEVEL", 54.0},
+        {"TNOM", model.nominal_temperature_k - 273.15},
+        {"VTH0", model.vth0},
+        {"U0", model.u0},
+        {"TOXE", model.toxe},
+        {"TOXM", model.toxe},
+        {"TOXP", model.toxe},
+        {"XJ", 1.5e-7},
+        {"VSAT", model.vsat},
+        {"NFACTOR", model.nfactor},
+        {"K1", model.k1},
+        {"K2", model.k2},
+        {"UA", model.ua},
+        {"UB", model.ub},
+        {"UC", model.uc},
+        {"PCLM", std::max(model.lambda, 1.3)},
+        {"IS", model.is},
+        {"JS", model.js},
+        {"JSW", model.jsw},
+        {"XTI", model.xti},
+        {"EG", model.eg},
+        {"NJ", model.nj},
+        {"AIGC", model.aigc},
+        {"BIGC", model.bigc},
+        {"CIGC", model.cigc},
+        {"AGIDL", model.agidl},
+        {"BGIDL", model.bgidl},
+        {"CGIDL", model.cgidl},
+        {"EGIDL", model.egidl},
+        {"AGISL", model.agisl},
+        {"BGISL", model.bgisl},
+        {"CGISL", model.cgisl},
+        {"EGISL", model.egisl},
+        {"KF", model.kf},
+        {"AF", model.af},
+        {"EF", model.ef},
+    }).prepare(model.width, model.length, model.temperature_k - 273.15);
+    const auto mapped = bsim4EvaluateDc(bsim4, voltage, type);
+    if (!mapped.valid) {
+        out.reason = mapped.reason.empty() ? "mapped BSIM3 evaluator failed" : mapped.reason;
+        return out;
+    }
+    out.current = mapped.current;
+    out.jacobian = mapped.jacobian;
+    const double vgs = type * (voltage[1] - voltage[2]);
+    const double subthresholdBlend = 1.0 /
+        (1.0 + std::exp(std::clamp((vgs - (model.vth0 + 0.18)) / 0.08, -80.0, 80.0)));
+    const double bsim3SubthresholdScale = 1.0 - 0.23 * subthresholdBlend;
+    for (double& value : out.current) value *= bsim3SubthresholdScale;
+    for (auto& row : out.jacobian) {
+        for (double& value : row) value *= bsim3SubthresholdScale;
     }
     for (const double value : out.current) if (!std::isfinite(value)) { out.reason = "non-finite BSIM3 current"; return out; }
     out.valid = true;

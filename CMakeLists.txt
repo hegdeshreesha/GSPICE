@@ -17,8 +17,9 @@ option(GSPICE_ENABLE_KLU "Enable the SuiteSparse/KLU sparse backend when availab
 option(GSPICE_REQUIRE_KLU "Fail configuration unless SuiteSparse/KLU is available" OFF)
 option(GSPICE_ENABLE_NOISE_VALIDATION "Enable external CSV-based stochastic noise validation tests" OFF)
 option(GSPICE_ENABLE_RF_NOISE_REGRESSION "Enable experimental RF/noise/PSS regression tests" OFF)
-option(GSPICE_ENABLE_VACASK_VALIDATION "Enable optional VACASK oracle parity tests" OFF)
+option(GSPICE_ENABLE_EXTERNAL_ORACLE_VALIDATION "Enable optional EXTERNAL_ORACLE oracle parity tests" OFF)
 option(GSPICE_ENABLE_GMC_GENERATED "Build generated GMC Verilog-A model smoke targets" ON)
+find_program(GSPICE_NGSPICE ngspice ngspice.exe)
 if(GSPICE_REQUIRE_KLU)
     set(GSPICE_ENABLE_KLU ON)
 endif()
@@ -120,6 +121,7 @@ add_executable(bsim4_diagnostics_probe tests/bsim4_diagnostics_probe.cpp)
 add_executable(bsim4_abulk_test tests/bsim4_abulk_test.cpp)
 add_executable(bsim4_model_dae_test tests/bsim4_model_dae_test.cpp)
 add_executable(bsim4_leakage_noise_test tests/bsim4_leakage_noise_test.cpp)
+add_executable(primitive_model_param_probe tests/primitive_model_param_probe.cpp)
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(gspice PUBLIC OpenMP::OpenMP_CXX)
@@ -187,6 +189,7 @@ add_test(NAME bsim4_dc_core COMMAND bsim4_dc_core_test)
 add_test(NAME bsim4_abulk COMMAND bsim4_abulk_test)
 add_test(NAME bsim4_model_dae COMMAND bsim4_model_dae_test)
 add_test(NAME bsim4_leakage_noise COMMAND bsim4_leakage_noise_test)
+add_test(NAME primitive_model_param_probe COMMAND primitive_model_param_probe)
 
 find_program(GSPICE_POWERSHELL NAMES pwsh powershell)
 find_program(GSPICE_PYTHON NAMES python3 python)
@@ -429,12 +432,153 @@ add_gspice_smoke_test(smoke_ihp_esd_native tests/decks/ihp_esd_native.sp)
 add_gspice_smoke_test(smoke_ihp_bondpad_native tests/decks/ihp_bondpad_native.sp)
 add_gspice_smoke_test(smoke_ihp_hbt_native tests/decks/ihp_hbt_native.sp)
 add_gspice_regex_test(smoke_dc_sweep_model tests/decks/dc_sweep_model.sp "Starting DC Sweep Analysis")
+add_gspice_smoke_test(smoke_primitive_model_params tests/decks/primitive_model_params.sp)
+if(GSPICE_PYTHON)
+    foreach(CURRENT_PROBE_CASE diode mos bjt psp103)
+        if(CURRENT_PROBE_CASE STREQUAL "diode")
+            set(CURRENT_PROBE_DECK tests/decks/current_probe_diode.sp)
+            set(CURRENT_PROBE_SIGNAL "I(D1)")
+            set(CURRENT_PROBE_MEASURE id1)
+            set(CURRENT_PROBE_MIN 1e-5)
+        elseif(CURRENT_PROBE_CASE STREQUAL "mos")
+            set(CURRENT_PROBE_DECK tests/decks/current_probe_mos.sp)
+            set(CURRENT_PROBE_SIGNAL "I(M1)")
+            set(CURRENT_PROBE_MEASURE im1)
+            set(CURRENT_PROBE_MIN 1e-7)
+        elseif(CURRENT_PROBE_CASE STREQUAL "bjt")
+            set(CURRENT_PROBE_DECK tests/decks/current_probe_bjt.sp)
+            set(CURRENT_PROBE_SIGNAL "I(Q1)")
+            set(CURRENT_PROBE_MEASURE iq1)
+            set(CURRENT_PROBE_MIN 1e-5)
+        else()
+            set(CURRENT_PROBE_DECK tests/decks/current_probe_psp103.sp)
+            set(CURRENT_PROBE_SIGNAL "I(M1)")
+            set(CURRENT_PROBE_MEASURE im1)
+            set(CURRENT_PROBE_MIN 1e-6)
+        endif()
+        add_test(NAME current_probe_${CURRENT_PROBE_CASE}
+            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_current_probe.py
+                --exe $<TARGET_FILE:gspice>
+                --deck ${CMAKE_CURRENT_SOURCE_DIR}/${CURRENT_PROBE_DECK}
+                --signal ${CURRENT_PROBE_SIGNAL}
+                --measure ${CURRENT_PROBE_MEASURE}
+                --min ${CURRENT_PROBE_MIN})
+    endforeach()
+endif()
 add_gspice_regex_test(smoke_dc_nested tests/decks/dc_nested.sp "sweep\\(V1\\).*sweep\\(V2\\)")
 add_gspice_regex_test(smoke_ac_lin tests/decks/ac_rc.sp "AC summary: points=5 sweep=LIN")
-add_gspice_regex_test(smoke_ac_values_phase tests/decks/ac_values_phase.sp "AC summary: points=3 sweep=VALUES")
+add_gspice_regex_test(smoke_ac_values_phase tests/decks/ac_values_phase.sp "1\\.00e\\+03 \\| \\(6\\.[0-9]+e-17,1\\.00e\\+00\\).*AC summary: points=3 sweep=VALUES")
+add_gspice_regex_test(smoke_ac_current_phase tests/decks/ac_current_phase.sp "1\\.00e\\+03 \\| \\(-6\\.[0-9]+e-14,-1\\.00e\\+03\\).*AC summary: points=1 sweep=LIN")
+add_gspice_regex_test(smoke_mutual_inductor_ac tests/decks/mutual_inductor_ac.sp "1\\.00e\\+03 \\| .*\\(4\\.[0-9]+e-01,.*AC summary: points=1 sweep=LIN")
+add_gspice_regex_test(smoke_tline_grounded_op tests/decks/tline_grounded_op.sp "Node [0-9]+=0\\.500000V \\[out\\]")
+add_gspice_regex_test(smoke_tline_floating_ac tests/decks/tline_floating_ac.sp "AC summary: points=1 sweep=LIN")
 add_gspice_regex_test(smoke_controlled_sources tests/decks/controlled_sources.sp "Node 1=1\\.000000V \\[out\\].*Node 2=2\\.000000V \\[buf\\]")
 add_gspice_smoke_test(smoke_current_controlled_sources tests/decks/current_controlled_sources.sp)
+add_gspice_regex_test(smoke_jfet_n_channel tests/decks/jfet_n_channel.sp "Node [0-9]+=3\\.[0-9]+V \\[drain\\]")
+add_gspice_regex_test(smoke_mesfet_alias tests/decks/mesfet_alias.sp "Node [0-9]+=3\\.[0-9]+V \\[drain\\]")
 add_gspice_regex_test(smoke_tf_divider tests/decks/tf_divider.sp "magnitude=4\\.99999999[0-9]e-01")
+add_gspice_regex_test(smoke_acxf_alias tests/decks/acxf_alias.sp "Starting ACXF Small-Signal Analysis")
+add_gspice_regex_test(smoke_dcxf_alias tests/decks/dcxf_alias.sp "Starting DCXF Small-Signal Analysis")
+add_gspice_regex_test(smoke_dcinc_alias tests/decks/dcinc_alias.sp "Starting DCINC Small-Signal Analysis")
+add_gspice_regex_test(smoke_spectre_errpreset_conservative tests/decks/spectre_errpreset_conservative.sp "Numerical policy: reltol=1\\.000000000e-04")
+add_gspice_regex_test(smoke_hbac_alias tests/decks/hbac_alias.sp "Native HB Converged:.*HBAC conversion matrix: sidebands=")
+add_gspice_regex_test(smoke_hbnoise_alias tests/decks/hbnoise_alias.sp "Native HB Converged:.*HBNOISE conversion matrix: sidebands=")
+add_gspice_regex_test(smoke_hbsp_alias tests/decks/hbsp_alias.sp "Native HB Converged:.*HBSP conversion matrix: sidebands=")
+add_gspice_regex_test(smoke_hbstb_alias tests/decks/hbstb_alias.sp "Native HB Converged:.*HBSTB conversion matrix: sidebands=")
+add_gspice_regex_test(smoke_hbxf_alias tests/decks/hbxf_alias.sp "Native HB Converged:.*HBAC conversion matrix: sidebands=")
+add_gspice_regex_test(smoke_hb_alias tests/decks/hb_alias.sp "Native HB Converged:.*HB Converged: f0=")
+add_gspice_regex_test(smoke_hb_multitone_alias tests/decks/hb_multitone_alias.sp "Native HB Converged:.*HB Converged: f0=5\\.000000000e\\+02.*tones=2")
+add_gspice_regex_test(smoke_hb_signoff_options tests/decks/hb_signoff_options.sp "Native HB Converged:.*native_hb=yes")
+add_gspice_regex_test(smoke_hb_diode_nonlinear tests/decks/hb_diode_nonlinear.sp "Native HB Converged:.*native_hb=yes.*2\\.000000000e\\+03 \\| .*\\| [1-9]\\.[0-9]+e-03")
+add_gspice_regex_test(smoke_hb_psp103_nonlinear tests/decks/hb_psp103_nonlinear.sp "Native HB Converged:.*native_hb=yes.*2\\.000000000e\\+03 \\| .*\\| .*\\| [2-3]\\.[0-9]+e-04")
+add_gspice_regex_test(smoke_hbac_diode_nonlinear tests/decks/hbac_diode_nonlinear.sp "Native HB Converged:.*HBAC conversion matrix: sidebands=5")
+add_gspice_regex_test(smoke_hbnoise_diode_nonlinear tests/decks/hbnoise_diode_nonlinear.sp "Native HB Converged:.*HBNOISE conversion matrix: sidebands=5.*PNOISE summary:")
+add_gspice_regex_test(smoke_pxf_alias tests/decks/pxf_alias.sp "Starting PAC from converged PSS operating point")
+add_gspice_regex_test(smoke_psssp_alias tests/decks/psssp_alias.sp "PSSSP conversion matrix: sidebands=")
+add_gspice_regex_test(smoke_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp "phase_noise_dbc_per_hz.*jitter_s_per_rtHz")
+if(GSPICE_PYTHON)
+    set(RF_SIGNOFF_GOLDEN ${CMAKE_CURRENT_SOURCE_DIR}/tests/rf_signoff_golden.json)
+    add_test(NAME signoff_hb_linear_rc
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hb_alias.sp
+            --case hb_linear_rc
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_hb_diode_nonlinear
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hb_diode_nonlinear.sp
+            --case hb_diode
+            --golden ${RF_SIGNOFF_GOLDEN})
+    if(GSPICE_NGSPICE)
+        add_test(NAME validation_rf_ngspice_hb_diode
+            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_rf_ngspice_hb.py
+                --gspice $<TARGET_FILE:gspice>
+                --ngspice ${GSPICE_NGSPICE}
+                --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hb_diode_nonlinear.sp
+                --relative-tolerance 1e-2)
+    endif()
+    add_test(NAME signoff_hb_multitone
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hb_multitone_alias.sp
+            --case hb_multitone
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_hb_psp103_nonlinear
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hb_psp103_nonlinear.sp
+            --case hb_psp103
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_hbac_diode_nonlinear
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hbac_diode_nonlinear.sp
+            --case hbac_diode
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_hbnoise_diode_nonlinear
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hbnoise_diode_nonlinear.sp
+            --case hbnoise_diode
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_pnoise_phase_jitter
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/pnoise_phase_jitter.sp
+            --case pnoise_phase_jitter
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_hbsp_matched
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hbsp_alias.sp
+            --case hbsp
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_psssp_matched
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/psssp_alias.sp
+            --case psssp
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_hbstb_loop
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/hbstb_alias.sp
+            --case hbstb
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_pssstb_loop
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/pssstb_rc_feedback.sp
+            --case pssstb
+            --golden ${RF_SIGNOFF_GOLDEN})
+    add_test(NAME signoff_psspac_linear
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_rf_signoff.py
+            --exe $<TARGET_FILE:gspice>
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/psspac_linear.sp
+            --case psspac_linear
+            --golden ${RF_SIGNOFF_GOLDEN})
+endif()
 add_gspice_smoke_test(smoke_bjt_npn tests/decks/bjt_npn.sp)
 add_gspice_regex_test(smoke_noise_resistor tests/decks/noise_resistor.sp "Starting Noise Analysis")
 add_test(
@@ -446,8 +590,8 @@ set_tests_properties(regression_pnoise_default_sweep PROPERTIES
     PASS_REGULAR_EXPRESSION "PNOISE summary:.*offsets=251"
 )
 if(GSPICE_ENABLE_RF_NOISE_REGRESSION)
-    add_gspice_regex_test(smoke_sp_oneport tests/decks/sp_oneport_matched.sp "SP summary: points=1 ports=1 method=multiport-y-to-s")
-    add_gspice_regex_test(smoke_sp_twoport tests/decks/sp_twoport_resistor.sp "SP summary: points=[1-9].*ports=2 method=multiport-y-to-s")
+    add_gspice_regex_test(smoke_sp_oneport tests/decks/sp_oneport_matched.sp "1\\.000000000e\\+03 \\| -2\\.[0-9]+e-11 0\\.000000000e\\+00.*SP summary: points=1 ports=1 method=multiport-y-to-s")
+    add_gspice_regex_test(smoke_sp_twoport tests/decks/sp_twoport_resistor.sp "1\\.000000000e\\+03 \\| 6\\.66666666[0-9]e-02 0\\.000000000e\\+00 2\\.666666667e-01 0\\.000000000e\\+00 2\\.666666667e-01 0\\.000000000e\\+00 6\\.66666666[0-9]e-02 0\\.000000000e\\+00.*SP summary: points=3 ports=2 method=multiport-y-to-s")
     add_gspice_regex_test(smoke_noise_integrated tests/decks/noise_resistor.sp "Integrated output noise: [1-9].* Vrms")
     add_gspice_regex_test(smoke_noise_input_referred tests/decks/noise_resistor.sp "Noise summary: points=2 output=V\\(out\\) input=V1")
     add_gspice_smoke_test(smoke_transient_noise tests/decks/transient_noise.sp)
@@ -460,14 +604,18 @@ if(GSPICE_ENABLE_RF_NOISE_REGRESSION)
     add_gspice_regex_test(smoke_pss_use_initial_conditions tests/decks/pss_use_initial_conditions.sp "Initial conditions: applied 1 node voltage seed\\(s\\) with UIC\\.")
     add_gspice_regex_test(smoke_pss_tstab_adaptive tests/decks/pss_tstab_adaptive.sp "PSS summary:.*tstab_seconds=[1-9].*adaptive_orbit=yes")
     add_gspice_error_test(error_pnoise_small_signal tests/decks/pnoise_resistor.sp ".PNOISE requires a preceding .PSS")
-    add_gspice_error_test(error_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp ".PNOISE requires a preceding .PSS")
-    add_gspice_error_test(error_psspac_sidebands tests/decks/psspac_linear.sp "analysis .PSSPAC is parsed for compatibility")
-    add_gspice_error_test(error_pssstb_twoport tests/decks/pssstb_rc_feedback.sp "analysis .PSSSTB is parsed for compatibility")
+    add_gspice_regex_test(smoke_pnoise_phase_jitter_rf tests/decks/pnoise_phase_jitter.sp "PNOISE summary:.*carrier=")
+    add_gspice_regex_test(smoke_psspac_sidebands tests/decks/psspac_linear.sp "Starting PAC from converged PSS operating point")
+    add_gspice_regex_test(smoke_pssstb_twoport tests/decks/pssstb_rc_feedback.sp "Starting PSSSTB from converged PSS operating point")
     add_gspice_error_test(error_pnoise_sidebands tests/decks/pnoise_sidebands.sp ".PNOISE requires a preceding .PSS")
-    add_gspice_error_test(error_psspac_diode_lptv tests/decks/psspac_diode_lptv.sp "analysis .PSSPAC is parsed for compatibility")
+    add_gspice_regex_test(smoke_psspac_diode_lptv tests/decks/psspac_diode_lptv.sp "Starting PAC from converged PSS operating point")
     add_gspice_error_test(error_pnoise_diode_lptv tests/decks/pnoise_diode_lptv.sp ".PNOISE requires a preceding .PSS")
 endif()
 add_gspice_regex_test(smoke_measure_tran tests/decks/measure_tran.sp "MEASURE vfinal = 6\\.[0-9]+e-01")
+add_gspice_regex_test(smoke_measure_tran_ops tests/decks/measure_tran_ops.sp "MEASURE area = 5\\.000000000e-04.*MEASURE slope = 1\\.000000000e\\+03.*MEASURE slope_at = 1\\.000000000e\\+03")
+add_gspice_regex_test(smoke_measure_tran_when tests/decks/measure_tran_when.sp "MEASURE t50 = 5\\.000000000e-04")
+add_gspice_regex_test(smoke_measure_tran_delay tests/decks/measure_tran_delay.sp "MEASURE delay = 2\\.000000000e-04")
+add_gspice_regex_test(smoke_four_sine tests/decks/four_sine.sp "FOUR V\\(out\\).*fundamental=1\\.000000000e\\+03.*thd_percent=.*harmonic frequency magnitude phase_deg normalized")
 add_gspice_regex_test(smoke_step_op tests/decks/step_op.sp "Starting STEP Analysis")
 add_gspice_regex_test(smoke_sens_source tests/decks/sens_source.sp "Sensitivity: dV\\(out\\)/dV1")
 add_gspice_regex_test(smoke_pz_rc tests/decks/pz_rc.sp "Dominant pole estimate")
@@ -515,20 +663,59 @@ if(GSPICE_PYTHON AND GSPICE_ENABLE_NOISE_VALIDATION)
 endif()
 if(GSPICE_PYTHON)
     add_test(
-        NAME validation_vacask_harness_cases
-        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/vacask_parity.py
+        NAME validation_bsim4_reference
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_bsim4_reference.py
+            --python ${GSPICE_PYTHON}
+            --gspice-probe $<TARGET_FILE:bsim4_reference_probe>
+            --source ${CMAKE_CURRENT_SOURCE_DIR}
+            --relative-tolerance 0.01
+    )
+    if(GSPICE_NGSPICE)
+        add_test(
+            NAME validation_bsim3_ngspice_full_region
+            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_bsim3_reference.py
+                --ngspice ${GSPICE_NGSPICE}
+                --gspice $<TARGET_FILE:bsim3_reference_probe>
+                --source ${CMAKE_CURRENT_SOURCE_DIR}
+                --relative-tolerance 0.10
+                --absolute-tolerance 1e-12
+        )
+    endif()
+    add_test(
+        NAME validation_external_oracle_harness_cases
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/external_oracle_parity.py
             --list-cases
     )
-    if(GSPICE_ENABLE_VACASK_VALIDATION)
-        foreach(VACASK_CASE ihp_lv_dc ihp_lv_ac ihp_lv_tran ihp_lv_noise)
+    if(GSPICE_NGSPICE)
+        add_test(
+            NAME validation_external_oracle_ngspice_diode_dc
+            COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/external_oracle_parity.py
+                --source ${CMAKE_CURRENT_SOURCE_DIR}
+                --gspice $<TARGET_FILE:gspice>
+                --case ngspice_diode_dc
+                --external_oracle-command "${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_ngspice_oracle.py --ngspice ${GSPICE_NGSPICE} --case {case} --deck {deck} --csv {csv} --workdir {workdir}"
+                --require-external_oracle
+                --relative-tolerance 1e-2
+                --absolute-tolerance 1e-6
+        )
+    endif()
+    add_test(
+        NAME scanner_psp103_approximate_param_enforced
+        COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/rank_psp103_ignored.py
+            --deck ${CMAKE_CURRENT_SOURCE_DIR}/tests/decks/psp103_approximate_param.sp
+            --fail-on-approximate
+    )
+    set_tests_properties(scanner_psp103_approximate_param_enforced PROPERTIES WILL_FAIL TRUE)
+    if(GSPICE_ENABLE_EXTERNAL_ORACLE_VALIDATION)
+        foreach(EXTERNAL_ORACLE_CASE ihp_lv_dc ihp_lv_ac ihp_lv_tran ihp_lv_noise)
             add_test(
-                NAME validation_vacask_${VACASK_CASE}
-                COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/vacask_parity.py
+                NAME validation_external_oracle_${EXTERNAL_ORACLE_CASE}
+                COMMAND ${GSPICE_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/external_oracle_parity.py
                     --source ${CMAKE_CURRENT_SOURCE_DIR}
                     --gspice $<TARGET_FILE:gspice>
-                    --case ${VACASK_CASE}
+                    --case ${EXTERNAL_ORACLE_CASE}
             )
-            set_tests_properties(validation_vacask_${VACASK_CASE} PROPERTIES
+            set_tests_properties(validation_external_oracle_${EXTERNAL_ORACLE_CASE} PROPERTIES
                 SKIP_RETURN_CODE 77
                 TIMEOUT 180
             )
@@ -609,7 +796,7 @@ if(GSPICE_PYTHON AND GSPICE_ENABLE_GMC_GENERATED)
     )
 endif()
 add_gspice_error_test(error_unsupported_compact_model tests/decks/compact_model_unsupported.sp ".GSDI artifact for model type")
-add_gspice_error_test(error_osdi_directive_rejected tests/decks/osdi_directive_rejected.sp "OSDI/OpenVAF loading is disabled")
+add_gspice_error_test(error_osdi_directive_rejected tests/decks/osdi_directive_rejected.sp "external compact-model runtime loading is disabled")
 add_gspice_error_test(error_gsdi_bad_envelope tests/decks/gsdi_bad_envelope.sp "invalid .GSDI artifact envelope")
 if(GSPICE_ENABLE_GMC_GENERATED)
     add_gspice_error_test(error_gsdi_terminal_mismatch tests/decks/gsdi_terminal_mismatch.sp "declares 2")

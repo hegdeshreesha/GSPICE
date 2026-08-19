@@ -151,6 +151,7 @@ public:
 
     void setBranchIndex(int index) { branchIndex_ = index; }
     int getBranchIndex() const { return branchIndex_; }
+    double getInductance() const { return value_; }
 
 private:
     static double nodeVoltage(const VectorReal& x, int node) {

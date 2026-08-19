@@ -268,6 +268,24 @@ public:
         (void)variables;
     }
 
+    virtual bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const {
+        DaeRequest request;
+        request.analysis = DaeAnalysis::OperatingPoint;
+        request.time = time;
+        request.staticResidual = true;
+        request.dynamicResidual = false;
+        request.staticJacobian = false;
+        request.dynamicJacobian = false;
+        DaeEvaluation evaluation;
+        if (!const_cast<Device*>(this)->evaluateDae(x, request, evaluation) ||
+            evaluation.staticResidual.empty()) {
+            (void)current;
+            return false;
+        }
+        current = evaluation.staticResidual.front().value;
+        return true;
+    }
+
     /**
      * Stamping for Harmonic Balance analysis (Frequency domain non-linear).
      * @param f_fund Fundamental frequency

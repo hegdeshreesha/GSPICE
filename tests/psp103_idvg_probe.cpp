@@ -1,5 +1,6 @@
 #include "devices/psp103_model.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -62,7 +63,7 @@ int main() {
                                        0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00,
                                        1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35,
                                        1.40, 1.45, 1.50};
-const std::vector<double> refId = {2.798872181e-09, 1.093550907e-08, 4.292254664e-08,
+    const std::vector<double> refId = {2.798872181e-09, 1.093550907e-08, 4.292254664e-08,
                                        1.682544634e-07, 6.454529279e-07, 2.286294201e-06,
                                        6.784016912e-06, 1.586210528e-05, 2.964320107e-05,
                                        4.655416315e-05, 6.475628261e-05, 8.300684720e-05,
@@ -71,12 +72,16 @@ const std::vector<double> refId = {2.798872181e-09, 1.093550907e-08, 4.292254664
                                        1.825172459e-04, 1.921255333e-04, 2.007159691e-04,
                                        2.083560523e-04, 2.151130513e-04, 2.210526015e-04,
                                        2.262378256e-04, 2.307288046e-04, 2.345822852e-04,
-                                       2.378515494e-04, 2.405863942e-04, 2.428331863e-04,
-                                       2.446349676e-04};
+                                       2.378515494e-04, 2.405863942e-04, 2.430697660e-04,
+                                       2.448505700e-04};
 
     DaeRequest request;
     request.staticResidual = true;
     request.staticJacobian = true;
+    constexpr double maxRelError = 1.0e-3;
+    double worstRelError = 0.0;
+    double worstVg = 0.0;
+    bool failed = false;
     std::printf("     Vg        Id(gspice)     Id(ref)       ratio\n");
     for (size_t i = 0; i < refVg.size(); ++i) {
         VectorReal x(4);
@@ -87,6 +92,7 @@ const std::vector<double> refId = {2.798872181e-09, 1.093550907e-08, 4.292254664
         DaeEvaluation evaluation;
         if (!mos.evaluateDae(x, request, evaluation)) {
             std::printf("%10.3f  EVAL FAIL\n", refVg[i]);
+            failed = true;
             continue;
         }
         double drainResidual = 0.0;
@@ -96,9 +102,16 @@ const std::vector<double> refId = {2.798872181e-09, 1.093550907e-08, 4.292254664
             if (term.equation == 2) sourceResidual += term.value;
         }
         const double id = drainResidual;
+        const double relError = std::abs(id - refId[i]) / std::max(std::abs(refId[i]), 1.0e-15);
+        if (relError > worstRelError) {
+            worstRelError = relError;
+            worstVg = refVg[i];
+        }
         std::printf("%10.3f  %12.5e  %12.5e  %9.4f\n", refVg[i], id, refId[i],
                     id / refId[i]);
         (void)sourceResidual;
     }
-    return 0;
+    std::printf("PSP103 IdVg probe parity: points=%zu max_rel_err=%.6g at vg=%.3f limit=%.6g\n",
+                refVg.size(), worstRelError, worstVg, maxRelError);
+    return failed || worstRelError > maxRelError ? 1 : 0;
 }

@@ -102,6 +102,12 @@ public:
         b.add(nodeNeg_ * K, dcValue_);
     }
 
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)x;
+        current = evaluateAt(time);
+        return true;
+    }
+
 private:
     static constexpr double PI_ = 3.14159265358979323846;
 

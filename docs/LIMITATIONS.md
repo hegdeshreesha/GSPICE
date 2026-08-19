@@ -26,8 +26,9 @@ path and its numerical solve completed. It is not a signoff guarantee.
   scoping, recursion, function, vector, string, table, or corner-library rules.
 - No general user-defined functions, discipline/nature system, digital or
   mixed-signal language, XSPICE code models, or arbitrary runtime alteration.
-- `.SAVE` output is presently voltage-focused; current and expression output
-  selection is incomplete.
+- `.SAVE` output supports node voltages and device currents for branch-current
+  devices plus DAE/static semiconductor current probes. General expressions and
+  all dynamic element current histories are incomplete.
 - Multiple analysis blocks and analysis-wrapped nested sweeps are not a general
   control language.
 - Error source locations can be imprecise after nested preprocessing.
@@ -36,12 +37,19 @@ path and its numerical solve completed. It is not a signoff guarantee.
 
 - Primitive MOS is a simplified Level-1-style teaching/debug model. It is not
   BSIM, PSP, EKV, HiSIM, or foundry-grade.
+- Native BSIM4 level-54 DC has a clean-room BSIM4.8.3 parity gate. Native
+  BSIM3 level-49 has an ngspice weak/moderate/strong DC parity gate; broader
+  geometry, temperature, capacitance, and transient charge parity still need
+  deeper BSIM3 equation coverage.
 - Primitive BJT, diode, and noise implementations are first-pass models with
   limited temperature, charge, breakdown, high-injection, flicker, and
   correlation behavior.
-- JFET, MESFET, transmission-line families, magnetic coupling breadth,
+- Broad transmission-line families, broad magnetic-core modeling,
   semiconductor switches, IBIS, TCAD devices, and many standard SPICE model
-  levels are absent.
+  levels are absent. Primitive `NJF`/`PJF` JFET devices, MESFET aliases routed
+  through the primitive JFET approximation, one-section `Txxx` Z0/TD line
+  approximations, and linear two-winding `Kxxx L1 L2 k` mutual inductance are
+  supported for OP/AC/transient through the DAE path.
 - native compact-model compatibility is experimental. Reactive residuals participate in
   transient integration and charge-aware LTE checks. Recognized model
   parameters are resolved and bound strictly; limiting flags participate in
@@ -71,30 +79,38 @@ path and its numerical solve completed. It is not a signoff guarantee.
   convergence-order qualification on stiff nonlinear compact-model circuits,
   dense event scheduling, checkpoint/restart, and large-circuit validation.
 - AC is correct only for devices with complete, validated small-signal stamps.
-- Noise is output-referred and first-pass. Input-referred/integrated noise,
-  comprehensive flicker/correlation, transient noise, and PNoise are absent.
+- Noise is output-referred and first-pass. PNOISE/HBNOISE execution exists for
+  the implemented periodic small-signal path, but input-referred/integrated
+  noise, comprehensive flicker/correlation, and transient noise remain limited
+  and need external oracle sweeps before signoff use.
 - `.TF` supports a voltage output and independent source input subset.
 - `.SENS` is finite-difference source sensitivity, not general direct/adjoint
   device/model sensitivity.
 - `.PZ` is a frequency-sweep threshold estimator, not a generalized-eigenvalue
   pole-zero solver.
-- `.MEASURE` covers a small transient-voltage subset; triggers, targets,
-  delays, derivatives, integrals, expressions, AC/DC modes, and broad SPICE
-  compatibility are absent.
+- `.MEASURE` covers transient voltage probes and device-current probes for
+  `FIND`, `MIN`, `MAX`, `PP`, `AVG`, `RMS`, `INTEG`, `DERIV`, and simple
+  `WHEN probe=value` crossings with `RISE`/`FALL`/`CROSS` counts. Common
+  transient trigger/target delay measurements are supported. General
+  expressions, AC/DC modes, and broad SPICE compatibility are absent.
 - `.STEP`, `.CORNER`, and `.MC` operate mainly on independent-source OP runs.
   Arbitrary instance/model/option distributions and correlations are absent.
 - Monte Carlo supports Gaussian or bounded-uniform variation of one source,
   deterministic seeds, and one-dimensional LHS. It has no correlation matrix,
   process/mismatch hierarchy, Sobol sequence, importance sampling, or confidence
   interval reporting.
-- HB is experimental, single-engine code with limited device stamps and no
-  production continuation/preconditioning strategy.
-- PSS, PAC, PNoise, SP execution, HBAC/HBNoise/HBSP/HBSTB, PSSSP, and PSSSTB
-  have no validated execution engine and are rejected. Some are parsed only to
-  provide a precise error.
+- HB has a native collocation Newton refinement path with shooting
+  initialization and signoff-required mode, but it is still prototype-grade
+  without production continuation/preconditioning coverage.
+- PSS, PAC/PXF, PNOISE, SP, HBAC/HBNOISE/HBSP/HBSTB/HBXF, PSSSP, and PSSSTB
+  now execute for supported small decks and have smoke/signoff regressions.
+  They remain prototype RF engines until each has independent oracle sweeps
+  across nonlinear devices, sidebands, ports, noise, and convergence stress
+  cases.
 - STB is experimental and requires the specific implemented probe topology.
-- Distortion, Fourier post-analysis directives, envelope, transient
-  sensitivity, and general uncertainty quantification are absent.
+- `.FOUR` supports transient voltage-probe harmonic tables over the final
+  period. Distortion, envelope, transient sensitivity, and general uncertainty
+  quantification are absent.
 
 ## Numerics, scale, and performance
 

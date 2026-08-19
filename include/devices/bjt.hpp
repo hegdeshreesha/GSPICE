@@ -28,20 +28,37 @@ public:
         double area = 1.0,
         double cje = 0.0,
         double cjc = 0.0,
-        double tf = 0.0)
+        double tf = 0.0,
+        double ikf = 0.0,
+        double ikr = 0.0,
+        double vaf = 0.0,
+        double var = 0.0,
+        double ise = 0.0,
+        double isc = 0.0,
+        double ne = 1.5,
+        double nc = 2.0)
         : Device(name),
           nodeC_(nodeC),
           nodeB_(nodeB),
           nodeE_(nodeE),
           type_(type >= 0 ? 1 : -1),
-          is_(std::max(is * std::max(area, 1e-30), 1e-30)),
+          area_(std::max(area, 1e-30)),
+          is_(std::max(is * area_, 1e-30)),
           bf_(std::max(bf, 1e-9)),
           br_(std::max(br, 1e-9)),
           nf_(std::max(nf, 1e-9)),
           nr_(std::max(nr, 1e-9)),
-          cje_(std::max(cje * std::max(area, 1e-30), 0.0)),
-          cjc_(std::max(cjc * std::max(area, 1e-30), 0.0)),
-          tf_(std::max(tf, 0.0)) {}
+          cje_(std::max(cje * area_, 0.0)),
+          cjc_(std::max(cjc * area_, 0.0)),
+          tf_(std::max(tf, 0.0)),
+          ikf_(std::max(ikf * area_, 0.0)),
+          ikr_(std::max(ikr * area_, 0.0)),
+          vaf_(std::max(vaf, 0.0)),
+          var_(std::max(var, 0.0)),
+          ise_(std::max(ise * area_, 0.0)),
+          isc_(std::max(isc * area_, 0.0)),
+          ne_(std::max(ne, 1e-9)),
+          nc_(std::max(nc, 1e-9)) {}
 
     bool evaluateDae(
         const VectorReal& x,
@@ -213,6 +230,12 @@ public:
         if (ibPsd > 0.0) sources.push_back({name_ + ".base_shot", nodeB_, nodeE_, ibPsd});
     }
 
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)time;
+        current = terminalCurrents(x)[0];
+        return true;
+    }
+
 private:
     struct JunctionCap {
         int pos = -1;
@@ -269,9 +292,22 @@ private:
         const double ve = v[2];
         const double vbe = type_ * (vb - ve);
         const double vbc = type_ * (vb - vc);
-        const double ibe = is_ / bf_ * (limitedExp(vbe / (nf_ * vt_)) - 1.0);
-        const double ibc = is_ / br_ * (limitedExp(vbc / (nr_ * vt_)) - 1.0);
-        const double itr = is_ * (limitedExp(vbe / (nf_ * vt_)) - limitedExp(vbc / (nr_ * vt_)));
+        const double vce = type_ * (vc - ve);
+        const double vec = -vce;
+        const double qbe = limitedExp(vbe / (nf_ * vt_));
+        const double qbc = limitedExp(vbc / (nr_ * vt_));
+        const double forward = is_ * (qbe - 1.0);
+        const double reverse = is_ * (qbc - 1.0);
+        const double qb = 1.0 +
+            (ikf_ > 0.0 ? std::max(forward, 0.0) / ikf_ : 0.0) +
+            (ikr_ > 0.0 ? std::max(reverse, 0.0) / ikr_ : 0.0);
+        const double forwardEarly = vaf_ > 0.0 ? std::max(0.01, 1.0 + vce / vaf_) : 1.0;
+        const double reverseEarly = var_ > 0.0 ? std::max(0.01, 1.0 + vec / var_) : 1.0;
+        const double ibe = is_ / bf_ * (qbe - 1.0) +
+            ise_ * (limitedExp(vbe / (ne_ * vt_)) - 1.0);
+        const double ibc = is_ / br_ * (qbc - 1.0) +
+            isc_ * (limitedExp(vbc / (nc_ * vt_)) - 1.0);
+        const double itr = (forward * forwardEarly - reverse * reverseEarly) / std::max(qb, 1e-30);
 
         const double ic = itr - ibc;
         const double ib = ibe + ibc;
@@ -402,6 +438,7 @@ private:
     int nodeB_;
     int nodeE_;
     int type_;
+    double area_;
     double is_;
     double bf_;
     double br_;
@@ -410,6 +447,14 @@ private:
     double cje_;
     double cjc_;
     double tf_;
+    double ikf_;
+    double ikr_;
+    double vaf_;
+    double var_;
+    double ise_;
+    double isc_;
+    double ne_;
+    double nc_;
     std::array<double, 2> capCurrents_{};
     std::array<bool, 2> capCurrentValid_{};
 };

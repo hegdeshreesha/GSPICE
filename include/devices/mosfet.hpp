@@ -263,6 +263,12 @@ public:
         }
     }
 
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)time;
+        current = terminalCurrents(x)[0];
+        return true;
+    }
+
 private:
     struct ParasiticCap {
         int pos = -1;

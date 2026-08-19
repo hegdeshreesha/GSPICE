@@ -8,14 +8,14 @@ compact-model stack with in-house components:
   (`tools/gmc/*.py`) replaces OpenVAF.
 
 Target models, in order: **BSIM4.8.3, BSIM3, PSP103** (plus the existing
-JUNCAP/JUNCAP2 native modules). VACASK and ngspice remain external benchmark
+JUNCAP/JUNCAP2 native modules). External simulators and ngspice remain benchmark
 oracles only.
 
 ---
 
 ## 1. Context and Goal
 
-The ecosystem is being mapped against VACASK (PSP103.4 + OSDI 0.4 +
+The ecosystem is being mapped against external references (PSP103.4 + OSDI 0.4 +
 OpenVAF-reloaded; C6288 benchmark: 10 112 transistors, 57.98 s / 138.5 MB vs
 ngspice 71.81 s, Xyce 151.57 s) to define competitive targets for GSPICE.
 
@@ -49,7 +49,7 @@ either merge into a kept terminal column or become genuine extra unknowns.
    are copied into this repository. Concepts such as model descriptors,
    setup/evaluate split, F/Q decomposition, and Jacobian patterns are standard
    simulator architecture and inform the design without being "concept
-   property" — nothing is copied in any concrete form. VACASK (AGPL-3.0) is a
+   property" — nothing is copied in any concrete form. The external reference simulator is a
    benchmark reference only.
 2. **Build-time generated C++ headers, no `dlopen`.** No external compact-model
    compilers and no run-time loading of model binaries. Models are compiled to
@@ -60,8 +60,8 @@ either merge into a kept terminal column or become genuine extra unknowns.
 4. **One shared `F(x) + dQ(x)/dt` DAE path.** All compact models, native or
    generated, flow through the same device-neutral DAE contract; no
    per-analysis companion-model hacks.
-5. **VACASK / ngspice as benchmark oracles only.** ngspice (BSD) is the numeric
-   oracle for reference gates; VACASK (AGPL-3.0) is benchmark reference only.
+5. **External simulators / ngspice as benchmark oracles only.** ngspice (BSD) is the numeric
+   oracle for reference gates; other simulators are benchmark references only.
 6. **Target order: BSIM4.8.3, BSIM3, PSP103.** BSIM4.8.3 first — it is the
    broadest overlap with the ecosystem benchmarks; then BSIM3 (shared
    architecture, faster to back-port); PSP103 last via the same pipeline.
@@ -173,7 +173,7 @@ either merge into a kept terminal column or become genuine extra unknowns.
 
 ### Phase F — Performance (after correctness)
 
-- Benchmark against VACASK / ngspice / Xyce numbers **only after the BSIM/PSP
+- Benchmark against external simulator / ngspice / Xyce numbers **only after the BSIM/PSP
   correctness gates are green**. C6288 (10 112 transistors) parity lives here,
   not in earlier phases.
 - Optimize after profiling: KLU backend and sparse stamp optimization, DAE

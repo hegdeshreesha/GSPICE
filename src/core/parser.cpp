@@ -5,6 +5,8 @@
 #include "devices/diode.hpp"
 #include "devices/voltage_source.hpp"
 #include "devices/inductor.hpp"
+#include "devices/mutual_inductor.hpp"
+#include "devices/jfet.hpp"
 #include "devices/mosvar_capacitor.hpp"
 #include "devices/port.hpp"
 #include "devices/mosfet.hpp"
@@ -246,6 +248,7 @@ bool tryEvaluateParamExpression(
 bool tryParseSpiceValue(const std::string& token, double& out);
 
 std::pair<std::string, std::string> splitParameterToken(const std::string& token);
+bool isStringValuedAssignmentKey(const std::string& key);
 
 std::string remapPrimitiveLine(
     const PreLine& line,
@@ -499,7 +502,7 @@ std::string applyGlobalParams(
         replaceAll(line, "{" + key + "}", resolved);
         replaceAll(line, "'" + key + "'", resolved);
     }
-line = resolveBracedNumericExpressions(line, params);
+    line = resolveBracedNumericExpressions(line, params);
     auto tokens = tokenizeSimple(line);
     const bool isOptionsLine =
         !tokens.empty() && (toUpperCopy(tokens[0]) == ".OPTIONS" || toUpperCopy(tokens[0]) == ".OPTION" ||
@@ -516,6 +519,7 @@ line = resolveBracedNumericExpressions(line, params);
             }
             auto [key, value] = splitParameterToken(token);
             if (!key.empty()) {
+                if (isStringValuedAssignmentKey(key)) continue;
                 double evaluated = 0.0;
                 if (tryEvaluateParamExpression(value, params, evaluated)) {
                     token = key + "=" + formatNumericValue(evaluated);
@@ -559,6 +563,57 @@ bool isGroundName(const std::string& name) {
 
 bool isParameterToken(const std::string& token) {
     return token.find('=') != std::string::npos;
+}
+
+bool isStringValuedAssignmentKey(const std::string& key) {
+    const std::string upper = toUpperCopy(key);
+    return upper == "MODE" || upper == "NOISEMODE" || upper == "NOISE_MODE" ||
+           upper == "SOLVER" || upper == "METHOD" || upper == "FORMAT" ||
+           upper == "PHASENOISE" || upper == "PHASE_NOISE" || upper == "JITTER";
+}
+
+bool parseSpiceBool(const std::string& value, bool fallback = true) {
+    const std::string upper = toUpperCopy(stripQuotes(value));
+    if (upper.empty()) return fallback;
+    if (upper == "1" || upper == "YES" || upper == "TRUE" || upper == "ON") return true;
+    if (upper == "0" || upper == "NO" || upper == "FALSE" || upper == "OFF") return false;
+    return fallback;
+}
+
+bool isRfSweepKeyword(const std::string& token) {
+    const std::string upper = toUpperCopy(token);
+    return upper == "DEC" || upper == "OCT" || upper == "LIN" || upper == "VALUES";
+}
+
+void applyRfAnalysisOption(gspice::SimulationSettings& settings, const std::string& key, const std::string& value) {
+    const std::string upper = toUpperCopy(key);
+    if (value.empty()) return;
+    if (upper == "FUND" || upper == "FUNDAMENTAL" || upper == "F0") {
+        settings.f_fund.clear();
+        settings.f_fund.push_back(gspice::Utils::parseValue(value));
+    } else if (upper == "SIDEBANDS" || upper == "SIDEBAND" ||
+               upper == "NHARMS" || upper == "N_HARMS" ||
+               upper == "HARMS" || upper == "HARMONICS") {
+        settings.n_harms = std::max(1, std::stoi(value));
+    } else if (upper == "PHASENOISE" || upper == "PHASE_NOISE") {
+        settings.pnoise_phase_noise = parseSpiceBool(value);
+    } else if (upper == "JITTER") {
+        settings.pnoise_jitter = parseSpiceBool(value);
+    } else if (upper == "CARRIER" || upper == "CARRIERFREQ") {
+        settings.pnoise_carrier = gspice::Utils::parseValue(value);
+    } else if (upper == "NATIVE_HB_REQUIRED" || upper == "HB_NATIVE_REQUIRED" ||
+               upper == "STRICT_HB" || upper == "SIGNOFF") {
+        settings.hb_native_required = parseSpiceBool(value);
+    }
+}
+
+void parseRfAssignmentOptions(gspice::SimulationSettings& settings,
+                              const std::vector<std::string>& tokens,
+                              size_t start) {
+    for (size_t i = start; i < tokens.size(); ++i) {
+        auto [key, value] = splitParameterToken(tokens[i]);
+        if (!key.empty()) applyRfAnalysisOption(settings, key, value);
+    }
 }
 
 std::pair<std::string, std::string> splitParameterToken(const std::string& token) {
@@ -1173,6 +1228,7 @@ std::string applyLocalParams(
         }
         auto [key, value] = splitParameterToken(token);
         if (!key.empty()) {
+            if (isStringValuedAssignmentKey(key)) continue;
             double evaluated = 0.0;
             if (tryEvaluateParamExpression(value, params, evaluated)) {
                 token = key + "=" + formatNumericValue(evaluated);
@@ -1929,6 +1985,9 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
         preset = toUpperCopy(preset);
         preset.erase(std::remove(preset.begin(), preset.end(), '_'), preset.end());
         preset.erase(std::remove(preset.begin(), preset.end(), '-'), preset.end());
+        if (preset == "LIBERAL") preset = "LOW";
+        else if (preset == "MODERATE") preset = "MEDIUM";
+        else if (preset == "CONSERVATIVE") preset = "VERYHIGH";
         settings.tran_adaptive = true;
         if (preset == "LOW") {
             settings.reltol = 5e-3;
@@ -2003,8 +2062,21 @@ void applyOptionToken(gspice::SimulationSettings& settings, const std::string& t
     else if ((key == "THREADS" || key == "NUM_THREADS" || key == "NTHREADS" || key == "PARALLEL" || key == "CPUS") && hasNumeric && numeric > 0.0) {
         settings.num_threads = static_cast<int>(numeric);
     }
-    else if (key == "ACCURACY" && !value.empty()) applyPreset(value);
+    else if ((key == "ACCURACY" || key == "ERRPRESET" || key == "ERR_PRESET") && !value.empty()) applyPreset(value);
     else if ((key == "NUMERICAL" || key == "CONVERGENCE" || key == "POLICY") && !value.empty()) applyNumericalPolicy(value);
+    else if (key == "SIGNOFF" || key == "RF_SIGNOFF") {
+        if (truthy(value)) {
+            settings.hb_native_required = true;
+            settings.max_pss_iter = std::max(settings.max_pss_iter, 20);
+            settings.op_max_iter = std::max(settings.op_max_iter, 200);
+            settings.tran_max_iter = std::max(settings.tran_max_iter, 160);
+            settings.source_stepping = true;
+            settings.gmin_stepping = true;
+            settings.line_search = true;
+            settings.solver_singletons = true;
+            settings.tran_adaptive = true;
+        }
+    }
     else if (key == "TRTOL" && hasNumeric && numeric > 0.0) settings.tran_trtol = numeric;
     else if ((key == "TRAN_RELTOL" || key == "LTE_RELTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_reltol = numeric;
     else if ((key == "TRABSTOL" || key == "TRAN_ABSTOL" || key == "LTE_ABSTOL") && hasNumeric && numeric > 0.0) settings.tran_lte_abstol = numeric;
@@ -2139,6 +2211,7 @@ void parseSourceSpec(
     const std::string& sourceSpec,
     double& dcValue,
     double& acMagnitude,
+    double& acPhaseDeg,
     bool& dcSeen,
     gspice::VoltageSource::WaveformType& waveformType,
     gspice::VoltageSource::PulseParams& pulse,
@@ -2148,6 +2221,7 @@ void parseSourceSpec(
 
     dcValue = 0.0;
     acMagnitude = 1.0;
+    acPhaseDeg = 0.0;
     dcSeen = false;
     waveformType = gspice::VoltageSource::WaveformType::DC;
     pulse = gspice::VoltageSource::PulseParams{};
@@ -2176,7 +2250,12 @@ void parseSourceSpec(
         if (pUpper == "AC" && i + 1 < parts.size()) {
             double tmp = 0.0;
             if (tryParseSpiceValue(parts[i + 1], tmp)) acMagnitude = tmp;
-            ++i;
+            if (i + 2 < parts.size() && tryParseSpiceValue(parts[i + 2], tmp)) {
+                acPhaseDeg = tmp;
+                i += 2;
+            } else {
+                ++i;
+            }
             continue;
         }
         if (!dcSeen && i == 0 && pUpper.find('(') == std::string::npos) {
@@ -2248,19 +2327,38 @@ bool applyMeasureParam(gspice::MeasureSpec& measure, const std::string& keyIn, c
         measure.has_to = true;
         return true;
     }
+    if (key == "VAL" || key == "VALUE") {
+        measure.when_value = gspice::Utils::parseValue(value);
+        measure.has_when_value = true;
+        return true;
+    }
+    if (key == "RISE" || key == "FALL" || key == "CROSS") {
+        measure.crossing = key;
+        if (!value.empty() && toUpperCopy(value) != "LAST") {
+            measure.crossing_count = std::max(1, static_cast<int>(gspice::Utils::parseValue(value)));
+        }
+        return true;
+    }
     return false;
 }
 
-void parseMeasureParams(gspice::MeasureSpec& measure, const std::vector<std::string>& tokens, size_t startIdx) {
-    for (size_t i = startIdx; i < tokens.size(); ++i) {
+void parseMeasureParams(
+    gspice::MeasureSpec& measure,
+    const std::vector<std::string>& tokens,
+    size_t startIdx,
+    size_t endIdx) {
+    endIdx = std::min(endIdx, tokens.size());
+    for (size_t i = startIdx; i < endIdx; ++i) {
         auto [key, value] = splitParameterToken(tokens[i]);
         if (!key.empty()) {
             applyMeasureParam(measure, key, value);
             continue;
         }
         std::string upper = toUpperCopy(tokens[i]);
-        if ((upper == "AT" || upper == "FROM" || upper == "TO") && i + 1 < tokens.size()) {
-            if (tokens[i + 1] == "=" && i + 2 < tokens.size()) {
+        if ((upper == "AT" || upper == "FROM" || upper == "TO" || upper == "VAL" ||
+             upper == "VALUE" || upper == "RISE" || upper == "FALL" || upper == "CROSS") &&
+            i + 1 < endIdx) {
+            if (tokens[i + 1] == "=" && i + 2 < endIdx) {
                 applyMeasureParam(measure, upper, tokens[i + 2]);
                 i += 2;
             } else {
@@ -2269,6 +2367,10 @@ void parseMeasureParams(gspice::MeasureSpec& measure, const std::vector<std::str
             }
         }
     }
+}
+
+void parseMeasureParams(gspice::MeasureSpec& measure, const std::vector<std::string>& tokens, size_t startIdx) {
+    parseMeasureParams(measure, tokens, startIdx, tokens.size());
 }
 
 std::string stripBehavioralExpressionDelimiters(std::string text) {
@@ -2649,6 +2751,32 @@ Netlist Parser::parse(const std::string& filePath) {
                     if (opt == "UIC") settings.use_uic = true;
                 }
                 netlist.setSettings(settings);
+            } else if (cmd == ".TRANNOISE" || cmd == ".TRNOISE") {
+                if (tokens.size() < 3) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .TRANNOISE line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "TRAN";
+                settings.transient_noise = true;
+                settings.t_step = Utils::parseValue(tokens[1]);
+                settings.t_stop = Utils::parseValue(tokens[2]);
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    key = toUpperCopy(key);
+                    const size_t rawEq = tokens[i].find('=');
+                    if (key == "SEED" && !value.empty()) {
+                        settings.transient_noise_seed = static_cast<unsigned int>(std::stoul(value));
+                    } else if (key == "SCALE" && !value.empty()) {
+                        settings.transient_noise_scale = Utils::parseValue(value);
+                    } else if (key == "FMAX" && !value.empty()) {
+                        settings.transient_noise_fmax = Utils::parseValue(value);
+                    } else if ((key == "NOISEMODE" || key == "MODE") && !value.empty()) {
+                        const std::string rawValue = rawEq == std::string::npos ? value : stripQuotes(tokens[i].substr(rawEq + 1));
+                        settings.transient_noise_mode = toUpperCopy(rawValue);
+                    }
+                }
+                netlist.setSettings(settings);
             } else if (cmd == ".IC" || cmd == ".NODESET") {
                 SimulationSettings settings = netlist.getSettings();
                 for (size_t i = 1; i < tokens.size(); ++i) {
@@ -2674,7 +2802,7 @@ Netlist Parser::parse(const std::string& filePath) {
                 netlist.setSettings(settings);
             } else if (cmd == ".LOAD" || cmd == ".OSDI" || cmd == ".PRE_OSDI") {
                 netlist.addError("Line " + std::to_string(lineNo) +
-                                 ": OSDI/OpenVAF loading is disabled; use .GSDI with GMC-generated native models.");
+                                 ": external compact-model runtime loading is disabled; use .GSDI with GMC-generated native models.");
             } else if (cmd == ".GSDI" || cmd == ".PRE_GSDI") {
                 if (tokens.size() < 2) {
                     netlist.addError("Line " + std::to_string(lineNo) + ": .GSDI requires a .gsdi artifact path.");
@@ -2776,6 +2904,51 @@ Netlist Parser::parse(const std::string& filePath) {
                     settings.f_stop = Utils::parseValue(tokens[4]);
                 }
                 netlist.setSettings(settings);
+            } else if (cmd == ".ACXF" || cmd == ".DCXF" || cmd == ".DCINC") {
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = cmd.substr(1);
+                if (cmd == ".DCINC") {
+                    settings.f_sweep_type = "VALUES";
+                    settings.f_values = {0.0};
+                    settings.points_per_dec = 1;
+                    settings.f_start = 0.0;
+                    settings.f_stop = 0.0;
+                    netlist.setSettings(settings);
+                    continue;
+                }
+                if (tokens.size() >= 2) {
+                    std::string outPos;
+                    std::string outNeg;
+                    if (parseVoltageProbeToken(tokens[1], outPos, outNeg)) {
+                        settings.xf_out_pos = netlist.getOrCreateNode(outPos);
+                        settings.xf_out_neg = netlist.getOrCreateNode(outNeg);
+                    }
+                }
+                size_t sweep = (settings.xf_out_pos >= 0) ? 2 : 1;
+                if (cmd == ".DCXF") {
+                    settings.f_sweep_type = "VALUES";
+                    settings.f_values = {0.0};
+                    settings.points_per_dec = 1;
+                    settings.f_start = 0.0;
+                    settings.f_stop = 0.0;
+                } else if (tokens.size() > sweep) {
+                    settings.f_sweep_type = toUpperCopy(tokens[sweep]);
+                    if (settings.f_sweep_type == "VALUES") {
+                        for (size_t j = sweep + 1; j < tokens.size(); ++j) {
+                            settings.f_values.push_back(Utils::parseValue(tokens[j]));
+                        }
+                        settings.points_per_dec = static_cast<int>(settings.f_values.size());
+                        if (!settings.f_values.empty()) {
+                            settings.f_start = settings.f_values.front();
+                            settings.f_stop = settings.f_values.back();
+                        }
+                    } else if (tokens.size() > sweep + 3) {
+                        settings.points_per_dec = std::stoi(tokens[sweep + 1]);
+                        settings.f_start = Utils::parseValue(tokens[sweep + 2]);
+                        settings.f_stop = Utils::parseValue(tokens[sweep + 3]);
+                    }
+                }
+                netlist.setSettings(settings);
             } else if (cmd == ".PSS" || cmd == ".HB") {
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = cmd.substr(1);
@@ -2795,8 +2968,17 @@ Netlist Parser::parse(const std::string& filePath) {
                         const std::string value = tokens[i].substr(eq + 1);
                         if (key == "TSTAB") settings.pss_tstab = Utils::parseValue(value);
                         else if (key == "TSTAB_PERIODS") settings.pss_tstab_periods = std::max(0, std::stoi(value));
-                        else if (key == "PSS_RESIDUAL_GOAL") settings.pss_residual_goal = Utils::parseValue(value);
+                        else if (key == "PSS_RESIDUAL_GOAL" || key == "RESIDUAL_GOAL" ||
+                                 key == "TOL" || key == "RELTOL") {
+                            settings.pss_residual_goal = Utils::parseValue(value);
+                        }
+                        else if (key == "MAX_PSS_ITER" || key == "PSS_MAX_ITER" ||
+                                 key == "MAXITER" || key == "MAX_ITERS" ||
+                                 key == "HB_MAXITER" || key == "HB_MAX_ITER") {
+                            settings.max_pss_iter = std::max(1, std::stoi(value));
+                        }
                         else if (key == "PSS_CONTINUATION_STEPS") settings.max_pss_iter = std::max(settings.max_pss_iter, std::stoi(value) * 2);
+                        else applyRfAnalysisOption(settings, key, value);
                     } else if (!tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit)) {
                         settings.n_harms = std::stoi(tokens[i]);
                     } else if (settings.f_fund.size() < 4) {
@@ -2822,6 +3004,7 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "SP";
+                settings.f_sweep_type = toUpperCopy(tokens[1]);
                 settings.points_per_dec = std::stoi(tokens[2]);
                 settings.f_start = Utils::parseValue(tokens[3]);
                 settings.f_stop = Utils::parseValue(tokens[4]);
@@ -2918,19 +3101,131 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 std::string outPos;
                 std::string outNeg;
-                if (!parseVoltageProbeToken(tokens[4], outPos, outNeg)) {
-                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage .MEASURE expressions are supported currently: " + line);
-                    continue;
-                }
                 MeasureSpec measure;
                 measure.analysis = toUpperCopy(tokens[1]);
                 measure.name = tokens[2];
                 measure.op = toUpperCopy(tokens[3]);
-                measure.node_pos = netlist.getOrCreateNode(outPos);
-                measure.node_neg = netlist.getOrCreateNode(outNeg);
+                auto parseProbeIntoMeasure = [&](MeasureSpec& spec, const std::string& token) -> bool {
+                    std::string probe = token;
+                    auto [probeKeyLocal, probeValueLocal] = splitParameterToken(probe);
+                    if (!probeKeyLocal.empty()) {
+                        probe = probeKeyLocal;
+                        spec.when_value = Utils::parseValue(probeValueLocal);
+                        spec.has_when_value = true;
+                    }
+                    if (parseVoltageProbeToken(probe, outPos, outNeg)) {
+                        spec.kind = "V";
+                        spec.node_pos = netlist.getOrCreateNode(outPos);
+                        spec.node_neg = netlist.getOrCreateNode(outNeg);
+                        return true;
+                    }
+                    const std::string expr = stripQuotes(trimCopy(probe));
+                    if (toUpperCopy(expr).rfind("I(", 0) != 0 || expr.back() != ')') return false;
+                    spec.kind = "I";
+                    spec.device_name = trimCopy(expr.substr(2, expr.size() - 3));
+                    return true;
+                };
+                if (measure.op == "TRIG" || measure.op == "TRIGGER") {
+                    size_t targetIdx = tokens.size();
+                    for (size_t i = 5; i < tokens.size(); ++i) {
+                        const std::string upper = toUpperCopy(tokens[i]);
+                        if (upper == "TARG" || upper == "TARGET") {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                    if (targetIdx == tokens.size() || targetIdx + 1 >= tokens.size()) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .MEASURE TRIG requires TARG probe: " + line);
+                        continue;
+                    }
+                    if (!parseProbeIntoMeasure(measure, tokens[4])) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": unsupported .MEASURE TRIG expression: " + line);
+                        continue;
+                    }
+                    parseMeasureParams(measure, tokens, 5, targetIdx);
+                    MeasureSpec target;
+                    if (!parseProbeIntoMeasure(target, tokens[targetIdx + 1])) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": unsupported .MEASURE TARG expression: " + line);
+                        continue;
+                    }
+                    parseMeasureParams(target, tokens, targetIdx + 2, tokens.size());
+                    if (!measure.has_when_value || !target.has_when_value) {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": .MEASURE TRIG/TARG requires VAL for both probes: " + line);
+                        continue;
+                    }
+                    measure.op = "DELAY";
+                    measure.has_target = true;
+                    measure.target_kind = target.kind;
+                    measure.target_device_name = target.device_name;
+                    measure.target_node_pos = target.node_pos;
+                    measure.target_node_neg = target.node_neg;
+                    measure.target_has_when_value = target.has_when_value;
+                    measure.target_when_value = target.when_value;
+                    measure.target_crossing = target.crossing;
+                    measure.target_crossing_count = target.crossing_count;
+                    SimulationSettings settings = netlist.getSettings();
+                    settings.measures.push_back(measure);
+                    netlist.setSettings(settings);
+                    continue;
+                }
+                std::string probeToken = tokens[4];
+                auto [probeKey, probeValue] = splitParameterToken(probeToken);
+                if (!probeKey.empty() && measure.op == "WHEN") {
+                    probeToken = probeKey;
+                    measure.when_value = Utils::parseValue(probeValue);
+                    measure.has_when_value = true;
+                }
+                if (parseVoltageProbeToken(probeToken, outPos, outNeg)) {
+                    measure.kind = "V";
+                    measure.node_pos = netlist.getOrCreateNode(outPos);
+                    measure.node_neg = netlist.getOrCreateNode(outNeg);
+                } else {
+                    const std::string expr = stripQuotes(trimCopy(probeToken));
+                    if (toUpperCopy(expr).rfind("I(", 0) != 0 || expr.back() != ')') {
+                        netlist.addError("Line " + std::to_string(lineNo) + ": unsupported .MEASURE expression: " + line);
+                        continue;
+                    }
+                    measure.kind = "I";
+                    measure.device_name = trimCopy(expr.substr(2, expr.size() - 3));
+                }
+                if (measure.op == "WHEN" && !measure.has_when_value && tokens.size() > 6 && tokens[5] == "=") {
+                    measure.when_value = Utils::parseValue(tokens[6]);
+                    measure.has_when_value = true;
+                    parseMeasureParams(measure, tokens, 7);
+                } else {
                 parseMeasureParams(measure, tokens, 5);
+                }
+                if (measure.op == "WHEN" && !measure.has_when_value) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": .MEASURE WHEN requires a target value: " + line);
+                    continue;
+                }
                 SimulationSettings settings = netlist.getSettings();
                 settings.measures.push_back(measure);
+                netlist.setSettings(settings);
+            } else if (cmd == ".FOUR") {
+                if (tokens.size() < 3) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .FOUR line ignored: " + line);
+                    continue;
+                }
+                std::string outPos;
+                std::string outNeg;
+                if (!parseVoltageProbeToken(tokens[2], outPos, outNeg)) {
+                    netlist.addError("Line " + std::to_string(lineNo) + ": only voltage-output .FOUR is supported currently: " + line);
+                    continue;
+                }
+                FourSpec four;
+                four.frequency = Utils::parseValue(tokens[1]);
+                four.node_pos = netlist.getOrCreateNode(outPos);
+                four.node_neg = netlist.getOrCreateNode(outNeg);
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    auto [key, value] = splitParameterToken(tokens[i]);
+                    if (toUpperCopy(key) == "NHARMS" || toUpperCopy(key) == "HARMONICS") {
+                        four.harmonics = std::max(1, std::stoi(value));
+                    }
+                }
+                SimulationSettings settings = netlist.getSettings();
+                if (settings.type == "OP") settings.type = "TRAN";
+                settings.fours.push_back(four);
                 netlist.setSettings(settings);
             } else if (cmd == ".STB") {
                 if (tokens.size() < 5) {
@@ -2943,16 +3238,63 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.f_start = Utils::parseValue(tokens[3]);
                 settings.f_stop = Utils::parseValue(tokens[4]);
                 netlist.setSettings(settings);
-            } else if (cmd == ".PAC") {
+            } else if (cmd == ".PAC" || cmd == ".PXF" || cmd == ".PSSXF") {
                 if (tokens.size() < 5) {
-                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PAC line ignored: " + line);
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid " + cmd + " line ignored: " + line);
                     continue;
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "PAC";
-                settings.points_per_dec = std::stoi(tokens[2]);
-                settings.f_start = Utils::parseValue(tokens[3]);
-                settings.f_stop = Utils::parseValue(tokens[4]);
+                if (cmd == ".PSSXF") settings.pss_requested = true;
+                size_t i = 1;
+                std::string outPos;
+                std::string outNeg;
+                if (i < tokens.size() && parseVoltageProbeToken(tokens[i], outPos, outNeg)) {
+                    settings.out_node = netlist.getOrCreateNode(outPos);
+                    ++i;
+                }
+                if (i < tokens.size() && !isRfSweepKeyword(tokens[i]) && tokens[i].find('=') == std::string::npos) {
+                    settings.f_fund.clear();
+                    settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                    settings.pss_requested = true;
+                    ++i;
+                }
+                if (i < tokens.size() && isRfSweepKeyword(tokens[i])) {
+                    settings.f_sweep_type = toUpperCopy(tokens[i++]);
+                }
+                if (settings.f_sweep_type == "VALUES") {
+                    settings.f_values.clear();
+                    while (i < tokens.size() && tokens[i].find('=') == std::string::npos) {
+                        settings.f_values.push_back(Utils::parseValue(tokens[i++]));
+                    }
+                    settings.points_per_dec = static_cast<int>(settings.f_values.size());
+                    if (!settings.f_values.empty()) {
+                        settings.f_start = settings.f_values.front();
+                        settings.f_stop = settings.f_values.back();
+                    }
+                } else if (i + 2 < tokens.size()) {
+                    settings.points_per_dec = std::stoi(tokens[i]);
+                    settings.f_start = Utils::parseValue(tokens[i + 1]);
+                    settings.f_stop = Utils::parseValue(tokens[i + 2]);
+                    i += 3;
+                }
+                parseRfAssignmentOptions(settings, tokens, i);
+                netlist.setSettings(settings);
+            } else if (cmd == ".PSSPAC") {
+                if (tokens.size() < 5) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PSSPAC line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.pss_requested = true;
+                settings.type = "PAC";
+                settings.f_fund.clear();
+                settings.f_fund.push_back(Utils::parseValue(tokens[1]));
+                settings.f_sweep_type = toUpperCopy(tokens[2]);
+                settings.points_per_dec = std::stoi(tokens[3]);
+                settings.f_start = Utils::parseValue(tokens[4]);
+                settings.f_stop = tokens.size() > 5 ? Utils::parseValue(tokens[5]) : settings.f_start;
+                parseRfAssignmentOptions(settings, tokens, 6);
                 netlist.setSettings(settings);
             } else if (cmd == ".PNOISE") {
                 if (tokens.size() < 2) {
@@ -2961,50 +3303,108 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "PNOISE";
-                std::string outNode = tokens[1].substr(2, tokens[1].size()-3);
-                settings.out_node = netlist.getOrCreateNode(outNode);
-                if (tokens.size() < 6) {
+                size_t i = 1;
+                std::string outPos;
+                std::string outNeg;
+                if (parseVoltageProbeToken(tokens[i], outPos, outNeg)) {
+                    settings.out_node = netlist.getOrCreateNode(outPos);
+                    ++i;
+                } else {
+                    settings.out_node = netlist.getOrCreateNode(tokens[i++]);
+                }
+                if (i < tokens.size() && !isRfSweepKeyword(tokens[i]) && tokens[i].find('=') == std::string::npos) {
+                    settings.pnoise_input_source = tokens[i++];
+                }
+                if (i >= tokens.size() || tokens[i].find('=') != std::string::npos) {
                     settings.f_sweep_type = "DEC";
                     settings.points_per_dec = 50;
                     settings.f_start = 1.0;
                     settings.f_stop = 100000.0;
+                    parseRfAssignmentOptions(settings, tokens, i);
+                    if (!settings.f_fund.empty()) settings.pss_requested = true;
                     netlist.setSettings(settings);
                     continue;
                 }
-                size_t sweepIdx = 3;
-                std::string sweepType = toUpperCopy(tokens[sweepIdx]);
+                std::string sweepType = toUpperCopy(tokens[i++]);
                 settings.f_sweep_type = sweepType;
                 if (sweepType == "DEC" || sweepType == "OCT" || sweepType == "LIN") {
-                    if (tokens.size() < 7) {
+                    if (i + 2 >= tokens.size()) {
                         netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE sweep line ignored: " + line);
                         continue;
                     }
-                    settings.points_per_dec = std::stoi(tokens[4]);
-                    settings.f_start = Utils::parseValue(tokens[5]);
-                    settings.f_stop = Utils::parseValue(tokens[6]);
-                } else {
-                    settings.points_per_dec = std::stoi(tokens[3]);
-                    settings.f_start = Utils::parseValue(tokens[4]);
-                    settings.f_stop = Utils::parseValue(tokens[5]);
-                }
-                netlist.setSettings(settings);
-            } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" ||
-                       cmd == ".PSSSP" || cmd == ".PSSSTB" || cmd == ".PSTB") {
-                SimulationSettings settings = netlist.getSettings();
-                settings.type = (cmd == ".PSTB") ? "PSSSTB" : cmd.substr(1);
-                
-                size_t i = 1;
-                while (i < tokens.size()) {
-                    bool is_int = !tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit);
-                    if (is_int) {
-                        settings.points_per_dec = std::stoi(tokens[i]);
-                        if (i + 1 < tokens.size()) settings.f_start = Utils::parseValue(tokens[i+1]);
-                        if (i + 2 < tokens.size()) settings.f_stop = Utils::parseValue(tokens[i+2]);
-                        break;
-                    } else {
-                        settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                    settings.points_per_dec = std::stoi(tokens[i]);
+                    settings.f_start = Utils::parseValue(tokens[i + 1]);
+                    settings.f_stop = Utils::parseValue(tokens[i + 2]);
+                    i += 3;
+                } else if (sweepType == "VALUES") {
+                    settings.f_values.clear();
+                    while (i < tokens.size() && tokens[i].find('=') == std::string::npos) {
+                        settings.f_values.push_back(Utils::parseValue(tokens[i++]));
                     }
-                    i++;
+                    settings.points_per_dec = static_cast<int>(settings.f_values.size());
+                    if (!settings.f_values.empty()) {
+                        settings.f_start = settings.f_values.front();
+                        settings.f_stop = settings.f_values.back();
+                    }
+                }
+                parseRfAssignmentOptions(settings, tokens, i);
+                if (!settings.f_fund.empty()) settings.pss_requested = true;
+                netlist.setSettings(settings);
+            } else if (cmd == ".HBAC" || cmd == ".HBXF" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" ||
+                       cmd == ".PSSSP" || cmd == ".PSSP" || cmd == ".PSP" || cmd == ".PSSSTB" || cmd == ".PSTB") {
+                SimulationSettings settings = netlist.getSettings();
+                if (cmd == ".HBXF") settings.type = "HBAC";
+                else if (cmd == ".PSTB") settings.type = "PSSSTB";
+                else if (cmd == ".PSSP" || cmd == ".PSP") settings.type = "PSSSP";
+                else settings.type = cmd.substr(1);
+
+                settings.pss_requested = true;
+                size_t i = 1;
+                std::string outPos;
+                std::string outNeg;
+                if (i < tokens.size() && parseVoltageProbeToken(tokens[i], outPos, outNeg)) {
+                    settings.out_node = netlist.getOrCreateNode(outPos);
+                    ++i;
+                }
+                if (i < tokens.size()) {
+                    if (!isRfSweepKeyword(tokens[i]) && tokens[i].find('=') == std::string::npos) {
+                        settings.f_fund.clear();
+                        while (i < tokens.size() && !isRfSweepKeyword(tokens[i]) &&
+                               tokens[i].find('=') == std::string::npos) {
+                            if (settings.f_fund.size() < 4) {
+                                settings.f_fund.push_back(Utils::parseValue(tokens[i]));
+                            } else {
+                                std::cerr << "Warning: GSPICE supports max 4 tones. Ignoring extra: "
+                                          << tokens[i] << std::endl;
+                            }
+                            ++i;
+                        }
+                    }
+                }
+                if (i < tokens.size()) {
+                    settings.f_sweep_type = toUpperCopy(tokens[i]);
+                    ++i;
+                }
+                if (settings.f_sweep_type == "VALUES") {
+                    settings.f_values.clear();
+                    for (; i < tokens.size(); ++i) {
+                        if (tokens[i].find('=') != std::string::npos) break;
+                        settings.f_values.push_back(Utils::parseValue(tokens[i]));
+                    }
+                    settings.points_per_dec = static_cast<int>(settings.f_values.size());
+                    if (!settings.f_values.empty()) {
+                        settings.f_start = settings.f_values.front();
+                        settings.f_stop = settings.f_values.back();
+                    }
+                } else if (i + 2 < tokens.size()) {
+                    settings.points_per_dec = std::stoi(tokens[i]);
+                    settings.f_start = Utils::parseValue(tokens[i + 1]);
+                    settings.f_stop = Utils::parseValue(tokens[i + 2]);
+                    i += 3;
+                }
+                parseRfAssignmentOptions(settings, tokens, i);
+                if (settings.f_fund.empty()) {
+                    settings.f_fund.push_back(std::max(settings.f_start, 1.0));
                 }
                 netlist.setSettings(settings);
             } else {
@@ -3093,6 +3493,92 @@ double val = 0.0;
             int n2 = netlist.getOrCreateNode(tokens[2]);
             double val = Utils::parseValue(tokens[3]);
             netlist.addDevice(std::make_unique<Inductor>(tokens[0], n1, n2, val, -1));
+        } else if (firstChar == 'T') {
+            // Transmission line compatibility: Tname A B C D Z0=... TD=...
+            // Implemented as a one-section passive LC approximation.
+            if (tokens.size() < 7) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid transmission line: " + line);
+                continue;
+            }
+            const auto params = parseParameterTokens(tokens, 5);
+            const double z0 = paramValue(params, {"Z0", "ZO", "R", "IMPEDANCE"}, std::numeric_limits<double>::quiet_NaN());
+            const double td = paramValue(params, {"TD", "DELAY", "TDELAY"}, std::numeric_limits<double>::quiet_NaN());
+            if (!std::isfinite(z0) || z0 <= 0.0 || !std::isfinite(td) || td < 0.0) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": transmission line requires positive Z0 and non-negative TD: " + line);
+                continue;
+            }
+            const int a = netlist.getOrCreateNode(tokens[1]);
+            const int b = netlist.getOrCreateNode(tokens[2]);
+            const int c = netlist.getOrCreateNode(tokens[3]);
+            const int d = netlist.getOrCreateNode(tokens[4]);
+            const std::string base = sanitizeIdentifier(tokens[0]);
+            const double ctotal = td > 0.0 ? td / z0 : 1e-18;
+            const double ltotal = td > 0.0 ? z0 * td : 1e-18;
+            netlist.addDevice(std::make_unique<Capacitor>("C_" + base + "_IN", a, b, 0.5 * ctotal));
+            netlist.addDevice(std::make_unique<Capacitor>("C_" + base + "_OUT", c, d, 0.5 * ctotal));
+            if (b == d) {
+                netlist.addDevice(std::make_unique<Inductor>("L_" + base + "_SER", a, c, ltotal, -1));
+            } else {
+                netlist.addDevice(std::make_unique<Inductor>("L_" + base + "_TOP", a, c, 0.5 * ltotal, -1));
+                netlist.addDevice(std::make_unique<Inductor>("L_" + base + "_RET", d, b, 0.5 * ltotal, -1));
+            }
+            if (verboseCompatWarnings()) {
+                netlist.addWarning(
+                    "Line " + std::to_string(lineNo) +
+                    ": transmission line '" + tokens[0] +
+                    "' routed as a one-section LC approximation from Z0/TD.");
+            }
+        } else if (firstChar == 'K') {
+            // Mutual coupling: Kname Lprimary Lsecondary coefficient
+            if (tokens.size() < 4) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid mutual inductor line: " + line);
+                continue;
+            }
+            double coupling = 0.0;
+            if (!parsePrimitiveValue(tokens, 3, {"K", "COUPLING", "VALUE"}, coupling)) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid mutual inductor coupling: " + line);
+                continue;
+            }
+            netlist.addDevice(std::make_unique<MutualInductor>(tokens[0], tokens[1], tokens[2], coupling));
+        } else if (firstChar == 'J') {
+            // JFET/MESFET primitive: Jname D G S Model [AREA=...]
+            if (tokens.size() < 5) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": invalid JFET line: " + line);
+                continue;
+            }
+            const ModelCard* modelCard = netlist.findModelCard(tokens[4]);
+            if (!modelCard) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": JFET model card not found: " + line);
+                continue;
+            }
+            const std::string modelType = toUpperCopy(modelCard->type);
+            const bool pChannel = modelType == "PJF" || modelType == "PJFET" || modelType == "PJP" || modelType == "PMES";
+            if (!pChannel && !(modelType == "NJF" || modelType == "NJFET" || modelType == "NJP" ||
+                               modelType == "MES" || modelType == "MESFET" || modelType == "NMES")) {
+                netlist.addError("Line " + std::to_string(lineNo) + ": unsupported JFET model type '" + modelCard->type + "': " + line);
+                continue;
+            }
+            const auto instanceParams = parseParameterTokens(tokens, 5);
+            const double area = std::max(paramValue(instanceParams, {"AREA", "M"}, 1.0), 0.0);
+            const int type = pChannel ? -1 : 1;
+            const double beta = paramValue(modelCard->params, {"BETA", "BET", "KP"}, 1e-4) * area;
+            double vto = paramValue(modelCard->params, {"VTO", "VT0", "VP"}, pChannel ? 2.0 : -2.0);
+            if (pChannel && vto < 0.0) vto = -vto;
+            if (!pChannel && vto > 0.0) vto = -vto;
+            const double lambda = paramValue(modelCard->params, {"LAMBDA", "L"}, 0.0);
+            const double is = paramValue(modelCard->params, {"IS", "ISS"}, 1e-14) * area;
+            const double n = paramValue(modelCard->params, {"N"}, 1.0);
+            netlist.addDevice(std::make_unique<Jfet>(
+                tokens[0],
+                netlist.getOrCreateNode(tokens[1]),
+                netlist.getOrCreateNode(tokens[2]),
+                netlist.getOrCreateNode(tokens[3]),
+                type,
+                beta,
+                vto,
+                lambda,
+                is,
+                n));
         } else if (firstChar == 'B') {
             // Behavioral source: Bname N+ N- I={expr} or V={expr}.
             if (tokens.size() < 4) {
@@ -3512,13 +3998,14 @@ double val = 0.0;
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
+            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -3527,6 +4014,7 @@ double val = 0.0;
 
             auto vsrc = std::make_unique<VoltageSource>(tokens[0], n1, n2, dcValue, -1);
             vsrc->setAcMagnitude(acMagnitude);
+            vsrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) vsrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) vsrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) vsrc->setPwl(pwlT, pwlV);
@@ -3542,13 +4030,14 @@ double val = 0.0;
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
+            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -3556,6 +4045,7 @@ double val = 0.0;
             }
             auto isrc = std::make_unique<CurrentSource>(tokens[0], n1, n2, dcValue);
             isrc->setAcMagnitude(acMagnitude);
+            isrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) isrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) isrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) isrc->setPwl(pwlT, pwlV);
@@ -3586,6 +4076,14 @@ double val = 0.0;
             double cje = 0.0;
             double cjc = 0.0;
             double tf = 0.0;
+            double ikf = 0.0;
+            double ikr = 0.0;
+            double vaf = 0.0;
+            double var = 0.0;
+            double ise = 0.0;
+            double isc = 0.0;
+            double ne = 1.5;
+            double nc = 2.0;
             if (modelCard) {
                 const std::string modelType = toUpperCopy(modelCard->type);
                 if (modelType == "PNP") type = -1;
@@ -3604,6 +4102,14 @@ double val = 0.0;
                 cje = paramValue(modelCard->params, {"CJE", "CBE"}, cje);
                 cjc = paramValue(modelCard->params, {"CJC", "CBC"}, cjc);
                 tf = paramValue(modelCard->params, {"TF"}, tf);
+                ikf = paramValue(modelCard->params, {"IKF", "IK"}, ikf);
+                ikr = paramValue(modelCard->params, {"IKR"}, ikr);
+                vaf = paramValue(modelCard->params, {"VAF", "VA", "BF_EARLY"}, vaf);
+                var = paramValue(modelCard->params, {"VAR", "VB", "BR_EARLY"}, var);
+                ise = paramValue(modelCard->params, {"ISE"}, ise);
+                isc = paramValue(modelCard->params, {"ISC"}, isc);
+                ne = paramValue(modelCard->params, {"NE"}, ne);
+                nc = paramValue(modelCard->params, {"NC"}, nc);
             } else {
                 netlist.addWarning(
                     "Line " + std::to_string(lineNo) +
@@ -3617,7 +4123,8 @@ double val = 0.0;
             auto instanceParams = parseParameterTokens(tokens, modelIdx + 1);
             area = paramValue(instanceParams, {"AREA", "M"}, area);
             netlist.addDevice(std::make_unique<Bjt>(
-                tokens[0], nC, nB, nE, type, is, bf, br, nf, nr, area, cje, cjc, tf));
+                tokens[0], nC, nB, nE, type, is, bf, br, nf, nr, area, cje, cjc, tf,
+                ikf, ikr, vaf, var, ise, isc, ne, nc));
         } else if (firstChar == 'D') {
             // Diode: Dname N1 N2 [model] [area]
             if (tokens.size() < 3) {
@@ -3657,12 +4164,20 @@ double val = 0.0;
             double is = 1e-14;
             double n = 1.0;
             double cjo = 0.0;
+            double rs = 0.0;
+            double bv = 0.0;
+            double ibv = 1e-10;
+            double nbv = 1.0;
             double area = 1.0;
             if (tokens.size() >= 4) {
                 if (modelCard && modelTypeMatches(modelCard, {"D", "DIODE"})) {
                     is = paramValue(modelCard->params, {"IS", "JS"}, is);
                     n = paramValue(modelCard->params, {"N", "NF"}, n);
                     cjo = paramValue(modelCard->params, {"CJO", "CJ0", "CJ"}, cjo);
+                    rs = paramValue(modelCard->params, {"RS"}, rs);
+                    bv = paramValue(modelCard->params, {"BV", "VJBR"}, bv);
+                    ibv = paramValue(modelCard->params, {"IBV", "IJBR"}, ibv);
+                    nbv = paramValue(modelCard->params, {"NBV", "NBR"}, nbv);
                 } else if (modelCard) {
                     netlist.addWarning(
                         "Line " + std::to_string(lineNo) +
@@ -3677,7 +4192,8 @@ double val = 0.0;
                 area = paramValue(instanceParams, {"AREA", "M"}, area);
             }
             area = std::max(area, 1e-30);
-            netlist.addDevice(std::make_unique<Diode>(tokens[0], n1, n2, is * area, n, cjo * area));
+            netlist.addDevice(std::make_unique<Diode>(
+                tokens[0], n1, n2, is * area, n, cjo * area, rs / area, bv, ibv * area, nbv));
         } else {
             netlist.addError("Line " + std::to_string(lineNo) + ": unsupported element; refusing to ignore active device: " + line);
         }

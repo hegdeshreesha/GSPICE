@@ -77,6 +77,14 @@ public:
         sources.push_back({name_ + ".thermal", nodePos_, nodeNeg_, 4.0 * k * T * G});
     }
 
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)time;
+        const double v = (nodePos_ >= 0 ? x[nodePos_] : 0.0) -
+                         (nodeNeg_ >= 0 ? x[nodeNeg_] : 0.0);
+        current = getConductance() * v;
+        return true;
+    }
+
     void hbStamp(SparseMatrixReal& J, VectorReal& b, double f_fund, int n_harms, const VectorReal& x_hb) override {
         double G = getConductance();
         int K = 2 * n_harms + 1;

@@ -60,7 +60,7 @@ int main() {
     const auto model = refNmosModel();
     Psp103Mosfet mos("M1", 0, 1, 2, 3, model, {{"W", 1e-6}, {"L", 0.1e-6}}, 21.0);
 
-    // VACASK .OP reference (op1.raw), bias Vd=0.1, Vg=0.75, Vs=Vb=0, T=21 C.
+    // EXTERNAL_ORACLE .OP reference (op1.raw), bias Vd=0.1, Vg=0.75, Vs=Vb=0, T=21 C.
     // sigVds>0, so the loadDynamic OP block that keeps Qd/Qs as-is applies
     // (PSP103_module.include lines 2965-2982). Derived caps use these combos:
     //   cdg=-dQd/dVg cdb=-dQd/dVb cds=cdd-cdg-cdb

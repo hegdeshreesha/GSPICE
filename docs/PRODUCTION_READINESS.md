@@ -25,7 +25,7 @@ The gate requires:
 
 - `SuiteSparse-KLU` capability.
 - `psp103_native`, `ihp_psp_rf_full`, `ihp_passive_wrapper_full`.
-- `bsim3_gsdi`, `bsim4_gsdi`.
+- `bsim3_gsdi`, `bsim4_gsdi`, and `bsim4_full_reference`.
 - `juncap2_tat`, `juncap2_avalanche`.
 - Broad native GSDI/GMC regression pass.
 - Optional Lumen deck completion with zero warnings and RAW output.
@@ -53,21 +53,21 @@ present, if the PSP103 ignored-parameter ranking contains critical/high
 occurrences, or if the deck uses accepted PSP103 parameters that the native
 evaluator still handles approximately.
 
-## VACASK Comparison Bridge
+## EXTERNAL_ORACLE Comparison Bridge
 
-VACASK is an optional external oracle. To check whether a Lumen/GSPICE deck can
-be converted into VACASK syntax without touching the factory PDK, run:
+EXTERNAL_ORACLE is an optional external oracle. To check whether a Lumen/GSPICE deck can
+be converted into EXTERNAL_ORACLE syntax without touching the factory PDK, run:
 
 ```powershell
-python C:\EDA\GSPICE\tools\vacask_lumen_bridge.py `
+python C:\EDA\GSPICE\tools\external_oracle_lumen_bridge.py `
   --deck C:\Users\hegde\Downloads\scratch\simenv_Dummy1_single\20260808_113041\input.sp `
-  --workdir C:\EDA\GSPICE\build-klu\vacask_bridge
+  --workdir C:\EDA\GSPICE\build-klu\external_oracle_bridge
 ```
 
-Add `--run-vacask` after conversion succeeds. A rejected conversion exits with
-the standard skip code `77` unless `--require-vacask` is set, and writes a JSON
-report with the converter stdout/stderr tails. This keeps VACASK validation
-actionable without making normal GSPICE runs depend on VACASK.
+Add `--run-external_oracle` after conversion succeeds. A rejected conversion exits with
+the standard skip code `77` unless `--require-external_oracle` is set, and writes a JSON
+report with the converter stdout/stderr tails. This keeps EXTERNAL_ORACLE validation
+actionable without making normal GSPICE runs depend on EXTERNAL_ORACLE.
 
 ## Lumen Production Defaults
 
@@ -82,11 +82,15 @@ actionable without making normal GSPICE runs depend on VACASK.
 
 ## Remaining Signoff Gap
 
-The remaining gaps are independent full-reference BSIM parity, full official
-PSP parameter-surface parity, and arbitrary OSDI runtime model loading. The
-current native PSP/BSIM GSDI paths are tested and normal-mode warning-clean, but
-verbose diagnostics and the PSP scanner can still expose official model-card
-parameters that the native evaluator either does not consume or only
-approximates. Treat very large speedups over OSDI/OpenVAF as valid only after
-the verbose scan, the accepted-approximation scan, and an external reference
-sweep all pass for the target design.
+The remaining gaps are BSIM3 weak-inversion/full-region reference parity, full official PSP
+parameter-surface parity, RF oracle sweeps for PSS/PAC/PNOISE/HB follow-on
+analyses, and arbitrary OSDI runtime model loading. BSIM4 now has a default
+clean-room BSIM4.8.3 DC parity gate; BSIM3 now has a default ngspice
+strong-inversion DC parity gate. The current
+native PSP/BSIM GSDI paths are tested and normal-mode warning-clean, and RF
+engines have smoke/signoff regressions, but verbose diagnostics and the PSP
+scanner can still expose official model-card parameters that the native
+evaluator either does not consume or only approximates. Treat very large
+speedups over OSDI/OpenVAF as valid only after the verbose scan, the
+accepted-approximation scan, and an external reference sweep all pass for the
+target design.

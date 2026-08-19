@@ -47,13 +47,14 @@ public:
         const auto voltage = [&](int node) { return node >= 0 ? x[node] : 0.0; };
         const std::array<double, 4> v = {voltage(nodeD_), voltage(nodeG_), voltage(nodeS_), voltage(nodeB_)};
         if (request.staticResidual || request.staticJacobian) {
-            const auto currents = bsim3DcEvaluateDual(model_, v, type_);
+            const auto dc = bsim3EvaluateDc(model_, v, type_);
+            if (!dc.valid) return false;
             if (request.staticResidual)
-                for (int row = 0; row < 4; ++row) evaluation.staticResidual.push_back({nodes[row], currents[row].value});
+                for (int row = 0; row < 4; ++row) evaluation.staticResidual.push_back({nodes[row], dc.current[row]});
             if (request.staticJacobian)
                 for (int row = 0; row < 4; ++row)
                     for (int column = 0; column < 4; ++column)
-                        evaluation.staticJacobian.push_back({nodes[row], nodes[column], currents[row].derivative[column]});
+                        evaluation.staticJacobian.push_back({nodes[row], nodes[column], dc.jacobian[row][column]});
         }
         if (request.dynamicResidual || request.dynamicJacobian) {
             const auto charges = terminalChargesDual(v);

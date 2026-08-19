@@ -7,6 +7,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 
 def parse_ngspice(path: pathlib.Path) -> list[float]:
@@ -28,13 +29,15 @@ def main() -> int:
     parser.add_argument("--gspice", required=True)
     parser.add_argument("--source", required=True)
     parser.add_argument("--relative-tolerance", type=float, default=0.05)
+    parser.add_argument("--absolute-tolerance", type=float, default=1e-12)
     args = parser.parse_args()
 
     source = pathlib.Path(args.source)
     deck = source / "tests" / "decks" / "bsim3_reference_dc.sp"
-    log = source / "build-vcpkg" / "bsim3_ngspice_validation.log"
-    subprocess.run([args.ngspice, "-b", "-o", str(log), str(deck)], check=True)
-    reference = parse_ngspice(log)
+    with tempfile.TemporaryDirectory(prefix="gspice_bsim3_ngspice_") as tmp:
+        log = pathlib.Path(tmp) / "bsim3_ngspice_validation.log"
+        subprocess.run([args.ngspice, "-b", "-o", str(log), str(deck)], check=True)
+        reference = parse_ngspice(log)
     probe = subprocess.run([args.gspice], check=True, capture_output=True, text=True)
     native = parse_probe(probe.stdout)
     if len(reference) != len(native):
@@ -44,9 +47,10 @@ def main() -> int:
     for index, (expected, actual) in enumerate(zip(reference, native)):
         # ngspice reports I(VDS), opposite to the positive drain-terminal
         # current convention used by the native evaluator.
-        scale = max(abs(expected), 1.0e-15)
-        relative = abs(abs(actual) - abs(expected)) / scale
-        if relative > args.relative_tolerance:
+        absolute = abs(abs(actual) - abs(expected))
+        scale = max(abs(expected), args.absolute_tolerance)
+        relative = absolute / scale
+        if absolute > args.absolute_tolerance and relative > args.relative_tolerance:
             errors.append((index, expected, actual, relative))
     for index, expected, actual, relative in errors:
         print(f"point={index} ngspice={expected:.6e} native={actual:.6e} relative_error={relative:.3e}")

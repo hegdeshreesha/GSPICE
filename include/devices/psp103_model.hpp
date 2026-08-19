@@ -352,6 +352,15 @@ public:
         }
     }
 
+    bool probeCurrent(const VectorReal& x, double& current, double time = 0.0) const override {
+        (void)time;
+        if (!prepared_.valid()) return false;
+        const auto currents = terminalCurrents(x);
+        if (!finiteDualVector(currents)) return false;
+        current = currents[0].value;
+        return true;
+    }
+
 private:
     struct Psp103NoiseComponents {
         double channel_psd = 0.0;

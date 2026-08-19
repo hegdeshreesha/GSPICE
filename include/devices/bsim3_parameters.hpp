@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -81,7 +82,8 @@ public:
         out.nominal_temperature_k = get({"TNOM"}, 27.0) + 273.15;
         out.level = get({"LEVEL"}, 49.0);
         out.vth0 = get({"VTH0", "VT0", "VTO"}, 0.4);
-        out.kp = get({"KP", "BETA"}, 120.0e-6);
+        const bool hasExplicitBeta = values_.count("KP") > 0 || values_.count("BETA") > 0;
+        out.kp = get({"KP", "BETA"}, std::numeric_limits<double>::quiet_NaN());
         out.u0 = get({"U0", "MOBMOD"}, 0.05);
         // BSIM cards conventionally use cm^2/(V*s); the native evaluator uses SI.
         if (out.u0 > 1.0) out.u0 *= 1.0e-4;
@@ -121,6 +123,9 @@ public:
         out.cdep0 = std::sqrt(1.602176634e-19 * 1.03594e-10 *
                               1.7e17 * 1.0e6 /
                               (2.0 * std::max(out.phi, 1.0e-6)));
+        if (!hasExplicitBeta || !std::isfinite(out.kp)) {
+            out.kp = out.u0 * out.cox;
+        }
         out.beta = out.kp * out.weff / std::max(out.leff, 1.0e-15);
         out.is = get({"IS"}, 0.0);
         out.js = get({"JS"}, 0.0);
