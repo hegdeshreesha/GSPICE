@@ -110,7 +110,10 @@ public:
         J.add(nodeNeg_, branchIndex_, {-1.0, 0.0});
         J.add(branchIndex_, nodePos_, {1.0, 0.0});
         J.add(branchIndex_, nodeNeg_, {-1.0, 0.0});
-        b.add(branchIndex_, {acMagnitude_, 0.0});
+        const double phase = acPhaseDeg_ * PI_ / 180.0;
+        b.add(branchIndex_, {
+            acMagnitude_ * std::cos(phase),
+            acMagnitude_ * std::sin(phase)});
     }
 
     void pacStamp(SparseMatrixReal& J, VectorReal& b, double f_in, double f_fund, int n_harms, const VectorReal& x_periodic) override {
