@@ -1,0 +1,101 @@
+{
+  "cases": {
+    "hb_linear_rc": {
+      "hb_linear_rc_ratio": null
+    },
+    "hb_diode": {
+      "hb_diode_second_harmonic": {
+        "reference": 0.001942092854,
+        "abs_tol": 0.00016
+      }
+    },
+    "hb_multitone": {
+      "hb_multitone_1khz_vout": {
+        "reference": 0.5,
+        "abs_tol": 0.001
+      },
+      "hb_multitone_1p5khz_vout": {
+        "reference": 0.5,
+        "abs_tol": 0.001
+      }
+    },
+    "hbac_diode": {
+      "hbac_diode_vout": {
+        "reference": 0.86,
+        "abs_tol": 0.02
+      }
+    },
+    "hbnoise_diode": {
+      "hbnoise_diode_psd": {
+        "reference": 1.4e-18,
+        "abs_tol": 4e-19
+      }
+    },
+    "pnoise_phase_jitter": {
+      "pnoise_phase_1khz_dbc_per_hz": {
+        "reference": -164.5,
+        "abs_tol": 1.5
+      },
+      "pnoise_jitter_1khz_s_per_rtHz": {
+        "reference": 9.5e-13,
+        "abs_tol": 1.5e-13
+      }
+    },
+    "hbsp": {
+      "hbsp_s11_real": {
+        "reference": 0.0,
+        "abs_tol": 1e-8
+      },
+      "hbsp_s11_imag": {
+        "reference": 0.0,
+        "abs_tol": 1e-8
+      }
+    },
+    "psssp": {
+      "psssp_s11_real": {
+        "reference": 0.0,
+        "abs_tol": 1e-8
+      },
+      "psssp_s11_imag": {
+        "reference": 0.0,
+        "abs_tol": 1e-8
+      }
+    },
+    "hbstb": {
+      "hbstb_mag": {
+        "reference": 1.0,
+        "abs_tol": 0.001
+      },
+      "hbstb_phase_deg": {
+        "reference": 180.0,
+        "abs_tol": 1.0
+      }
+    },
+    "pssstb": {
+      "pssstb_mag": {
+        "reference": 1.0,
+        "abs_tol": 0.001
+      },
+      "pssstb_phase_deg": {
+        "reference": 180.0,
+        "abs_tol": 1.0
+      }
+    },
+    "psspac_linear": {
+      "psspac_linear_vout_1khz": {
+        "reference": 0.9999802604,
+        "abs_tol": 0.0002
+      }
+    },
+    "hb_psp103": {
+      "hb_psp103_drain_fundamental": {
+        "reference": 0.004715696729,
+        "abs_tol": 0.0002
+      },
+      "hb_psp103_drain_second_harmonic": {
+        "reference": 0.0003076648096,
+        "abs_tol": 0.00003
+      }
+    }
+  }
+}

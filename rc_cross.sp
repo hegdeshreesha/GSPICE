@@ -1,0 +1,8 @@
+* RC step
+.OPTIONS RELTOL=3e-4 ABSTOL=1e-6 VNTOL=1e-6
+V1 in 0 DC 0 PULSE(0 1 1m 1u 1u 10m 20m)
+R1 in out 1k
+C1 out 0 1u
+.TRAN 10u 5m 0 20u
+.PRINT TRAN V(out)
+.END

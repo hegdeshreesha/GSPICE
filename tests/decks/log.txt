@@ -1,0 +1,40 @@
+
+Note: No compatibility mode selected!
+
+
+Circuit: * independent bsim4 reference deck for ngspice comparison.
+
+Warning -- Version not specified on line "level=54 vth0=0.40 u0=500 toxe=10n k1=0 k2=0 dvt0=0 dvt1=0.53 dvt2=-0.032 xj=0.15u ua=2.0e-9 ub=5.0e-19 vsat=1.0e5"
+Setting version to 'default'.
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using SPARSE 1.3 as Direct Linear Solver
+
+No. of Data Rows : 11
+           * independent bsim4 reference deck for ngspice comparison.
+           DC transfer characteristic  Fri Aug  7 13:20:53  2026
+--------------------------------------------------------------------------------
+Index   v-sweep         v(g)            vds#branch      
+--------------------------------------------------------------------------------
+0	0.000000e+00	0.000000e+00	-8.29612e-13	
+1	1.000000e-01	1.000000e-01	-9.12578e-13	
+2	2.000000e-01	2.000000e-01	-8.78871e-12	
+3	3.000000e-01	3.000000e-01	-1.29462e-10	
+4	4.000000e-01	4.000000e-01	-1.94551e-09	
+5	5.000000e-01	5.000000e-01	-2.46613e-08	
+6	6.000000e-01	6.000000e-01	-2.30875e-07	
+7	7.000000e-01	7.000000e-01	-1.25213e-06	
+8	8.000000e-01	8.000000e-01	-3.61349e-06	
+9	9.000000e-01	9.000000e-01	-7.11435e-06	
+10	1.000000e+00	1.000000e+00	-1.15018e-05	
+
+
+Total analysis time (seconds) = 0.790914
+
+Total elapsed time (seconds) = 0.929 
+
+Total DRAM available = 15818.324 MB.
+DRAM currently available = 6091.020 MB.
+Maximum ngspice program size =   17.797 MB.
+Current ngspice program size =   17.797 MB.
+
