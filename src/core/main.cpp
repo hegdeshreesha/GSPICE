@@ -2018,6 +2018,51 @@ bool get_source_dc_value(
     return false;
 }
 
+void apply_initial_voltage_source_constraints(
+    const std::vector<std::unique_ptr<Device>>& devices,
+    VectorReal& x,
+    int num_nodes,
+    double time) {
+    const int n = std::min(num_nodes, x.getSize());
+    if (n <= 0) return;
+
+    std::vector<bool> known(static_cast<std::size_t>(n), false);
+    auto node_known = [&](int node) {
+        return node < 0 || (node < n && known[static_cast<std::size_t>(node)]);
+    };
+    auto node_value = [&](int node) {
+        return node < 0 ? 0.0 : x[node];
+    };
+    auto set_node = [&](int node, double value) {
+        if (node < 0 || node >= n || !std::isfinite(value)) return false;
+        x[node] = value;
+        known[static_cast<std::size_t>(node)] = true;
+        return true;
+    };
+
+    bool changed = true;
+    for (int pass = 0; changed && pass < n + 1; ++pass) {
+        changed = false;
+        for (const auto& dev : devices) {
+            const auto* vsrc = dynamic_cast<const VoltageSource*>(dev.get());
+            if (!vsrc) continue;
+
+            const int pos = vsrc->getNodePos();
+            const int neg = vsrc->getNodeNeg();
+            const double value = vsrc->evaluateAt(time);
+            if (!std::isfinite(value)) continue;
+
+            const bool pos_known = node_known(pos);
+            const bool neg_known = node_known(neg);
+            if (!pos_known && neg_known) {
+                changed = set_node(pos, node_value(neg) + value) || changed;
+            } else if (pos_known && !neg_known) {
+                changed = set_node(neg, node_value(pos) - value) || changed;
+            }
+        }
+    }
+}
+
 struct SourceState {
     Device* device = nullptr;
     double dc_value = 0.0;
@@ -3258,6 +3303,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             }
             step = std::min(step, 1e-12);
         }
+        apply_initial_voltage_source_constraints(devices, x, num_nodes, 0.0);
         step = std::max(step, min_step);
         std::vector<VectorReal> x_hist; x_hist.push_back(x);
         std::vector<double> t_hist; t_hist.push_back(0.0);

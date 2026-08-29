@@ -2139,6 +2139,7 @@ void parseSourceSpec(
     const std::string& sourceSpec,
     double& dcValue,
     double& acMagnitude,
+    double& acPhaseDeg,
     bool& dcSeen,
     gspice::VoltageSource::WaveformType& waveformType,
     gspice::VoltageSource::PulseParams& pulse,
@@ -2148,6 +2149,7 @@ void parseSourceSpec(
 
     dcValue = 0.0;
     acMagnitude = 1.0;
+    acPhaseDeg = 0.0;
     dcSeen = false;
     waveformType = gspice::VoltageSource::WaveformType::DC;
     pulse = gspice::VoltageSource::PulseParams{};
@@ -2176,7 +2178,12 @@ void parseSourceSpec(
         if (pUpper == "AC" && i + 1 < parts.size()) {
             double tmp = 0.0;
             if (tryParseSpiceValue(parts[i + 1], tmp)) acMagnitude = tmp;
-            ++i;
+            if (i + 2 < parts.size() && tryParseSpiceValue(parts[i + 2], tmp)) {
+                acPhaseDeg = tmp;
+                i += 2;
+            } else {
+                ++i;
+            }
             continue;
         }
         if (!dcSeen && i == 0 && pUpper.find('(') == std::string::npos) {
@@ -3512,13 +3519,14 @@ double val = 0.0;
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
+            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -3527,6 +3535,7 @@ double val = 0.0;
 
             auto vsrc = std::make_unique<VoltageSource>(tokens[0], n1, n2, dcValue, -1);
             vsrc->setAcMagnitude(acMagnitude);
+            vsrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) vsrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) vsrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) vsrc->setPwl(pwlT, pwlV);
@@ -3542,13 +3551,14 @@ double val = 0.0;
             const std::string sourceSpec = joinTokens(tokens, 3);
             double dcValue = 0.0;
             double acMagnitude = 1.0;
+            double acPhaseDeg = 0.0;
             bool dcSeen = false;
             VoltageSource::WaveformType wf = VoltageSource::WaveformType::DC;
             VoltageSource::PulseParams pulse;
             VoltageSource::SinParams sin;
             std::vector<double> pwlT;
             std::vector<double> pwlV;
-            parseSourceSpec(sourceSpec, dcValue, acMagnitude, dcSeen, wf, pulse, sin, pwlT, pwlV);
+            parseSourceSpec(sourceSpec, dcValue, acMagnitude, acPhaseDeg, dcSeen, wf, pulse, sin, pwlT, pwlV);
             if (!dcSeen) {
                 if (wf == VoltageSource::WaveformType::PULSE) dcValue = pulse.v1;
                 if (wf == VoltageSource::WaveformType::SIN) dcValue = sin.vo;
@@ -3556,6 +3566,7 @@ double val = 0.0;
             }
             auto isrc = std::make_unique<CurrentSource>(tokens[0], n1, n2, dcValue);
             isrc->setAcMagnitude(acMagnitude);
+            isrc->setAcPhaseDeg(acPhaseDeg);
             if (wf == VoltageSource::WaveformType::PULSE) isrc->setPulse(pulse);
             if (wf == VoltageSource::WaveformType::SIN) isrc->setSin(sin);
             if (wf == VoltageSource::WaveformType::PWL) isrc->setPwl(pwlT, pwlV);
