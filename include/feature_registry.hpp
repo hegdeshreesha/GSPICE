@@ -73,10 +73,10 @@ public:
         json += "\n  },\n";
         json += "  \"analyses\": {\n";
         json += "    \"op\": \"tested\", \"dc\": \"tested\", \"tran\": \"tested\", \"ac\": \"tested\",\n";
-        json += "    \"noise\": \"tested\", \"stb\": \"prototype\", \"pss\": \"prototype\", \"pac\": \"prototype\", \"psspac\": \"prototype\", \"pssstb\": \"prototype\", \"pnoise\": \"prototype\", \"hb\": \"experimental\"\n";
+        json += "    \"noise\": \"tested\", \"sp\": \"tested\", \"stb\": \"prototype\", \"pss\": \"prototype\", \"pac\": \"prototype\", \"psspac\": \"prototype\", \"pssstb\": \"prototype\", \"pnoise\": \"prototype\", \"hb\": \"experimental\"\n";
         json += "  },\n";
         json += "  \"experimental\": [\"stb\", \"pss\", \"pac\", \"psspac\", \"pssstb\", \"pnoise\", \"hb\", \"fastspice\", \"multirate\", \"ticer\", \"binary_raw\", \"c_api\"],\n";
-        json += "  \"outputs\": [\"spice-ascii-raw\", \"csv\"]\n";
+        json += "  \"outputs\": [\"spice-ascii-raw\", \"csv\", \"touchstone\"]\n";
         json += "}\n";
         return json;
     }
@@ -103,6 +103,7 @@ private:
         registerFeature("ihp_psp103_matrix", FeatureMaturity::Tested, true, "IHP LV PSP OP/DC/AC/tran/noise, corner, temperature, geometry, and mismatch smoke coverage");
         registerFeature("ihp_psp_rf_smoke", FeatureMaturity::Tested, true, "IHP LV PSP RF model cards route through native PSP and pass small-signal smoke coverage");
         registerFeature("ihp_psp_rf_full", FeatureMaturity::Tested, true, "IHP LV PSP RF wrappers route natively with NG/M/DTA aliasing and RF gate-resistance stamping");
+        registerFeature("sp", FeatureMaturity::Tested, true, "Linear S-parameter analysis for explicit P ports");
         registerFeature("ihp_passive_wrapper_smoke", FeatureMaturity::Tested, true, "IHP passive wrappers run natively with R3 effective geometry/contact/corner/temperature terms and CMIM area/perimeter/temperature capacitance");
         registerFeature("ihp_mosvar_cv_smoke", FeatureMaturity::Tested, true, "IHP HV svaricap routes through native voltage-dependent MOSVAR charge plus parasitic RC pieces");
         registerFeature("ihp_passive_wrapper_full", FeatureMaturity::Tested, true, "IHP resistor, CMIM, parasitic-cap, tap, and MOSVAR wrappers route natively without user-visible compatibility warnings");

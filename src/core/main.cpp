@@ -24,6 +24,7 @@
 #include <map>
 #include <filesystem>
 #include <atomic>
+#include <utility>
 #include <omp.h>
 #include "parser.hpp"
 #include "feature_registry.hpp"
@@ -145,6 +146,84 @@ void write_operating_point_raw(
         raw << " " << x_dc[i];
     }
     raw << "\n";
+}
+
+void write_real_sweep_raw(
+    const std::string& output_file,
+    const std::string& plot_name,
+    const std::string& axis_name,
+    const std::string& axis_type,
+    const std::vector<std::pair<std::string, std::string>>& signals,
+    const std::vector<double>& axis_values,
+    const std::vector<std::vector<double>>& rows) {
+    if (output_file.empty()) return;
+    std::ofstream raw(output_file, std::ios::out | std::ios::trunc);
+    if (!raw) {
+        throw std::runtime_error("could not open RAW output file: " + output_file);
+    }
+    raw << "Title: GSPICE RAW output\n";
+    raw << "Plotname: " << plot_name << "\n";
+    raw << "Flags: real\n";
+    raw << "No. Variables: " << (signals.size() + 1) << "\n";
+    raw << "No. Points:                " << rows.size() << "\n";
+    raw << "Variables:\n";
+    raw << "0\t" << axis_name << "\t" << axis_type << "\n";
+    for (std::size_t i = 0; i < signals.size(); ++i) {
+        raw << (i + 1) << "\t" << signals[i].first << "\t" << signals[i].second << "\n";
+    }
+    raw << "Values:\n";
+    raw << std::scientific << std::setprecision(12);
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        raw << axis_values[row];
+        for (double value : rows[row]) {
+            raw << " " << value;
+        }
+        raw << "\n";
+    }
+}
+
+bool is_touchstone_extension(const std::string& extension) {
+    if (extension.size() < 4 || extension.front() != '.' || extension[1] != 'S' || extension.back() != 'P') {
+        return false;
+    }
+    for (std::size_t i = 2; i + 1 < extension.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(extension[i]))) return false;
+    }
+    return true;
+}
+
+void write_touchstone_ma(
+    const std::string& output_file,
+    int n_ports,
+    double z0,
+    const std::vector<double>& frequencies,
+    const std::vector<std::vector<double>>& rows) {
+    if (output_file.empty()) return;
+    std::ofstream out(output_file, std::ios::out | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("could not open Touchstone output file: " + output_file);
+    }
+    out << "! GSPICE S-Parameter Analysis\n";
+    out << "# Hz S MA R " << std::setprecision(12) << z0 << "\n";
+    out << std::scientific << std::setprecision(12);
+    const std::size_t pair_count = static_cast<std::size_t>(n_ports * n_ports * 2);
+    for (std::size_t i = 0; i < frequencies.size() && i < rows.size(); ++i) {
+        if (rows[i].size() < pair_count) continue;
+        out << frequencies[i];
+        if (n_ports == 2) {
+            for (std::size_t j = 0; j < pair_count; j += 2) {
+                out << " " << rows[i][j] << " " << rows[i][j + 1];
+            }
+        } else {
+            for (int row = 0; row < n_ports; ++row) {
+                for (int col = 0; col < n_ports; ++col) {
+                    const std::size_t idx = static_cast<std::size_t>((row + col * n_ports) * 2);
+                    out << " " << rows[i][idx] << " " << rows[i][idx + 1];
+                }
+            }
+        }
+        out << "\n";
+    }
 }
 
 struct DaeStampStatus {
@@ -2151,7 +2230,7 @@ void run_simulation(
     }
     const std::vector<std::string> implemented_analyses = {
         "OP", "DC", "STEP", "MC", "CORNER", "SENS", "PZ", "TF",
-        "TRAN", "AC", "NOISE", "STB", "HB", "PSS", "PAC", "PNOISE", "PSSSTB"
+        "TRAN", "AC", "NOISE", "SP", "STB", "HB", "PSS", "PAC", "PSSPAC", "PNOISE", "PSSSTB"
     };
     if (std::find(implemented_analyses.begin(), implemented_analyses.end(), requested_settings.type) ==
         implemented_analyses.end()) {
@@ -2864,7 +2943,7 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
 
     std::optional<PssOperatingPoint> pss_op;
     const bool pss_dependent =
-        settings.type == "PAC" || settings.type == "PNOISE" || settings.type == "PSSSTB";
+        settings.type == "PAC" || settings.type == "PSSPAC" || settings.type == "PNOISE" || settings.type == "PSSSTB";
     if (settings.type == "PSS" || pss_dependent) {
         if (settings.type != "PSS" && !settings.pss_requested) {
             throw std::runtime_error("." + settings.type + " requires a preceding .PSS analysis in the deck");
@@ -3893,6 +3972,19 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             }
         }
         int ac_points = 0;
+        std::vector<std::pair<std::string, std::string>> ac_signals;
+        ac_signals.reserve(static_cast<std::size_t>(num_nodes * 2));
+        for (int i = 0; i < num_nodes; ++i) {
+            const std::string node = netlist.getNodeName(i);
+            ac_signals.push_back({"V(" + node + ")", "voltage"});
+            ac_signals.push_back({"phase(V(" + node + "))", "phase"});
+        }
+        std::vector<double> ac_axis;
+        std::vector<std::vector<double>> ac_rows;
+        if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+            ac_axis.reserve(frequencies.size());
+            ac_rows.reserve(frequencies.size());
+        }
         for (double f : frequencies) {
             double omega = 2.0 * 3.14159265358979 * f;
             const auto stamp_start = std::chrono::steady_clock::now();
@@ -3910,7 +4002,20 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             std::cout << std::scientific << std::setprecision(2) << f << " | ";
             for(int i=0; i<num_nodes; ++i) std::cout << "(" << x_ac[i].real() << "," << x_ac[i].imag() << ") ";
             std::cout << std::endl;
+            if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+                ac_axis.push_back(f);
+                std::vector<double> row;
+                row.reserve(static_cast<std::size_t>(num_nodes * 2));
+                for (int i = 0; i < num_nodes; ++i) {
+                    row.push_back(std::abs(x_ac[i]));
+                    row.push_back(std::arg(x_ac[i]) * 180.0 / M_PI);
+                }
+                ac_rows.push_back(std::move(row));
+            }
             ++ac_points;
+        }
+        if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+            write_real_sweep_raw(output_file, "AC Analysis", "frequency", "frequency", ac_signals, ac_axis, ac_rows);
         }
         std::cout << "AC summary: points=" << ac_points << " sweep=" << sweep_type << std::endl;
     } else if (settings.type == "NOISE") {
@@ -3920,6 +4025,8 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         }
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
+        std::vector<double> noise_axis;
+        std::vector<std::vector<double>> noise_rows;
         std::cout << "freq | onoise_sqrt(V/rtHz) onoise_psd(V^2/Hz) noise_sources" << std::endl;
         while (f <= settings.f_stop * 1.01) {
             double omega = 2.0 * 3.14159265358979 * f;
@@ -3955,8 +4062,118 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                       << " " << output_psd
                       << " " << noise_sources.size()
                       << std::endl;
+            if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+                noise_axis.push_back(f);
+                noise_rows.push_back({
+                    std::sqrt(std::max(output_psd, 0.0)),
+                    output_psd,
+                    static_cast<double>(noise_sources.size())
+                });
+            }
             f *= dec_mult;
         }
+        if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+            write_real_sweep_raw(
+                output_file,
+                "Noise Analysis",
+                "frequency",
+                "frequency",
+                {
+                    {"onoise_sqrt(V/rtHz)", "voltage_noise"},
+                    {"onoise_psd(V^2/Hz)", "noise_psd"},
+                    {"noise_sources", "count"}
+                },
+                noise_axis,
+                noise_rows);
+        }
+    } else if (settings.type == "SP") {
+        std::cout << "Starting S-Parameter Analysis..." << std::endl;
+        if (ports.empty()) {
+            throw std::runtime_error(".SP requires one or more P port elements");
+        }
+        std::sort(ports.begin(), ports.end(), [](const Port* a, const Port* b) {
+            return a->getPortNum() < b->getPortNum();
+        });
+        std::vector<double> frequencies;
+        const std::string sweep_type = upper_copy(settings.f_sweep_type);
+        if (sweep_type == "LIN") {
+            const int points = std::max(settings.points_per_dec, 1);
+            frequencies.reserve(static_cast<std::size_t>(points));
+            for (int idx = 0; idx < points; ++idx) {
+                const double alpha = points == 1 ? 0.0 : static_cast<double>(idx) / static_cast<double>(points - 1);
+                frequencies.push_back(settings.f_start + alpha * (settings.f_stop - settings.f_start));
+            }
+        } else {
+            double f = settings.f_start;
+            const double dec_mult = std::pow(sweep_type == "OCT" ? 2.0 : 10.0, 1.0 / std::max(settings.points_per_dec, 1));
+            while (f <= settings.f_stop * 1.01) {
+                frequencies.push_back(f);
+                f *= dec_mult;
+            }
+        }
+        std::vector<std::pair<std::string, std::string>> sp_signals;
+        const int n_ports = static_cast<int>(ports.size());
+        sp_signals.reserve(static_cast<std::size_t>(n_ports * n_ports * 2));
+        for (int col = 0; col < n_ports; ++col) {
+            for (int row = 0; row < n_ports; ++row) {
+                const std::string name = "S" + std::to_string(row + 1) + std::to_string(col + 1);
+                sp_signals.push_back({name, "ratio"});
+                sp_signals.push_back({"phase(" + name + ")", "phase"});
+            }
+        }
+        std::vector<std::vector<double>> sp_rows;
+        sp_rows.reserve(frequencies.size());
+        for (double f : frequencies) {
+            const double omega = 2.0 * 3.14159265358979 * f;
+            std::vector<std::complex<double>> s_values(static_cast<std::size_t>(n_ports * n_ports), {0.0, 0.0});
+            for (int excite = 0; excite < n_ports; ++excite) {
+                SparseMatrixComplex J_sparse(matrix_size);
+                VectorComplex b_sp(matrix_size);
+                stamp_global_gmin(J_sparse, num_nodes, settings.gmin);
+                const bool use_parallel_stamp = parallel_stamp_enabled(num_devs, matrix_size);
+                #pragma omp parallel for if(use_parallel_stamp)
+                for (int i = 0; i < num_devs; ++i) stamp_device_ac(*devices[i], J_sparse, b_sp, omega, x_dc);
+                b_sp.add(ports[excite]->getBranchIndex(), {1.0, 0.0});
+                VectorComplex x_sp = KluSolverComplex::solve(J_sparse, b_sp, &complex_solver_context);
+                for (int observe = 0; observe < n_ports; ++observe) {
+                    const int pos = ports[observe]->getNodePos();
+                    const int neg = ports[observe]->getNodeNeg();
+                    const std::complex<double> v_pos = pos >= 0 ? x_sp[pos] : std::complex<double>(0.0, 0.0);
+                    const std::complex<double> v_neg = neg >= 0 ? x_sp[neg] : std::complex<double>(0.0, 0.0);
+                    std::complex<double> s = 2.0 * (v_pos - v_neg);
+                    if (observe == excite) {
+                        s -= std::complex<double>(1.0, 0.0);
+                    }
+                    s_values[static_cast<std::size_t>(observe + excite * n_ports)] = s;
+                }
+            }
+            std::vector<double> row;
+            row.reserve(sp_signals.size());
+            for (const auto& s : s_values) {
+                row.push_back(std::abs(s));
+                row.push_back(std::arg(s) * 180.0 / M_PI);
+            }
+            sp_rows.push_back(std::move(row));
+            if (n_ports <= 2) {
+                std::cout << std::scientific << std::setprecision(9)
+                          << f << " |";
+                for (int idx = 0; idx < n_ports * n_ports; ++idx) {
+                    std::cout << " S" << ((idx % n_ports) + 1) << ((idx / n_ports) + 1)
+                              << "=" << std::abs(s_values[static_cast<std::size_t>(idx)]);
+                }
+                std::cout << std::endl;
+            }
+        }
+        const std::string requested_output_format = upper_copy(output_format);
+        if (!output_file.empty() && requested_output_format == "RAW") {
+            write_real_sweep_raw(output_file, "S-Parameter Analysis", "frequency", "frequency", sp_signals, frequencies, sp_rows);
+        } else if (!output_file.empty() && requested_output_format == "TOUCHSTONE") {
+            write_touchstone_ma(output_file, n_ports, ports.front()->getZ0(), frequencies, sp_rows);
+        }
+        std::cout << "SP summary: points=" << frequencies.size()
+                  << " ports=" << n_ports
+                  << " method=multiport-y-to-s"
+                  << std::endl;
     } else if (settings.type == "STB") {
         std::cout << "Starting Stability Analysis (Tian)..." << std::endl;
         if (probes.empty()) {
@@ -3993,6 +4210,18 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                       << std::scientific << std::setprecision(9) << x_dc[i];
         }
         std::cout << std::endl;
+        if (pss_op && !output_file.empty() && upper_copy(output_format) == "RAW") {
+            std::vector<std::pair<std::string, std::string>> pss_signals = {
+                {"PSS_period", "time"},
+                {"PSS_residual", "ratio"},
+            };
+            std::vector<double> row = {pss_op->period, pss_op->residual};
+            for (int i = 0; i < num_nodes; ++i) {
+                pss_signals.push_back({"V(" + netlist.getNodeName(i) + ")", "voltage"});
+                row.push_back(x_dc[i]);
+            }
+            write_real_sweep_raw(output_file, "PSS Analysis", "sample", "sample", pss_signals, {0.0}, {row});
+        }
     } else if (settings.type == "HB") {
         std::cout << "Starting Harmonic Balance Analysis (Multi-Tone, FFT-accelerated)..." << std::endl;
         // ----------------------------------------------------------------
@@ -4102,11 +4331,20 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
             throw std::runtime_error(".HB did not converge; try increasing N_HARMS or using .PSS");
         }
         std::cout << "HB Converged (FFT-accelerated; validate against reference simulator)." << std::endl;
-    } else if (settings.type == "PAC") {
+    } else if (settings.type == "PAC" || settings.type == "PSSPAC") {
         if (!pss_op) throw std::runtime_error(".PAC requires a converged PSS operating point");
-        std::cout << "Starting PAC from converged PSS operating point..." << std::endl;
+        std::cout << "Starting " << settings.type << " from converged PSS operating point..." << std::endl;
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
+        std::vector<std::pair<std::string, std::string>> pac_signals;
+        pac_signals.reserve(static_cast<std::size_t>(num_nodes * 2));
+        for (int i = 0; i < num_nodes; ++i) {
+            const std::string node = netlist.getNodeName(i);
+            pac_signals.push_back({"V(" + node + ")", "voltage"});
+            pac_signals.push_back({"phase(V(" + node + "))", "phase"});
+        }
+        std::vector<double> pac_axis;
+        std::vector<std::vector<double>> pac_rows;
         while (f <= settings.f_stop * 1.01) {
             const double omega = 2.0 * 3.14159265358979323846 * f;
             SparseMatrixComplex J_sparse(matrix_size);
@@ -4123,7 +4361,20 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                           << std::abs(x_ac[i]) << " ";
             }
             std::cout << std::endl;
+            if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+                pac_axis.push_back(f);
+                std::vector<double> row;
+                row.reserve(static_cast<std::size_t>(num_nodes * 2));
+                for (int i = 0; i < num_nodes; ++i) {
+                    row.push_back(std::abs(x_ac[i]));
+                    row.push_back(std::arg(x_ac[i]) * 180.0 / M_PI);
+                }
+                pac_rows.push_back(std::move(row));
+            }
             f *= dec_mult;
+        }
+        if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+            write_real_sweep_raw(output_file, settings.type + " Analysis", "frequency", "frequency", pac_signals, pac_axis, pac_rows);
         }
     } else if (settings.type == "PNOISE") {
         if (!pss_op) throw std::runtime_error(".PNOISE requires a converged PSS operating point");
@@ -4132,6 +4383,8 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
         double f = settings.f_start;
         double dec_mult = std::pow(10.0, 1.0 / std::max(settings.points_per_dec, 1));
         int pnoise_offsets = 0;
+        std::vector<double> pnoise_axis;
+        std::vector<std::vector<double>> pnoise_rows;
         std::cout << "freq | pnoise_sqrt(V/rtHz) pnoise_psd(V^2/Hz) noise_sources" << std::endl;
         while (f <= settings.f_stop * 1.01) {
             const double omega = 2.0 * 3.14159265358979323846 * f;
@@ -4157,8 +4410,30 @@ if (!result.converged && matrix_size >= 1 && matrix_size <= 128 &&
                       << " " << output_psd
                       << " " << noise_sources.size()
                       << std::endl;
+            if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+                pnoise_axis.push_back(f);
+                pnoise_rows.push_back({
+                    std::sqrt(std::max(output_psd, 0.0)),
+                    output_psd,
+                    static_cast<double>(noise_sources.size())
+                });
+            }
             f *= dec_mult;
             ++pnoise_offsets;
+        }
+        if (!output_file.empty() && upper_copy(output_format) == "RAW") {
+            write_real_sweep_raw(
+                output_file,
+                "PNOISE Analysis",
+                "frequency",
+                "frequency",
+                {
+                    {"pnoise_sqrt(V/rtHz)", "voltage_noise"},
+                    {"pnoise_psd(V^2/Hz)", "noise_psd"},
+                    {"noise_sources", "count"}
+                },
+                pnoise_axis,
+                pnoise_rows);
         }
         std::cout << "PNOISE summary: offsets=" << pnoise_offsets << std::endl;
     } else if (settings.type == "PSSSTB") {
@@ -4281,8 +4556,8 @@ void print_usage() {
     std::cout << "  -v, --version    Display version information\n";
     std::cout << "  -h, --help       Display this help message\n";
     std::cout << "  -t, --threads <n> Set parallel threads (1-16, default: 1)\n";
-    std::cout << "  -o, --output <file>  Write transient results to a file\n";
-    std::cout << "  --format <raw|csv>   Select transient output format (default: extension or raw)\n";
+    std::cout << "  -o, --output <file>  Write waveform results to a file\n";
+    std::cout << "  --format <raw|csv|touchstone>   Select waveform output format (default: extension or raw)\n";
     std::cout << "  --save <all|selected|none>  Select transient waveform save policy\n";
     std::cout << "  --adaptive-maxstep   Accept SimENV adaptive maxstep mode (deck controls timestep cap)\n";
     std::cout << "  --capabilities       Print machine-readable capability maturity information\n";
@@ -4319,11 +4594,11 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--format") {
-            if (i + 1 >= argc) { std::cerr << "ERROR: --format requires raw or csv\n"; return 64; }
+            if (i + 1 >= argc) { std::cerr << "ERROR: --format requires raw, csv, or touchstone\n"; return 64; }
             output_format = upper_copy(argv[++i]);
             format_explicit = true;
-            if (output_format != "RAW" && output_format != "CSV") {
-                std::cerr << "ERROR: unsupported output format; expected raw or csv\n";
+            if (output_format != "RAW" && output_format != "CSV" && output_format != "TOUCHSTONE") {
+                std::cerr << "ERROR: unsupported output format; expected raw, csv, or touchstone\n";
                 return 64;
             }
             continue;
@@ -4355,6 +4630,7 @@ int main(int argc, char* argv[]) {
     if (!format_explicit && !output_file.empty()) {
         std::string extension = upper_copy(std::filesystem::path(output_file).extension().string());
         if (extension == ".CSV") output_format = "CSV";
+        else if (is_touchstone_extension(extension)) output_format = "TOUCHSTONE";
     }
     Netlist netlist = Parser::parse(input_file);
     if (!save_mode.empty()) {

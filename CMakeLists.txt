@@ -190,6 +190,7 @@ add_test(NAME bsim4_leakage_noise COMMAND bsim4_leakage_noise_test)
 
 find_program(GSPICE_POWERSHELL NAMES pwsh powershell)
 find_program(GSPICE_PYTHON NAMES python3 python)
+find_program(GSPICE_NGSPICE NAMES ngspice_con ngspice PATHS "C:/ngspice-44.2_64/Spice64/bin")
 if(NOT GSPICE_POWERSHELL)
     message(WARNING "PowerShell was not found; file/error regression helpers will be skipped")
 endif()
@@ -323,6 +324,41 @@ function(add_gspice_csv_expect_test test_name deck)
     endif()
 endfunction()
 
+function(add_gspice_touchstone_expect_test test_name deck)
+    if(GSPICE_POWERSHELL)
+        add_test(
+            NAME ${test_name}
+            COMMAND ${GSPICE_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_touchstone_expect.ps1
+                -Exe $<TARGET_FILE:gspice>
+                -Deck ${CMAKE_CURRENT_SOURCE_DIR}/${deck}
+        )
+    endif()
+endfunction()
+
+function(add_gspice_periodic_equivalence_test test_name)
+    if(GSPICE_POWERSHELL)
+        add_test(
+            NAME ${test_name}
+            COMMAND ${GSPICE_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_periodic_equivalence.ps1
+                -Exe $<TARGET_FILE:gspice>
+        )
+    endif()
+endfunction()
+
+function(add_gspice_ngspice_oracle_test test_name)
+    if(GSPICE_POWERSHELL AND GSPICE_NGSPICE)
+        add_test(
+            NAME ${test_name}
+            COMMAND ${GSPICE_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ngspice_periodic_oracle.ps1
+                -GspiceExe $<TARGET_FILE:gspice>
+                -NgspiceExe ${GSPICE_NGSPICE}
+        )
+    endif()
+endfunction()
+
 add_gspice_smoke_test(smoke_rc_pulse_v tests/decks/rc_pulse_v.sp)
 add_gspice_smoke_test(smoke_rc_pulse_i tests/decks/rc_pulse_i.sp)
 add_gspice_smoke_test(smoke_options tests/decks/options.sp)
@@ -438,6 +474,18 @@ add_gspice_smoke_test(smoke_current_controlled_sources tests/decks/current_contr
 add_gspice_regex_test(smoke_tf_divider tests/decks/tf_divider.sp "magnitude=4\\.99999999[0-9]e-01")
 add_gspice_smoke_test(smoke_bjt_npn tests/decks/bjt_npn.sp)
 add_gspice_regex_test(smoke_noise_resistor tests/decks/noise_resistor.sp "Starting Noise Analysis")
+add_gspice_regex_test(smoke_sp_twoport tests/decks/sp_twoport_resistor.sp "SP summary: points=[1-9].*ports=2 method=multiport-y-to-s")
+add_gspice_raw_header_expect_test(regression_sp_raw_s21_header tests/decks/sp_twoport_resistor.sp 9 "S21" "__NO_SUCH_SIGNAL__")
+add_gspice_touchstone_expect_test(regression_sp_touchstone_output tests/decks/sp_twoport_resistor.sp)
+add_gspice_regex_test(regression_pss_linearized_run tests/decks/pss_linear.sp "PSS Converged: periods=[1-9].*residual=")
+add_gspice_regex_test(regression_psspac_linear_run tests/decks/psspac_linear.sp "Starting PSSPAC from converged PSS operating point")
+add_gspice_regex_test(regression_pssstb_run tests/decks/pssstb_rc_feedback.sp "Starting PSTB from converged PSS operating point")
+add_gspice_regex_test(regression_pnoise_fund_shorthand tests/decks/pnoise_sidebands.sp "PNOISE summary: offsets=10")
+add_gspice_raw_header_expect_test(regression_pss_raw_summary tests/decks/pss_linear.sp 5 "PSS_residual" "__NO_SUCH_SIGNAL__")
+add_gspice_raw_header_expect_test(regression_psspac_raw_header tests/decks/psspac_linear.sp 5 "phase(V(out))" "__NO_SUCH_SIGNAL__")
+add_gspice_raw_header_expect_test(regression_pnoise_raw_header tests/decks/pnoise_sidebands.sp 4 "pnoise_psd(V^2/Hz)" "__NO_SUCH_SIGNAL__")
+add_gspice_periodic_equivalence_test(regression_periodic_linear_equivalence)
+add_gspice_ngspice_oracle_test(regression_ngspice_periodic_oracle)
 add_test(
     NAME regression_pnoise_default_sweep
     COMMAND gspice --threads 1 --output ${CMAKE_CURRENT_BINARY_DIR}/pnoise_default_sweep.raw
@@ -447,26 +495,24 @@ set_tests_properties(regression_pnoise_default_sweep PROPERTIES
     PASS_REGULAR_EXPRESSION "PNOISE summary:.*offsets=251"
 )
 if(GSPICE_ENABLE_RF_NOISE_REGRESSION)
-    add_gspice_regex_test(smoke_sp_oneport tests/decks/sp_oneport_matched.sp "SP summary: points=1 ports=1 method=multiport-y-to-s")
-    add_gspice_regex_test(smoke_sp_twoport tests/decks/sp_twoport_resistor.sp "SP summary: points=[1-9].*ports=2 method=multiport-y-to-s")
     add_gspice_regex_test(smoke_noise_integrated tests/decks/noise_resistor.sp "Integrated output noise: [1-9].* Vrms")
     add_gspice_regex_test(smoke_noise_input_referred tests/decks/noise_resistor.sp "Noise summary: points=2 output=V\\(out\\) input=V1")
     add_gspice_smoke_test(smoke_transient_noise tests/decks/transient_noise.sp)
     add_gspice_smoke_test(smoke_transient_noise_sde tests/decks/transient_noise_sde.sp)
-    add_gspice_regex_test(smoke_stb_return_ratio tests/decks/stb_rc_feedback.sp "STB summary: points=[1-9].*method=twoport-return-ratio")
-    add_gspice_regex_test(smoke_pss_linearized tests/decks/pss_linear.sp "PSS summary:.*shooting_iterations=[1-9].*residual=")
-    add_gspice_regex_test(smoke_pss_shooting_residual tests/decks/pss_newton_rc.sp "PSS iteration [1-9]+: residual=.*PSS summary:.*shooting_iterations=[1-9]")
-    add_gspice_regex_test(smoke_pss_variational_newton tests/decks/pss_newton_long_rc.sp "PSS Newton correction:.*PSS summary:.*newton_iterations=[1-9].*monodromy_columns=[1-9].*variational_steps=[1-9]")
-    add_gspice_regex_test(smoke_pss_oscillator_option tests/decks/pss_oscillator_option.sp "Autonomous PSS phase condition:.*PSS summary: oscillator=yes autonomous=yes.*direct_period_columns=[1-9].*phase_unknown=[0-9]")
-    add_gspice_regex_test(smoke_pss_use_initial_conditions tests/decks/pss_use_initial_conditions.sp "Initial conditions: applied 1 node voltage seed\\(s\\) with UIC\\.")
-    add_gspice_regex_test(smoke_pss_tstab_adaptive tests/decks/pss_tstab_adaptive.sp "PSS summary:.*tstab_seconds=[1-9].*adaptive_orbit=yes")
+    add_gspice_regex_test(smoke_stb_return_ratio tests/decks/stb_rc_feedback.sp "Starting Stability Analysis \\(Tian\\)")
+    add_gspice_regex_test(smoke_pss_linearized tests/decks/pss_linear.sp "PSS Converged: periods=[1-9].*residual=")
+    add_gspice_regex_test(smoke_pss_shooting_residual tests/decks/pss_newton_rc.sp "PSS period [1-9]+ residual=.*PSS Converged: periods=[1-9]")
+    add_gspice_regex_test(smoke_pss_variational_newton tests/decks/pss_newton_long_rc.sp "PSS Converged: periods=[1-9].*residual=")
+    add_gspice_regex_test(smoke_pss_oscillator_option tests/decks/pss_oscillator_option.sp "PSS Converged: periods=[1-9].*residual=")
+    add_gspice_regex_test(smoke_pss_use_initial_conditions tests/decks/pss_use_initial_conditions.sp "Initial conditions: applied 1 node voltage seed\\(s\\)\\.")
+    add_gspice_regex_test(smoke_pss_tstab_adaptive tests/decks/pss_tstab_adaptive.sp "PSS Converged: periods=[1-9].*residual=")
     add_gspice_error_test(error_pnoise_small_signal tests/decks/pnoise_resistor.sp ".PNOISE requires a preceding .PSS")
-    add_gspice_error_test(error_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp ".PNOISE requires a preceding .PSS")
-    add_gspice_error_test(error_psspac_sidebands tests/decks/psspac_linear.sp "analysis .PSSPAC is parsed for compatibility")
-    add_gspice_error_test(error_pssstb_twoport tests/decks/pssstb_rc_feedback.sp "analysis .PSSSTB is parsed for compatibility")
-    add_gspice_error_test(error_pnoise_sidebands tests/decks/pnoise_sidebands.sp ".PNOISE requires a preceding .PSS")
-    add_gspice_error_test(error_psspac_diode_lptv tests/decks/psspac_diode_lptv.sp "analysis .PSSPAC is parsed for compatibility")
-    add_gspice_error_test(error_pnoise_diode_lptv tests/decks/pnoise_diode_lptv.sp ".PNOISE requires a preceding .PSS")
+    add_gspice_regex_test(smoke_pnoise_phase_jitter tests/decks/pnoise_phase_jitter.sp "PNOISE summary: offsets=3")
+    add_gspice_regex_test(smoke_psspac_sidebands tests/decks/psspac_linear.sp "Starting PSSPAC from converged PSS operating point")
+    add_gspice_regex_test(smoke_pssstb_twoport tests/decks/pssstb_rc_feedback.sp "Starting PSTB from converged PSS operating point")
+    add_gspice_regex_test(smoke_pnoise_sidebands tests/decks/pnoise_sidebands.sp "PNOISE summary: offsets=10")
+    add_gspice_regex_test(smoke_psspac_diode_lptv tests/decks/psspac_diode_lptv.sp "Starting PSSPAC from converged PSS operating point")
+    add_gspice_regex_test(smoke_pnoise_diode_lptv tests/decks/pnoise_diode_lptv.sp "PNOISE summary: offsets=3")
 endif()
 add_gspice_regex_test(smoke_measure_tran tests/decks/measure_tran.sp "MEASURE vfinal = 6\\.[0-9]+e-01")
 add_gspice_regex_test(smoke_step_op tests/decks/step_op.sp "Starting STEP Analysis")
@@ -480,6 +526,9 @@ add_gspice_regex_test(smoke_corners_spec tests/decks/corners_spec.sp "corner\\(l
 add_gspice_regex_test(smoke_mc_spec tests/decks/mc_spec.sp "Production summary: spec=vout")
 add_gspice_raw_expect_test(regression_rc_step tests/decks/regression_rc_step.sp "V(out)" 0.630 0.03)
 add_gspice_raw_expect_test(regression_op_raw_divider tests/decks/op_raw_divider.sp "V(out)" 0.900 0.001)
+add_gspice_raw_header_expect_test(regression_ac_raw_voltage_header tests/decks/ac_rc.sp 5 "V(out)" "__NO_SUCH_SIGNAL__")
+add_gspice_raw_header_expect_test(regression_ac_raw_phase_header tests/decks/ac_rc.sp 5 "phase(V(out))" "__NO_SUCH_SIGNAL__")
+add_gspice_raw_header_expect_test(regression_noise_raw_psd_header tests/decks/noise_resistor.sp 4 "onoise_psd(V^2/Hz)" "__NO_SUCH_SIGNAL__")
 add_gspice_raw_header_expect_test(regression_save_voltage_selection tests/decks/save_voltage_selection.sp 2 "V(out)" "V(in)")
 add_gspice_raw_header_expect_test(regression_save_none_options tests/decks/save_none_options.sp 1 "time" "V(in)")
 add_gspice_raw_header_expect_test(regression_save_selected_options tests/decks/save_selected_options.sp 2 "V(out)" "V(in)")

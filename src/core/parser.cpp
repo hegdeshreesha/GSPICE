@@ -2829,6 +2829,7 @@ Netlist Parser::parse(const std::string& filePath) {
                 }
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = "SP";
+                settings.f_sweep_type = toUpperCopy(tokens[1]);
                 settings.points_per_dec = std::stoi(tokens[2]);
                 settings.f_start = Utils::parseValue(tokens[3]);
                 settings.f_stop = Utils::parseValue(tokens[4]);
@@ -2961,6 +2962,20 @@ Netlist Parser::parse(const std::string& filePath) {
                 settings.f_start = Utils::parseValue(tokens[3]);
                 settings.f_stop = Utils::parseValue(tokens[4]);
                 netlist.setSettings(settings);
+            } else if (cmd == ".PSSPAC") {
+                if (tokens.size() < 6) {
+                    netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PSSPAC line ignored: " + line);
+                    continue;
+                }
+                SimulationSettings settings = netlist.getSettings();
+                settings.type = "PSSPAC";
+                settings.pss_requested = true;
+                if (settings.f_fund.empty()) settings.f_fund.push_back(Utils::parseValue(tokens[1]));
+                settings.f_sweep_type = toUpperCopy(tokens[2]);
+                settings.points_per_dec = std::stoi(tokens[3]);
+                settings.f_start = Utils::parseValue(tokens[4]);
+                settings.f_stop = Utils::parseValue(tokens[5]);
+                netlist.setSettings(settings);
             } else if (cmd == ".PNOISE") {
                 if (tokens.size() < 2) {
                     netlist.addWarning("Line " + std::to_string(lineNo) + ": invalid .PNOISE line ignored: " + line);
@@ -2994,14 +3009,44 @@ Netlist Parser::parse(const std::string& filePath) {
                     settings.f_start = Utils::parseValue(tokens[4]);
                     settings.f_stop = Utils::parseValue(tokens[5]);
                 }
+                for (std::size_t i = 7; i < tokens.size(); ++i) {
+                    const auto eq = tokens[i].find('=');
+                    if (eq == std::string::npos) continue;
+                    const std::string key = toUpperCopy(tokens[i].substr(0, eq));
+                    const std::string value = tokens[i].substr(eq + 1);
+                    if (key == "FUND" && settings.f_fund.empty()) {
+                        settings.f_fund.push_back(Utils::parseValue(value));
+                        settings.pss_requested = true;
+                    } else if (key == "SIDEBANDS") {
+                        settings.n_harms = std::max(settings.n_harms, std::stoi(value));
+                    }
+                }
                 netlist.setSettings(settings);
             } else if (cmd == ".HBAC" || cmd == ".HBNOISE" || cmd == ".HBSP" || cmd == ".HBSTB" ||
                        cmd == ".PSSSP" || cmd == ".PSSSTB" || cmd == ".PSTB") {
                 SimulationSettings settings = netlist.getSettings();
                 settings.type = (cmd == ".PSTB") ? "PSSSTB" : cmd.substr(1);
+                if (cmd == ".PSSSTB" || cmd == ".PSTB") settings.pss_requested = true;
                 
                 size_t i = 1;
                 while (i < tokens.size()) {
+                    const std::string tokenUpper = toUpperCopy(tokens[i]);
+                    const size_t eq = tokens[i].find('=');
+                    if ((tokenUpper == "DEC" || tokenUpper == "OCT" || tokenUpper == "LIN") && i + 3 < tokens.size()) {
+                        settings.f_sweep_type = tokenUpper;
+                        settings.points_per_dec = std::stoi(tokens[i + 1]);
+                        settings.f_start = Utils::parseValue(tokens[i + 2]);
+                        settings.f_stop = Utils::parseValue(tokens[i + 3]);
+                        break;
+                    }
+                    if (eq != std::string::npos) {
+                        const std::string key = tokenUpper.substr(0, eq);
+                        const std::string value = tokens[i].substr(eq + 1);
+                        if (key == "FUND" && settings.f_fund.empty()) settings.f_fund.push_back(Utils::parseValue(value));
+                        else if (key == "SIDEBANDS") settings.n_harms = std::max(settings.n_harms, std::stoi(value));
+                        ++i;
+                        continue;
+                    }
                     bool is_int = !tokens[i].empty() && std::all_of(tokens[i].begin(), tokens[i].end(), ::isdigit);
                     if (is_int) {
                         settings.points_per_dec = std::stoi(tokens[i]);
